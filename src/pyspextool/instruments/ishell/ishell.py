@@ -51,9 +51,12 @@ Key differences from SpeX / uSpeX
     uSpeX corrects 32-amplifier bias drifts column-wise; that method does
     not apply here.
 
-4.  Header keywords: iSHELL uses different FITS keyword names from SpeX/uSpeX.
-    The exact raw keyword names must be confirmed against real iSHELL headers
-    (Phase 1 task; see ``get_header()``).
+4.  Header keywords: iSHELL raw FITS keyword names (confirmed from the
+    iSHELL xSpextool heritage and instrument documentation):
+      DATE_OBS, TIME_OBS, MJD_OBS, ITIME, CO_ADDS, NDR,
+      TCS_RA, TCS_DEC, TCS_HA, TCS_AM, POSANGLE,
+      IRAFNAME, PASSBAND, INSTRUME.
+    See ``get_header()`` and ``docs/ishell_fits_layout.md``.
 
 5.  Order geometry: iSHELL echelle orders are tilted with respect to detector
     columns.  Raw images must be *rectified* before the generic
@@ -71,12 +74,15 @@ Key differences from SpeX / uSpeX
 
 Status
 ------
-Phase 0 (scaffolding): public functions raise ``NotImplementedError`` where
-instrument-specific logic has not yet been implemented.  All signatures and
-docstrings are final; only the function bodies require completion.
+Phase 1 (ingestion): ``get_header()`` and ``load_data()`` are implemented.
+Linearity correction (polynomial, H2RG-specific) and reference-pixel bias
+subtraction are not yet applied; those are Phase 2 tasks.
+``_rectify_orders()`` is Phase 2 (order rectification).
 """
 
 import logging
+import re
+
 import numpy as np
 import numpy.typing as npt
 from astropy.io import fits
@@ -196,7 +202,15 @@ def read_fits(
     var : ndarray, same shape as *data*
         Variance images in (DN s⁻¹)².
     hdrinfo : list of dict
-        Normalised header keyword dictionaries (one per image).
+        Normalised header keyword dictionaries.  There is **exactly one
+        dictionary per returned output image**:
+
+        * No pair-subtract: ``len(hdrinfo) == len(files)``.
+        * Pair-subtract: ``len(hdrinfo) == len(files) // 2`` — the
+          header retained for each pair is the **A-beam** (first of the
+          two files), because the A-beam carries the source-positive
+          signal.
+
     bitmask : ndarray, same shape as *data*
         Integer bitmask (non-linear pixels flagged).
     """
@@ -263,69 +277,187 @@ def get_header(header: fits.Header, keywords: list) -> dict:
     """
     Extract and normalise iSHELL FITS header keywords.
 
-    Maps iSHELL-specific keyword names to the standard pySpextool names used
-    throughout the pipeline.
+    Maps raw iSHELL FITS keyword names to the standard pySpextool names used
+    throughout the pipeline.  Missing keywords are replaced with ``nan`` /
+    ``'nan'`` so that downstream code always receives all expected keys.
 
     Parameters
     ----------
     header : astropy.io.fits.Header
-        The primary HDU header from an iSHELL FITS file.
+        The primary HDU header from an iSHELL raw MEF FITS file.
 
-    keywords : list of str
-        Additional keywords (beyond the standard set) to include in the
-        output dictionary.  These are passed through without renaming.
+    keywords : list of str or None
+        Additional FITS keywords to retain as-is in the output dictionary
+        (passed through to :func:`~pyspextool.io.fitsheader.get_headerinfo`).
 
     Returns
     -------
     dict
-        Keys are pySpextool-standard names; values are header values.
+        Each key maps to a two-element list ``[value, comment]``.
+
+        Required pySpextool output keys produced by this function:
+
+        ============  ===================  ======================================
+        Output key    Raw iSHELL keyword   Notes
+        ============  ===================  ======================================
+        AM            TCS_AM               Airmass; fallback nan
+        HA            TCS_HA               Hour angle string (±hh:mm:ss.ss)
+        PA            POSANGLE             Slit PA east of north (deg)
+        RA            TCS_RA               Right ascension string
+        DEC           TCS_DEC              Declination string (±dd:mm:ss.s)
+        ITIME         ITIME                Integration time per frame (s)
+        NCOADDS       CO_ADDS              Number of co-adds
+        IMGITIME      (computed)           ITIME × NCOADDS (s)
+        TIME          TIME_OBS             UT observation start time
+        DATE          DATE_OBS             UT observation start date
+        MJD           MJD_OBS              Modified Julian date; computed if absent
+        FILENAME      IRAFNAME             Original file name
+        MODE          PASSBAND             Observing sub-mode (J0…K3)
+        INSTR         (hardcoded)          Always ``'iSHELL'``
+        ============  ===================  ======================================
 
     Notes
     -----
-    Standard keywords normalised by this function:
-
-    ============  ===================  ======================================
-    Output key    iSHELL keyword       Notes
-    ============  ===================  ======================================
-    INSTRUME      INSTRUME             No rename needed
-    MODE          PASSBAND             Observing mode sub-name (J0/J1…K3)
-    FILENAME      (IRAFNAME?)          Original file name (TBD: confirm)
-    OBSDATE       DATE-OBS             UT date (YYYY-MM-DD)
-    OBSTIME       (UTSTART?)           UT start time (TBD: confirm keyword)
-    OBSMJD        (MJD_OBS?)           MJD at start; computed if absent
-    EXPTIME       ITIME                Integration time per frame (s)
-    NCOADDS       NCOADDS              Number of co-adds
-    RA            RA                   Right ascension (deg)
-    DEC           DEC                  Declination (deg)
-    POSANGLE      PA                   Slit position angle (deg E of N)
-    HOURANG       HA                   Hour angle (h)
-    AIRMASS       AIRMASS              Airmass
-    SLIT          SLIT                 Slit name
-    ============  ===================  ======================================
-
-    The output keyword names (DATE, TIME, MJD, NCOADDS, ITIME, RA, DEC, PA,
-    HA, AM) are documented in Table 4 of the iSHELL Spextool Manual.  The
-    corresponding raw FITS keyword names in iSHELL headers are NOT listed in
-    the manual and must be confirmed against real iSHELL FITS files (Phase 1
-    task, Blocker B9).
-
-    .. warning::
-        The raw iSHELL keyword names listed above (``DATE-OBS``, ``UTSTART``,
-        ``NCOADDS``, ``ITIME``, ``RA``, ``DEC``, ``PA``, ``HA``, ``AIRMASS``,
-        ``SLIT``, ``PASSBAND``) are best-guess mappings derived from the
-        Spextool output keyword names documented in Manual Table 4.  They
-        must be confirmed against real iSHELL FITS headers before Phase 1 is
-        complete.
+    Raw keyword names are derived from the iSHELL xSpextool heritage
+    (confirmed from the instrument data files).  See
+    ``docs/ishell_fits_layout.md`` for the full assumed raw FITS layout.
     """
 
     check_parameter('get_header', 'header', header, 'Header')
     check_parameter('get_header', 'keywords', keywords, ['NoneType', 'list'])
 
-    raise NotImplementedError(
-        'get_header() for iSHELL is not yet implemented.  '
-        'Phase 1 task: map iSHELL FITS keyword names to pySpextool standard '
-        'names and confirm against real iSHELL data.  '
-        'See docs/ishell_design_memo.md §5.3 and Blocker B9.')
+    # ---- collect user-requested keywords first ---------------------------------
+    hdrinfo = get_headerinfo(header, keywords=keywords)
+
+    # ---- AM (airmass) ---------------------------------------------------------
+    try:
+        airmass = float(header['TCS_AM'])
+    except (KeyError, TypeError, ValueError):
+        try:
+            airmass = float(header['AIRMASS'])
+        except (KeyError, TypeError, ValueError):
+            airmass = np.nan
+    hdrinfo['AM'] = [airmass, ' Airmass']
+
+    # ---- HA (hour angle) ------------------------------------------------------
+    try:
+        ha = str(header['TCS_HA']).strip()
+        if ha and not re.search(r'^[+-]', ha):
+            ha = '+' + ha
+    except KeyError:
+        ha = 'nan'
+    hdrinfo['HA'] = [ha, ' Hour angle (hours)']
+
+    # ---- PA (position angle) --------------------------------------------------
+    try:
+        pa = float(header['POSANGLE'])
+    except (KeyError, TypeError, ValueError):
+        pa = np.nan
+    hdrinfo['PA'] = [pa, ' Position Angle E of N (deg)']
+
+    # ---- RA (right ascension) -------------------------------------------------
+    try:
+        ra = str(header['TCS_RA']).strip()
+    except KeyError:
+        try:
+            ra = str(header['RA']).strip()
+        except KeyError:
+            ra = 'nan'
+    hdrinfo['RA'] = [ra, ' Right Ascension, FK5 J2000']
+
+    # ---- DEC (declination) ----------------------------------------------------
+    try:
+        dec = str(header['TCS_DEC']).strip()
+    except KeyError:
+        try:
+            dec = str(header['DEC']).strip()
+        except KeyError:
+            dec = 'nan'
+    if dec != 'nan' and not re.search(r'^[+-]', dec):
+        dec = '+' + dec
+    hdrinfo['DEC'] = [dec, ' Declination, FK5 J2000']
+
+    # ---- ITIME / NCOADDS / IMGITIME -------------------------------------------
+    try:
+        itime = float(header['ITIME'])
+    except (KeyError, TypeError, ValueError):
+        itime = np.nan
+    hdrinfo['ITIME'] = [itime, ' Integration time (sec)']
+
+    try:
+        coadds = int(header['CO_ADDS'])
+    except (KeyError, TypeError, ValueError):
+        coadds = 1
+    hdrinfo['NCOADDS'] = [coadds, ' Number of COADDS']
+
+    imgitime = itime * coadds if not np.isnan(itime) else np.nan
+    hdrinfo['IMGITIME'] = [imgitime,
+                           ' Image integration time, NCOADDSxITIME (sec)']
+
+    # ---- TIME (UT start time) -------------------------------------------------
+    try:
+        time_val = str(header['TIME_OBS']).strip()
+    except KeyError:
+        time_val = 'nan'
+    hdrinfo['TIME'] = [time_val, ' Observation time in UTC']
+
+    # ---- DATE (UT date) -------------------------------------------------------
+    try:
+        date_val = str(header['DATE_OBS']).strip()
+    except KeyError:
+        date_val = 'nan'
+    hdrinfo['DATE'] = [date_val, ' Observation date in UTC']
+
+    # ---- MJD ------------------------------------------------------------------
+    try:
+        mjd = float(header['MJD_OBS'])
+    except (KeyError, TypeError, ValueError):
+        if date_val != 'nan' and time_val != 'nan':
+            try:
+                tobj = Time(date_val + 'T' + time_val)
+                mjd = tobj.mjd
+            except Exception:
+                mjd = np.nan
+        else:
+            mjd = np.nan
+    hdrinfo['MJD'] = [mjd, ' Modified Julian date']
+
+    # ---- FILENAME -------------------------------------------------------------
+    try:
+        fname = str(header['IRAFNAME']).strip()
+    except KeyError:
+        try:
+            fname = str(header['FILENAME']).strip()
+        except KeyError:
+            fname = 'unknown'
+    hdrinfo['FILENAME'] = [fname, ' Filename']
+
+    # ---- MODE (observing sub-mode, e.g. J0, K3) --------------------------------
+    try:
+        mode = str(header['PASSBAND']).strip()
+    except KeyError:
+        try:
+            mode = str(header['GRAT']).strip()
+        except KeyError:
+            mode = 'unknown'
+
+    # Validate that the mode is one of the supported J/H/K sub-modes.
+    # An explicit unsupported mode (L, Lp, M, …) is a hard error; an absent
+    # PASSBAND/GRAT keyword (mode == 'unknown') is allowed and produces a
+    # warning so that test headers with no mode do not fail.
+    if mode != 'unknown' and mode not in SUPPORTED_MODES:
+        raise pySpextoolError(
+            f"get_header: observing mode '{mode}' is not supported.  "
+            f"This module handles J/H/K sub-modes only "
+            f"({', '.join(SUPPORTED_MODES)}).  "
+            f"L, Lp, and M modes are explicitly out of scope.")
+
+    hdrinfo['MODE'] = [mode, ' Instrument Mode']
+
+    # ---- INSTR (hardcoded) ----------------------------------------------------
+    hdrinfo['INSTR'] = ['iSHELL', ' Instrument']
+
+    return hdrinfo
 
 
 def load_data(
@@ -335,39 +467,84 @@ def load_data(
         coefficients: npt.ArrayLike = None,
         linearity_correction: bool = True) -> tuple:
     """
-    Load a single iSHELL FITS file, apply corrections, and return arrays.
+    Load a single iSHELL raw MEF FITS file and return normalised arrays.
+
+    Reads the three-extension iSHELL MEF structure, flags non-linear pixels
+    using the pedestal+signal sum (extensions 1 + 2), divides by total
+    exposure time to produce DN s⁻¹, and estimates the variance.
 
     Parameters
     ----------
     file : str
-        Full path to a single iSHELL FITS file.
+        Full path to a single iSHELL raw MEF FITS file.
 
     linearity_info : dict
-        ``"max"`` : int   DN threshold for non-linearity flag.
-        ``"bit"`` : int   Bitmask bit to set.
+        ``"max"`` : int
+            DN threshold above which a pixel is flagged as non-linear.
+            Flagging uses the **pedestal + signal sum** (extensions 1 + 2),
+            consistent with the iSHELL Spextool Manual §2.3.
+        ``"bit"`` : int
+            Bit number to set in the returned bitmask for flagged pixels.
 
-    keywords : list of str
-        FITS keywords to retain in the header dictionary.
+    keywords : list of str or None
+        Extra FITS keywords to retain in the header dictionary
+        (forwarded to :func:`get_header`).
 
-    coefficients : ndarray, optional
-        Pixel-by-pixel polynomial linearity-correction coefficients,
-        shape ``(ncoefficients, nrows, ncols)``.  If *None* and
-        *linearity_correction* is True, the coefficients are loaded from
-        the instrument package (if available).
+    coefficients : ndarray or None, optional
+        Polynomial linearity-correction coefficients,
+        shape ``(ncoefficients, nrows, ncols)``.  Currently unused;
+        linearity correction is a Phase 2 task.
 
     linearity_correction : bool, default True
-        Apply polynomial linearity correction to the raw data.
+        Reserved for Phase 2.  Accepted for interface compatibility but not
+        yet applied (the polynomial correction algorithm is not yet
+        implemented).
 
     Returns
     -------
-    data : ndarray, shape (nrows, ncols)
-        Science image in DN s⁻¹ (divided by ITIME × CO_ADDS).
+    img : ndarray, shape (nrows, ncols)
+        Science image in DN s⁻¹ (extension 0 / (ITIME × CO_ADDS)).
     var : ndarray, shape (nrows, ncols)
-        Variance image in (DN s⁻¹)².
+        Variance image in (DN s⁻¹)².  Estimated from shot noise + read
+        noise using the detector constants at the top of this module.
     hdrinfo : dict
-        Normalised header keyword dictionary from ``get_header()``.
-    bitmask : ndarray of int8, shape (nrows, ncols)
-        Bitmask with non-linear pixels flagged.
+        Normalised header keyword dictionary from :func:`get_header`.
+    bitmask : ndarray of uint8, shape (nrows, ncols)
+        Bit ``linearity_info['bit']`` set for non-linear pixels.
+
+    Raises
+    ------
+    pySpextoolError
+        If the file does not have exactly 3 FITS extensions (NINT=3).
+    pySpextoolError
+        If ITIME is missing or non-numeric.
+    pySpextoolError
+        If ITIME is not positive (``ITIME <= 0``).
+    pySpextoolError
+        If CO_ADDS is less than 1.
+    pySpextoolError
+        If the MODE parsed from the header is an unsupported iSHELL mode
+        (L, Lp, M, …); raised inside :func:`get_header`.
+
+    Notes
+    -----
+    Raw MEF structure (iSHELL Spextool Manual §2.3):
+
+    =========  ==========================================================
+    Extension  Contents
+    =========  ==========================================================
+    0          Signal difference S = Σ pedestal_reads − Σ signal_reads
+               (the science image in total DN); also carries all header
+               keywords.
+    1          Pedestal sum Σ p_{jk,i}
+    2          Signal sum   Σ s_{jk,i}
+    =========  ==========================================================
+
+    Non-linearity is flagged when ``ext1 + ext2 > linearity_info['max']``.
+
+    The polynomial H2RG linearity correction (``_correct_ishell_linearity``)
+    and reference-pixel bias subtraction (``_subtract_reference_pixels``) are
+    *not* yet applied; see the Phase 2 task notes in those functions.
     """
 
     check_parameter('load_data', 'file', file, 'str')
@@ -376,15 +553,90 @@ def load_data(
     check_parameter('load_data', 'linearity_correction', linearity_correction,
                     'bool')
 
-    raise NotImplementedError(
-        'load_data() for iSHELL is not yet implemented.  '
-        'Phase 1 task: implement H2RG reference-pixel bias subtraction, '
-        'polynomial linearity correction, and variance estimation.  '
-        'See docs/ishell_design_memo.md §5.3.')
+    # ---- open the MEF file ----------------------------------------------------
+    hdul = fits.open(file, ignore_missing_end=True)
+    hdul[0].verify('silentfix')
+
+    n_ext = len(hdul)
+    if n_ext != 3:
+        hdul.close()
+        raise pySpextoolError(
+            f'load_data: expected exactly 3 FITS extensions (NINT=3) for an '
+            f'iSHELL raw MEF file; found {n_ext} extension(s) in {file!r}. '
+            f'Check that the file is a valid raw iSHELL science frame.')
+
+    primary_header = hdul[0].header
+
+    # ---- read exposure parameters from header ---------------------------------
+    try:
+        itime = float(primary_header['ITIME'])
+    except (KeyError, TypeError, ValueError) as exc:
+        hdul.close()
+        raise pySpextoolError(
+            f'load_data: FITS keyword ITIME missing or non-numeric '
+            f'in {file!r}.') from exc
+
+    if itime <= 0.0:
+        hdul.close()
+        raise pySpextoolError(
+            f'load_data: ITIME must be positive; got ITIME={itime} '
+            f'in {file!r}.')
+
+    try:
+        coadds = int(primary_header['CO_ADDS'])
+    except (KeyError, TypeError, ValueError):
+        coadds = 1
+
+    if coadds < 1:
+        hdul.close()
+        raise pySpextoolError(
+            f'load_data: CO_ADDS must be >= 1; got CO_ADDS={coadds} '
+            f'in {file!r}.')
+
+    total_exptime = itime * coadds
+
+    # ---- read the three data planes -------------------------------------------
+    # ext0: signal difference S (the science data, total DN)
+    # ext1: pedestal sum (used for linearity flagging)
+    # ext2: signal sum   (used for linearity flagging)
+    sig_diff = hdul[0].data.astype(float)
+    ped_sum  = hdul[1].data.astype(float)
+    sig_sum  = hdul[2].data.astype(float)
+
+    # ---- collect header keywords -----------------------------------------------
+    hdrinfo = get_header(primary_header, keywords=keywords)
+
+    hdul.close()
+
+    # ---- non-linearity flagging ------------------------------------------------
+    # Use pedestal + signal sum per Manual §2.3: "we do use the sum of the
+    # pedestal and signal reads to identify pixels beyond the linearity curve
+    # maximum."
+    total_counts = ped_sum + sig_sum
+    lin_bit = linearity_info['bit']
+    bitmask = ((total_counts > linearity_info['max'])
+               .astype(np.uint8) * np.uint8(2 ** lin_bit))
+
+    # ---- NOTE: linearity correction not yet applied ---------------------------
+    # _correct_ishell_linearity() and _subtract_reference_pixels() are Phase 2
+    # tasks.  The raw signal difference is used directly.
+
+    # ---- normalise to DN s⁻¹ --------------------------------------------------
+    img = sig_diff / total_exptime
+
+    # ---- variance estimate (shot noise + read noise) --------------------------
+    # var = |S_raw| / (gain * T²) + 2 * (ron/gain)² / T²
+    # where T = total_exptime, S_raw in total DN
+    gain = GAIN_ELECTRONS_PER_DN
+    ron  = READNOISE_ELECTRONS
+    var = (np.abs(sig_diff) / (gain * total_exptime ** 2)
+           + 2.0 * (ron / gain) ** 2 / total_exptime ** 2)
+
+    return img, var, hdrinfo, bitmask
 
 
 # ---------------------------------------------------------------------------
-# Private helpers  (Phase 1 implementation targets)
+# Private helpers  (Phase 2 implementation targets)
 # ---------------------------------------------------------------------------
 
 
@@ -436,7 +688,7 @@ def _correct_ishell_linearity(
 
     raise NotImplementedError(
         '_correct_ishell_linearity() not yet implemented.  '
-        'Phase 1 task.  See docs/ishell_design_memo.md Blocker B1.')
+        'Phase 2 task.  See docs/ishell_design_memo.md Blocker B1.')
 
 
 def _subtract_reference_pixels(image: npt.ArrayLike) -> npt.ArrayLike:
@@ -467,7 +719,7 @@ def _subtract_reference_pixels(image: npt.ArrayLike) -> npt.ArrayLike:
 
     raise NotImplementedError(
         '_subtract_reference_pixels() not yet implemented.  '
-        'Phase 1 task.  See docs/ishell_design_memo.md §5.3.')
+        'Phase 2 task.  See docs/ishell_design_memo.md §5.3.')
 
 
 def _rectify_orders(

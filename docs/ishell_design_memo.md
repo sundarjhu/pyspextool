@@ -1,6 +1,6 @@
 # iSHELL Backend Integration Design Memo
 
-**Status:** Draft  
+**Status:** Phase 1 (ingestion layer implemented)  
 **Scope:** NASA IRTF iSHELL spectrograph, J / H / K modes only  
 **Restriction:** L, Lp, and M modes are explicitly out of scope.
 
