@@ -1,0 +1,86 @@
+# iSHELL mode registry
+# Supported J/H/K modes only.  L/Lp/M are not yet implemented.
+#
+# Fields:
+#   family         - spectral family (J, H, or K)
+#   wavecal_method - wavelength-calibration strategy (thar = ThAr arc lamp)
+#   line_list      - arc-line list file (relative to the data/ sub-package)
+#   flatinfo       - flat-field calibration FITS file
+#   wavecalinfo    - wavelength-calibration FITS file
+
+J0:
+  family: J
+  wavecal_method: thar
+  line_list: J0_lines.dat
+  flatinfo: J0_flatinfo.fits
+  wavecalinfo: J0_wavecalinfo.fits
+
+J1:
+  family: J
+  wavecal_method: thar
+  line_list: J1_lines.dat
+  flatinfo: J1_flatinfo.fits
+  wavecalinfo: J1_wavecalinfo.fits
+
+J2:
+  family: J
+  wavecal_method: thar
+  line_list: J2_lines.dat
+  flatinfo: J2_flatinfo.fits
+  wavecalinfo: J2_wavecalinfo.fits
+
+J3:
+  family: J
+  wavecal_method: thar
+  line_list: J3_lines.dat
+  flatinfo: J3_flatinfo.fits
+  wavecalinfo: J3_wavecalinfo.fits
+
+H1:
+  family: H
+  wavecal_method: thar
+  line_list: H1_lines.dat
+  flatinfo: H1_flatinfo.fits
+  wavecalinfo: H1_wavecalinfo.fits
+
+H2:
+  family: H
+  wavecal_method: thar
+  line_list: H2_lines.dat
+  flatinfo: H2_flatinfo.fits
+  wavecalinfo: H2_wavecalinfo.fits
+
+H3:
+  family: H
+  wavecal_method: thar
+  line_list: H3_lines.dat
+  flatinfo: H3_flatinfo.fits
+  wavecalinfo: H3_wavecalinfo.fits
+
+K1:
+  family: K
+  wavecal_method: thar
+  line_list: K1_lines.dat
+  flatinfo: K1_flatinfo.fits
+  wavecalinfo: K1_wavecalinfo.fits
+
+K2:
+  family: K
+  wavecal_method: thar
+  line_list: K2_lines.dat
+  flatinfo: K2_flatinfo.fits
+  wavecalinfo: K2_wavecalinfo.fits
+
+K3:
+  family: K
+  wavecal_method: thar
+  line_list: K3_lines.dat
+  flatinfo: K3_flatinfo.fits
+  wavecalinfo: K3_wavecalinfo.fits
+
+Kgas:
+  family: K
+  wavecal_method: thar
+  line_list: Kgas_lines.dat
+  flatinfo: Kgas_flatinfo.fits
+  wavecalinfo: Kgas_wavecalinfo.fits
