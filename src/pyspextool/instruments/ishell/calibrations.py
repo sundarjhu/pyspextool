@@ -213,6 +213,19 @@ class FlatInfo:
         Common-region window size in pixels.
     image : numpy.ndarray, shape (2048, 2048)
         Flat-field detector image.
+    xranges : numpy.ndarray, shape (n_orders, 2) or None
+        Per-order column ranges ``[x_start, x_end]`` parsed from the
+        ``OR{n}_XR`` header keywords.  ``None`` if the header does not
+        contain these keywords.
+    edge_coeffs : numpy.ndarray, shape (n_orders, 2, n_terms) or None
+        Per-order edge polynomial coefficients.  ``edge_coeffs[i, 0, :]``
+        is the bottom-edge polynomial for order *i*; ``edge_coeffs[i, 1,
+        :]`` is the top-edge polynomial.  Coefficients follow the
+        ``numpy.polynomial.polynomial`` convention (constant term first).
+        ``None`` if the header does not contain ``OR{n}_B1…`` keywords.
+    edge_degree : int or None
+        Polynomial degree of the edge fits (``EDGEDEG`` header keyword).
+        ``None`` if the keyword is absent.
     """
 
     mode: str
@@ -227,6 +240,9 @@ class FlatInfo:
     flat_fraction: float
     comm_window: int
     image: np.ndarray
+    xranges: Optional[np.ndarray] = None
+    edge_coeffs: Optional[np.ndarray] = None
+    edge_degree: Optional[int] = None
 
     @property
     def n_orders(self) -> int:
@@ -249,8 +265,11 @@ class WaveCalInfo:
     resolving_power : float
         Nominal spectral resolving power.
     data : numpy.ndarray, shape (n_orders, 4, n_pixels)
-        Spectral data cube.  The four planes contain spectral arrays
-        (exact labelling is instrument-specific; see module docstring).
+        Spectral data cube.  Plane 0 contains the stored reference
+        wavelength solution (microns).  Plane 1 contains the arc-lamp
+        spectrum (DN/s).  Plane 2 contains the uncertainty.  Plane 3
+        contains quality flags.  Pixels outside the valid column range
+        for each order are set to NaN.
     linelist_name : str
         Filename of the arc-line list used for calibration.
     wcal_type : str
@@ -261,6 +280,12 @@ class WaveCalInfo:
         Degree of the dispersion-direction polynomial.
     order_degree : int
         Degree of the cross-order polynomial.
+    xranges : numpy.ndarray, shape (n_orders, 2) or None
+        Per-order column ranges ``[x_start, x_end]`` parsed from the
+        ``OR{n}_XR`` header keywords.  Array index 0 of the data cube
+        third axis corresponds to detector column ``xranges[i, 0]`` for
+        order *i*.  ``None`` if the header does not contain these
+        keywords.
     """
 
     mode: str
@@ -273,6 +298,7 @@ class WaveCalInfo:
     home_order: int
     disp_degree: int
     order_degree: int
+    xranges: Optional[np.ndarray] = None
 
     @property
     def n_pixels(self) -> int:
@@ -367,6 +393,74 @@ class ModeCalibrations:
     line_list: LineList
     flatinfo: FlatInfo
     wavecalinfo: WaveCalInfo
+
+
+# ---------------------------------------------------------------------------
+# FITS header parsing helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_order_xranges(
+    hdr, orders: list[int]
+) -> Optional[np.ndarray]:
+    """Parse per-order column ranges from ``OR{n}_XR`` header keywords.
+
+    Parameters
+    ----------
+    hdr : astropy FITS header
+    orders : list of int
+
+    Returns
+    -------
+    ndarray, shape (n_orders, 2) or None
+        Column ranges ``[x_start, x_end]`` for each order, or ``None``
+        if no ``OR{n}_XR`` keywords are present.
+    """
+    xranges = []
+    for o in orders:
+        key = f"OR{o}_XR"
+        if key not in hdr:
+            return None
+        try:
+            parts = [int(x) for x in str(hdr[key]).split(",")]
+            xranges.append(parts[:2])
+        except (ValueError, IndexError):
+            return None
+    return np.array(xranges, dtype=int)
+
+
+def _parse_order_edge_coeffs(
+    hdr, orders: list[int]
+) -> Optional[np.ndarray]:
+    """Parse per-order edge polynomial coefficients from the FITS header.
+
+    Reads ``OR{n}_B1`` … ``OR{n}_Bk`` (bottom edge) and ``OR{n}_T1``
+    … ``OR{n}_Tk`` (top edge) keywords.  The number of terms *k* is
+    determined from the ``EDGEDEG`` keyword (``n_terms = EDGEDEG + 1``).
+
+    Returns
+    -------
+    ndarray, shape (n_orders, 2, n_terms) or None
+        Edge polynomial coefficients in ``numpy.polynomial.polynomial``
+        convention (constant term at index 0).  Returns ``None`` if
+        ``EDGEDEG`` is absent or any expected keyword is missing.
+    """
+    if "EDGEDEG" not in hdr:
+        return None
+    n_terms = int(hdr["EDGEDEG"]) + 1
+    result = []
+    for o in orders:
+        bottom = []
+        top = []
+        for k in range(1, n_terms + 1):
+            bkey = f"OR{o}_B{k}"
+            tkey = f"OR{o}_T{k}"
+            if bkey not in hdr or tkey not in hdr:
+                return None
+            bottom.append(float(hdr[bkey]))
+            top.append(float(hdr[tkey]))
+        result.append([bottom, top])
+    return np.array(result, dtype=float)
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +613,9 @@ def read_flatinfo(mode_name: str) -> FlatInfo:
         flat_fraction=float(hdr.get("FLATFRAC", float("nan"))),
         comm_window=int(hdr.get("COMWIN", 0)),
         image=image,
+        xranges=_parse_order_xranges(hdr, orders),
+        edge_coeffs=_parse_order_edge_coeffs(hdr, orders),
+        edge_degree=int(hdr["EDGEDEG"]) if "EDGEDEG" in hdr else None,
     )
 
 
@@ -606,6 +703,7 @@ def read_wavecalinfo(mode_name: str) -> WaveCalInfo:
         home_order=int(hdr.get("HOMEORDR", 0)),
         disp_degree=int(hdr.get("DISPDEG", 0)),
         order_degree=int(hdr.get("ORDRDEG", 0)),
+        xranges=_parse_order_xranges(hdr, orders),
     )
 
 

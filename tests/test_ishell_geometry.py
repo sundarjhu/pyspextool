@@ -450,11 +450,28 @@ class TestNonRegression:
         assert hasattr(ishell_mod, "get_header")
         assert hasattr(ishell_mod, "load_data")
 
-    def test_rectify_orders_raises_not_implemented(self):
-        """_rectify_orders() must still raise NotImplementedError."""
+    def test_rectify_orders_empty_geometry_returns_input(self):
+        """_rectify_orders() with an empty geometry set returns the input unchanged."""
         from pyspextool.instruments.ishell.ishell import _rectify_orders
         from pyspextool.instruments.ishell.geometry import OrderGeometrySet
         dummy_img = np.zeros((10, 10))
         dummy_geom = OrderGeometrySet(mode="K1")
-        with pytest.raises(NotImplementedError):
-            _rectify_orders(dummy_img, dummy_geom)
+        result = _rectify_orders(dummy_img, dummy_geom)
+        np.testing.assert_array_equal(result, dummy_img)
+
+    def test_rectify_orders_no_wave_solution_raises_value_error(self):
+        """_rectify_orders() must raise ValueError if geometry has no wavelength solution."""
+        from pyspextool.instruments.ishell.ishell import _rectify_orders
+        from pyspextool.instruments.ishell.geometry import OrderGeometry, OrderGeometrySet
+        dummy_img = np.zeros((100, 100))
+        # Build a geometry without wavelength solution
+        g = OrderGeometry(
+            order=233,
+            x_start=10,
+            x_end=50,
+            bottom_edge_coeffs=np.array([20.0, 0.0]),
+            top_edge_coeffs=np.array([40.0, 0.0]),
+        )
+        geom = OrderGeometrySet(mode="K1", geometries=[g])
+        with pytest.raises(ValueError, match="wavelength solution"):
+            _rectify_orders(dummy_img, geom)

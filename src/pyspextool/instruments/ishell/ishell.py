@@ -112,6 +112,10 @@ REF_PIX_WIDTH = 4
 #: PLTSCALE = 0.125000 arcsec/pixel (consistent with 0.375" slit / 3 pixels).
 PIXEL_SCALE_ARCSEC_PER_PIX = 0.125
 
+#: Default plate scale used as fallback in _rectify_orders when not explicitly
+#: provided (matches the standard iSHELL plate scale above).
+_DEFAULT_PLATE_SCALE = PIXEL_SCALE_ARCSEC_PER_PIX
+
 #: Linearity correction maximum (DN).  From Table 4 of the iSHELL Spextool
 #: Manual, LINCRMAX example value = 30000.  Pixels with pedestal+signal sum
 #: above this value are flagged and not linearity-corrected.
@@ -725,7 +729,8 @@ def _subtract_reference_pixels(image: npt.ArrayLike) -> npt.ArrayLike:
 
 def _rectify_orders(
         image: npt.ArrayLike,
-        geometry: OrderGeometrySet) -> npt.ArrayLike:
+        geometry: OrderGeometrySet,
+        plate_scale_arcsec: float = _DEFAULT_PLATE_SCALE) -> np.ndarray:
     """
     Rectify tilted iSHELL echelle orders onto a rectilinear grid.
 
@@ -744,28 +749,119 @@ def _rectify_orders(
         Must have ``geometry.has_tilt() == True`` before this function can
         be called.
 
+    plate_scale_arcsec : float, optional
+        Spatial plate scale in arcsec/pixel.  Defaults to 0.125 arcsec/pixel
+        (the standard iSHELL plate scale).
+
     Returns
     -------
     rectified : ndarray, shape (nrows, ncols)
-        Rectified image with orders aligned to detector rows.
+        Rectified image with orders resampled to remove spectral-line tilt.
+        Pixels outside all orders are set to NaN.
 
     Notes
     -----
     This is the primary new piece of instrument-specific logic required for
     iSHELL and has no equivalent in the SpeX pipeline.
 
-    The implementation depends on the tilt and wavelength polynomial
-    coefficients stored in *geometry*, which are populated during the wavecal
-    step.  Call :func:`~pyspextool.instruments.ishell.geometry.build_order_geometry_set`
-    to create the geometry from flat-field data, then run the wavecal step to
-    fill in tilt/wavelength information before calling this function.
+    The implementation uses :func:`scipy.ndimage.map_coordinates` with
+    bilinear interpolation (``order=1``) to resample each order from the
+    tilted raw frame onto a rectilinear grid.  Each output pixel at
+    ``(row, col)`` within an order is mapped to a source column via the
+    tilt polynomial::
 
-    .. todo::
-        Phase 2: implement interpolation once tilt polynomial format is
-        confirmed from real ThAr arc data.
-        See docs/ishell_geometry_design_note.md §4.
+        src_col = col + tilt(col) * (row - centerline(col))
+        src_row = row          # rows are not shifted
+
+    With the current zero-tilt approximation (``tilt_coeffs = [0.0]``),
+    the mapping is the identity and the output equals the input within the
+    order boundaries.  Real tilt measurement from arc frames will make
+    the correction non-trivial.
+
+    The function requires ``geometry.has_wavelength_solution()`` to be
+    ``True``; if the geometry is empty (no orders) the input image is
+    returned unchanged.
     """
+    from scipy.ndimage import map_coordinates
 
-    raise NotImplementedError(
-        '_rectify_orders() not yet implemented.  '
-        'Phase 2 task.  See docs/ishell_geometry_design_note.md §4.')
+    from .wavecal import build_rectification_maps
+
+    image_arr = np.asarray(image, dtype=float)
+
+    # Nothing to do for an empty geometry set
+    if geometry.n_orders == 0:
+        return image_arr.copy()
+
+    if not geometry.has_wavelength_solution():
+        raise ValueError(
+            "_rectify_orders() requires a fully populated OrderGeometrySet "
+            "with wavelength solutions.  Call "
+            "wavecal.build_geometry_from_wavecalinfo() first to populate "
+            "wave_coeffs for every order."
+        )
+
+    nrows, ncols = image_arr.shape
+    output = np.full((nrows, ncols), np.nan, dtype=float)
+
+    # Build rectification maps for every order
+    rect_maps = build_rectification_maps(
+        geom_set=geometry,
+        plate_scale_arcsec=plate_scale_arcsec,
+    )
+
+    for geom, rmap in zip(geometry.geometries, rect_maps):
+        x_start = geom.x_start
+        x_end = geom.x_end
+
+        # For each column in the order's column range, apply tilt correction
+        cols_out = np.arange(x_start, x_end + 1, dtype=float)
+        n_cols = len(cols_out)
+
+        # Row range for this order: scan the full column range to get the
+        # overall row extent
+        row_bot_arr = geom.eval_bottom_edge(cols_out)
+        row_top_arr = geom.eval_top_edge(cols_out)
+        row_min = max(0, int(np.floor(row_bot_arr.min())))
+        row_max = min(nrows - 1, int(np.ceil(row_top_arr.max())))
+
+        rows_out = np.arange(row_min, row_max + 1, dtype=float)
+        n_rows = len(rows_out)
+
+        if n_rows == 0 or n_cols == 0:
+            continue
+
+        # Vectorised computation of source coordinates
+        # Shape: (n_rows, n_cols)
+        rows_grid, cols_grid = np.meshgrid(rows_out, cols_out, indexing="ij")
+
+        centerline_rows = geom.eval_centerline(cols_grid)
+        tilt_vals = geom.eval_tilt(cols_grid)
+
+        row_offsets = rows_grid - centerline_rows
+        src_cols = cols_grid + tilt_vals * row_offsets
+        src_rows = rows_grid  # rows are not shifted in the tilt model
+
+        # Mask pixels outside the order boundaries
+        in_order = (
+            (rows_grid >= geom.eval_bottom_edge(cols_grid))
+            & (rows_grid <= geom.eval_top_edge(cols_grid))
+            & (src_cols >= 0)
+            & (src_cols < ncols)
+        )
+
+        # Interpolate using map_coordinates
+        coords = np.array([src_rows.ravel(), src_cols.ravel()])
+        interp_vals = map_coordinates(
+            image_arr, coords, order=1, mode="constant", cval=np.nan
+        )
+        interp_grid = interp_vals.reshape(n_rows, n_cols)
+
+        # Write to output only within order boundaries
+        r_slice = slice(row_min, row_max + 1)
+        c_slice = slice(x_start, x_end + 1)
+        current = output[r_slice, c_slice]
+        mask = in_order
+        current[mask] = interp_grid[mask]
+        output[r_slice, c_slice] = current
+
+    return output
