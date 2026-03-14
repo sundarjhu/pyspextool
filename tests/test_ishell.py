@@ -103,7 +103,8 @@ def test_set_instrument_ishell():
 
 def test_set_instrument_ishell_lincormax():
     set_instrument('ishell')
-    assert setup.state['lincormax'] == 55000
+    # LINCORMAX = 30000 DN (iSHELL Spextool Manual Table 4, LINCRMAX example)
+    assert setup.state['lincormax'] == 30000
 
 
 def test_set_instrument_ishell_irtf_flag():
@@ -118,7 +119,9 @@ def test_set_instrument_ishell_suffix():
 
 def test_set_instrument_ishell_nint():
     set_instrument('ishell')
-    assert setup.state['nint'] == 1
+    # NINT = 3: raw MEF has 3 extensions (signal diff, pedestal sum, signal sum)
+    # (iSHELL Spextool Manual §2.3, equation 1)
+    assert setup.state['nint'] == 3
 
 
 def test_set_instrument_ishell_bad_pixel_mask_loaded():

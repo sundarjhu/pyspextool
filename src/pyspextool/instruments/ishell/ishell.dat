@@ -4,20 +4,23 @@
 # NASA IRTF iSHELL cross-dispersed echelle spectrograph
 # Teledyne H2RG 2048x2048 near-IR detector
 #
-# NOTE: Values marked TBD must be confirmed against real iSHELL data and
-#       IRTF instrument documentation before use in production.
+# Source: iSHELL Spextool Manual v10jan2020 (Cushing)
 #
 #============================================================================
 #
-# NINT: number of readout channels (H2RG uses a single output in most modes)
- NINT=1
+# NINT: number of raw FITS extensions per file.
+# iSHELL writes MEF files with exactly 3 extensions:
+#   extension 0: signal  S = sum(pedestal reads) - sum(signal reads)
+#   extension 1: pedestal sum
+#   extension 2: signal sum
+# (Manual §2.3, equation 1)
+ NINT=3
  BADPIXMASK=ishell_bdpxmk.fits
  SUFFIX=.[ab]
  READFITS=read_ishell_fits
-# TBD: confirm the actual DN saturation/linearity limit for the H2RG
-# detector in the readout modes used at IRTF.  Typical H2RG values
-# are in the range 40000-60000 DN depending on gain and sampling.
- LINCORMAX=55000
+# Linearity correction maximum (DN).
+# Value taken from the LINCRMAX example in Table 4 of the iSHELL Spextool Manual.
+ LINCORMAX=30000
 #
 # Additional instrument FITS header keywords to retain.
 # Will already get the standard set (INSTRUME, OBJECT, ITIME, DATE_OBS, etc.)

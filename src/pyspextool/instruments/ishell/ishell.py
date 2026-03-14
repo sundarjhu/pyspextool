@@ -5,6 +5,14 @@ NASA IRTF iSHELL cross-dispersed echelle spectrograph.
 Teledyne H2RG 2048 x 2048 near-IR detector.
 
 Scope: J, H, and K modes only.  L, Lp, and M modes are not implemented.
+Specifically, the supported near-IR sub-modes are:
+  J-band: J0, J1, J2, J3
+  H-band: H1, H2, H3
+  K-band: K1, K2, Kgas, K3
+
+Source
+------
+iSHELL Spextool Manual v10jan2020, Cushing et al.
 
 Interface contract
 ------------------
@@ -23,19 +31,43 @@ This module exposes three callables that are discovered at runtime by
 
 Key differences from SpeX / uSpeX
 -----------------------------------
-1.  Detector: Teledyne H2RG (2048 x 2048) vs. ALADDIN InSb (1024 x 1024).
-    Linearity correction uses a pixel-by-pixel polynomial evaluated on the
-    measured DN; the SpeX ``slowcnts``-based Vacca et al. (2004) algorithm
-    does not apply.
-2.  Bias: H2RG provides 4-side reference pixels (bottom 4 rows, top 4 rows,
-    left 4 columns, right 4 columns) that are used for bias subtraction.
+1.  Raw FITS format: iSHELL writes multi-extension FITS (MEF) files with
+    exactly **3 extensions** per file (NINT=3):
+
+    - Extension 0: signal S = Σ pedestal_reads − Σ signal_reads  (Eq. 1, Manual §2.3)
+    - Extension 1: pedestal sum Σ p_{jk,i}
+    - Extension 2: signal sum   Σ s_{jk,i}
+
+    SpeX writes 4 extensions (NINT=4); uSpeX writes 5 (NINT=5).
+
+2.  Linearity: The linearity correction uses the signal difference S (ext 0)
+    and the sum of pedestal+signal reads (ext 1 + ext 2) to identify pixels
+    above LINCORMAX = **30000 DN** (Manual Table 4, LINCRMAX example).
+    The SpeX ``slowcnts``-based Vacca et al. (2004) algorithm does not apply
+    to the H2RG detector.
+
+3.  Bias: H2RG provides 4-side reference pixels (bottom 4 rows, top 4 rows,
+    left 4 columns, right 4 columns) that track bias and 1/f noise.
     uSpeX corrects 32-amplifier bias drifts column-wise; that method does
     not apply here.
-3.  Header keywords: iSHELL uses different FITS keyword names (e.g.
-    ``UTSTART`` instead of ``TIME_OBS``, ``CO_ADDS`` instead of ``DIVISOR``).
-4.  Order geometry: iSHELL echelle orders are tilted with respect to detector
+
+4.  Header keywords: iSHELL uses different FITS keyword names from SpeX/uSpeX.
+    The exact raw keyword names must be confirmed against real iSHELL headers
+    (Phase 1 task; see ``get_header()``).
+
+5.  Order geometry: iSHELL echelle orders are tilted with respect to detector
     columns.  Raw images must be *rectified* before the generic
-    ``extract_1dxd()`` routine can be applied.  See ``rectify_orders()``.
+    ``extract_1dxd()`` routine can be applied.  See ``_rectify_orders()``.
+
+6.  Telluric correction: The **deconvolution** method is NOT available for
+    iSHELL.  Only the **IP (instrumental-profile) method** is supported
+    (Manual §6.2: "The deconvolution method is not available for iSHELL
+    data").  The ``telluric_modeinfo.dat`` file therefore specifies
+    ``ip`` for all modes.
+
+7.  Arc lamp: All J/H/K modes use a **ThAr** (thorium-argon) arc lamp for
+    wavelength calibration (Manual Table 1).  This is different from the
+    Ar-only lamp used by SpeX.
 
 Status
 ------
@@ -59,7 +91,7 @@ from pyspextool.pyspextoolerror import pySpextoolError
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Detector constants (TBD: confirm from IRTF documentation / real data)
+# Detector constants
 # ---------------------------------------------------------------------------
 
 #: H2RG detector dimensions (science pixels, excluding reference pixel border)
@@ -69,14 +101,34 @@ NCOLS = 2048
 #: H2RG reference pixel border width (pixels)
 REF_PIX_WIDTH = 4
 
-#: Approximate detector gain (e-/DN).  Confirm with IRTF instrument team.
-GAIN_ELECTRONS_PER_DN = 1.8  # TBD
+#: Plate scale (arcsec/pixel).  From Table 4 of the iSHELL Spextool Manual:
+#: PLTSCALE = 0.125000 arcsec/pixel (consistent with 0.375" slit / 3 pixels).
+PIXEL_SCALE_ARCSEC_PER_PIX = 0.125
 
-#: Approximate read noise for Fowler-16 sampling (e-).  Confirm with IRTF.
-READNOISE_ELECTRONS = 8.0  # TBD
+#: Linearity correction maximum (DN).  From Table 4 of the iSHELL Spextool
+#: Manual, LINCRMAX example value = 30000.  Pixels with pedestal+signal sum
+#: above this value are flagged and not linearity-corrected.
+LINCORMAX_DN = 30000
 
-#: Supported observing modes in this module (J/H/K only; L/Lp/M excluded).
-SUPPORTED_MODES = ('J', 'H', 'K')
+#: Approximate detector gain (e-/DN).  Not stated explicitly in the iSHELL
+#: Spextool Manual; must be confirmed from IRTF calibration files.
+GAIN_ELECTRONS_PER_DN = 1.8  # TBD: confirm from IRTF calibration files
+
+#: Approximate read noise (e-).  Not stated explicitly in the iSHELL Spextool
+#: Manual; must be confirmed from IRTF calibration files.
+READNOISE_ELECTRONS = 8.0  # TBD: confirm from IRTF calibration files
+
+#: Supported J-band sub-modes (ThAr arc lamp, 5" slit; Manual Table 1).
+J_MODES = ('J0', 'J1', 'J2', 'J3')
+
+#: Supported H-band sub-modes (ThAr arc lamp, 5" slit; Manual Table 1).
+H_MODES = ('H1', 'H2', 'H3')
+
+#: Supported K-band sub-modes (ThAr arc lamp, 5" slit; Manual Table 1).
+K_MODES = ('K1', 'K2', 'Kgas', 'K3')
+
+#: All supported observing modes in this module (J/H/K only; L/Lp/M excluded).
+SUPPORTED_MODES = J_MODES + H_MODES + K_MODES
 
 # ---------------------------------------------------------------------------
 # Public interface
@@ -236,26 +288,34 @@ def get_header(header: fits.Header, keywords: list) -> dict:
     Output key    iSHELL keyword       Notes
     ============  ===================  ======================================
     INSTRUME      INSTRUME             No rename needed
-    MODE          PINSTMOD / MODE      Observing mode (J/H/K)
-    FILENAME      IRAFNAME             Original IRAF file name
+    MODE          PASSBAND             Observing mode sub-name (J0/J1…K3)
+    FILENAME      (IRAFNAME?)          Original file name (TBD: confirm)
     OBSDATE       DATE-OBS             UT date (YYYY-MM-DD)
-    OBSTIME       UTSTART              UT start time (HH:MM:SS.S)
-    OBSMJD        MJD_OBS              MJD at start; computed if absent
+    OBSTIME       (UTSTART?)           UT start time (TBD: confirm keyword)
+    OBSMJD        (MJD_OBS?)           MJD at start; computed if absent
     EXPTIME       ITIME                Integration time per frame (s)
+    NCOADDS       NCOADDS              Number of co-adds
     RA            RA                   Right ascension (deg)
     DEC           DEC                  Declination (deg)
-    POSANGLE      POSANGLE             Slit position angle (deg E of N)
-    HOURANG       TCS_HA               Hour angle (h)
-    AIRMASS       TCS_AM               Airmass
+    POSANGLE      PA                   Slit position angle (deg E of N)
+    HOURANG       HA                   Hour angle (h)
+    AIRMASS       AIRMASS              Airmass
     SLIT          SLIT                 Slit name
-    GRATING       ECHNAME              Echelle grating name
-    CO_ADDS       CO_ADDS              Number of co-adds
     ============  ===================  ======================================
 
+    The output keyword names (DATE, TIME, MJD, NCOADDS, ITIME, RA, DEC, PA,
+    HA, AM) are documented in Table 4 of the iSHELL Spextool Manual.  The
+    corresponding raw FITS keyword names in iSHELL headers are NOT listed in
+    the manual and must be confirmed against real iSHELL FITS files (Phase 1
+    task, Blocker B9).
+
     .. warning::
-        Keyword names and availability must be confirmed against real iSHELL
-        FITS headers.  The mapping above is based on IRTF public documentation
-        and may be incomplete.
+        The raw iSHELL keyword names listed above (``DATE-OBS``, ``UTSTART``,
+        ``NCOADDS``, ``ITIME``, ``RA``, ``DEC``, ``PA``, ``HA``, ``AIRMASS``,
+        ``SLIT``, ``PASSBAND``) are best-guess mappings derived from the
+        Spextool output keyword names documented in Manual Table 4.  They
+        must be confirmed against real iSHELL FITS headers before Phase 1 is
+        complete.
     """
 
     check_parameter('get_header', 'header', header, 'Header')
@@ -361,6 +421,14 @@ def _correct_ishell_linearity(
     The Vacca et al. (2004) algorithm used for SpeX is **not applicable** to
     the H2RG detector.  The H2RG correction is a direct polynomial
     evaluation:  corrected = Σ_k coefficients[k] × image^k.
+
+    The linearity flagging uses the **sum** of pedestal and signal reads
+    (FITS extensions 1 and 2 of the raw MEF file) rather than the signal
+    difference alone, as stated in the iSHELL Spextool Manual §2.3:
+    "we do use the sum of the pedestal and signal reads to identify pixels
+    that have counts beyond the linearity curve maximum."
+
+    LINCORMAX = 30000 DN (iSHELL Spextool Manual Table 4, LINCRMAX example).
 
     .. todo::
         Phase 1: implement and validate against IRTF-provided calibration.

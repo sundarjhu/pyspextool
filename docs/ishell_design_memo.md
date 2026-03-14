@@ -132,9 +132,9 @@ src/pyspextool/
         ├── telluric_modeinfo.dat          J / H / K telluric params (TBD)
         ├── telluric_ewadjustments.dat     EW scale corrections      (TBD)
         ├── telluric_shiftinfo.dat         shift windows             (TBD)
-        ├── J_lines.dat                    Ar + Xe arc lines, J band (TBD)
-        ├── H_lines.dat                    Ar + Xe arc lines, H band (TBD)
-        └── K_lines.dat                    Ar + Xe arc lines, K band (TBD)
+        ├── J_lines.dat                    ThAr arc lines, J sub-modes (TBD)
+        ├── H_lines.dat                    ThAr arc lines, H sub-modes (TBD)
+        └── K_lines.dat                    ThAr arc lines, K sub-modes (TBD)
 ```
 
 Calibration FITS files (`<Mode>_flatinfo.fits`, `<Mode>_wavecalinfo.fits`)
@@ -198,7 +198,7 @@ combine / telluric / merge
 | `instruments/ishell/telluric_ewadjustments.dat` | Filled from real data |
 | `instruments/ishell/telluric_shiftinfo.dat` | Filled from real data |
 | `instruments/ishell/IP_coefficients.dat` | iSHELL slit-width IP parameters |
-| `instruments/ishell/{J,H,K}_lines.dat` | Ar + Xe line lists for iSHELL passbands |
+| `instruments/ishell/{J,H,K}_lines.dat` | ThAr line lists for iSHELL passbands |
 
 ### 5.3 Entirely new implementation needed
 
@@ -225,6 +225,8 @@ combine / telluric / merge
 - [x] Add `'ishell'` to the IRTF instrument list in `setup_utils.py`
 - [x] Add `tests/test_ishell.py` covering import, config registration, and
       `set_instrument()` call
+- [x] Populate confirmed values from iSHELL Spextool Manual (Jan 2020):
+      NINT=3, LINCORMAX=30000 DN, pixel scale, arc lamp, telluric method
 
 ### Phase 1 – Header and FITS reading
 
@@ -238,21 +240,21 @@ combine / telluric / merge
 
 ### Phase 2 – Order geometry and rectification
 
-- [ ] Generate `J_flatinfo.fits`, `H_flatinfo.fits`, `K_flatinfo.fits` from
-      flat-field frames taken at the telescope
-- [ ] Generate `J_wavecalinfo.fits`, `H_wavecalinfo.fits`, `K_wavecalinfo.fits`
-      from arc-lamp frames
-- [ ] Implement `rectify_orders()` using the wavecal grid to transform tilted
+- [ ] Generate `<Mode>_flatinfo.fits` and `<Mode>_wavecalinfo.fits` from
+      flat-field and ThAr arc-lamp frames taken at the telescope for each
+      J/H/K sub-mode (J0–J3, H1–H3, K1–K3/Kgas)
+- [ ] Implement `_rectify_orders()` using the wavecal grid to transform tilted
       orders onto a rectilinear grid
 - [ ] Validate that `extract_1dxd()` works correctly on rectified iSHELL data
-- [ ] Populate `{J,H,K}_lines.dat` with Ar + Xe lines in each passband
+- [ ] Populate `{J,H,K}_lines.dat` with confirmed ThAr lines in each passband
 
 ### Phase 3 – Telluric and calibration files
 
-- [ ] Populate `telluric_modeinfo.dat` with real J/H/K parameters
+- [ ] Populate `telluric_modeinfo.dat` with real J/H/K IP parameters
 - [ ] Populate `telluric_ewadjustments.dat` from A0 V standard observations
 - [ ] Populate `telluric_shiftinfo.dat` from cross-correlation measurements
 - [ ] Populate `IP_coefficients.dat` for each iSHELL slit width
+      (mandatory: iSHELL does not support the deconvolution method)
 - [ ] End-to-end test with real iSHELL science data
 
 ### Phase 4 – Validation and release
@@ -268,35 +270,56 @@ combine / telluric / merge
 
 | # | Item | Impact | Mitigation |
 |---|---|---|---|
-| B1 | **Exact iSHELL H2RG linearity-correction algorithm** – the IRTF team may use a custom method not publicly documented | High – incorrect photometry / flux calibration | Contact IRTF instrument scientists; inspect existing iSHELL pipeline code |
+| B1 | **Exact iSHELL H2RG linearity-correction algorithm** – LINCORMAX is confirmed as 30000 DN (Manual Table 4), but the pixel-by-pixel polynomial coefficient file is not publicly available | High – incorrect photometry / flux calibration | Contact IRTF instrument scientists; request `ishell_lincorr.fits` calibration file |
 | B2 | **Order tilt / curvature model format** – the current `wavecalinfo.fits` format may need extension to carry 2D polynomial coefficients describing order tilt | High – rectification impossible without this | Inspect existing iSHELL `.fits` calibration files from observatory; extend format if needed |
 | B3 | **Bad-pixel mask** – not yet available for H2RG; stale pixels change over time | Medium – may introduce artefacts | Request current mask from IRTF; add to pooch registry |
-| B4 | **Arc-line lists** – Ar + Xe lamp; line positions in J/H/K differ from SpeX Ar-only lamp | Medium – wavelength calibration fails | Source from NIST Atomic Spectra Database filtered to iSHELL wavelength ranges |
-| B5 | **`DIVISOR` keyword** – SpeX stores co-adds in `DIVISOR`; iSHELL uses `CO_ADDS` or similar | Medium – incorrect flux scaling | Confirm with real iSHELL FITS header; update `get_header()` accordingly |
-| B6 | **Fowler sampling vs. MCDS** – some iSHELL readout modes do not produce a simple DN image; co-add handling may differ | Medium – data loading errors | Inspect real files; add readout-mode-specific handling |
-| B7 | **Slit length** – iSHELL slit is 15 arcsec; SpeX is shorter; spatial-profile assumptions may break for faint targets | Low–Medium | Test with actual data; profile fitting should be robust |
+| B4 | **ThAr arc-line lists** – confirmed ThAr lamp (Manual Table 1); line positions in J/H/K must be selected from the NIST database | Medium – wavelength calibration fails without real lines | Source Th I, Th II, Ar I, Ar II vacuum wavelengths from NIST Atomic Spectra Database |
+| B5 | **Raw FITS keyword names** – the Manual documents *output* Spextool keywords (Table 4) but not the *raw* iSHELL FITS header keyword names | Medium – incorrect flux scaling / header parsing | Confirm from real iSHELL FITS file; output keywords DATE/TIME/NCOADDS/ITIME/RA/DEC/PA/HA/AM are documented |
+| B6 | **H2RG pedestal/signal read counts** – must use FITS ext 1 + ext 2 sum to identify non-linear pixels (Manual §2.3), not just ext 0 | Medium – incorrect linearity flagging | Implement `load_data()` to read all three extensions (NINT=3) |
+| B7 | **Slit length** – iSHELL J/H/K slit is 5"; L/Lp/M thermal modes use 15" or 25"; spatial-profile assumptions fine for 5" near-IR modes | Low | Confirmed from Manual Table 1 |
 | B8 | **Test data availability** – Git LFS test data does not yet exist for iSHELL | Low (for Phase 0–1) | Use synthetic/simulated data for unit tests; add real data in Phase 3 |
-| B9 | **Exact FITS keyword names** – the table in `get_header()` must be confirmed against real iSHELL FITS files | Medium | Cross-check with IRTF DCS documentation or existing iSHELL reduction scripts |
+| B9 | **Exact raw FITS keyword names** – the table in `get_header()` must be confirmed against real iSHELL FITS files | Medium | Cross-check with IRTF DCS documentation or existing iSHELL reduction scripts |
 
 ---
 
 ## 8. iSHELL Instrument Reference (J/H/K modes)
 
-The following values are sourced from publicly available IRTF documentation
-and should be **confirmed against real data** before use in production code.
-Fields marked **TBD** require confirmation from the IRTF instrument team.
+The following values are sourced from the iSHELL Spextool Manual (v10jan2020,
+Cushing).  Fields marked **TBD** still require confirmation from IRTF staff
+or real iSHELL calibration files.
 
-| Parameter | J | H | K | Unit |
-|---|---|---|---|---|
-| Wavelength range | 1.14 – 1.34 | 1.47 – 1.81 | 1.98 – 2.52 | μm |
-| Number of orders | ~8 | ~9 | ~9 | — |
-| Detector | 2048 × 2048 H2RG | ← | ← | pixels |
-| Pixel scale | ~0.375 | ← | ← | arcsec/pixel |
-| Gain | **TBD** (~1.8) | ← | ← | e⁻/DN |
-| Read noise (Fowler-16) | **TBD** (~5–10) | ← | ← | e⁻ |
-| Linearity threshold | **TBD** (~55 000) | ← | ← | DN |
-| Arc lamp | Ar + Xe | ← | ← | — |
-| Resolving power (0.375″) | ~75 000 | ~75 000 | ~75 000 | — |
-| Resolving power (0.75″) | ~37 500 | ~37 500 | ~37 500 | — |
+### 8.1 Detector Parameters
 
-Slit widths available: 0.375″, 0.75″, 1.5″, 4.0″ (cross × 15″ long).
+| Parameter | Value | Source |
+|---|---|---|
+| Detector | 2048 × 2048 Teledyne H2RG | Manual §2.2 |
+| Pixel scale | **0.125 arcsec/pixel** | Manual Table 4, PLTSCALE example |
+| NINT (FITS extensions per file) | **3** | Manual §2.3, Eq. 1 |
+| LINCORMAX | **30000 DN** | Manual Table 4, LINCRMAX example |
+| Gain | **TBD** (~1.8 e⁻/DN) | Not stated in manual; confirm from IRTF |
+| Read noise (Fowler-16) | **TBD** (~5–10 e⁻) | Not stated in manual; confirm from IRTF |
+| Reference pixel width | 4 pixels on all 4 edges | H2RG standard |
+| Arc lamp (J/H/K/L1) | **ThAr** (thorium-argon) | Manual Table 1 |
+| Slit length (J/H/K) | **5 arcseconds** | Manual Table 1 |
+| Telluric correction method | **IP only** (deconvolution not available) | Manual §6.2 |
+| Resolving power (0.375″ slit) | 75 000 | Manual §2.2 |
+
+### 8.2 Near-IR Mode Table (J / H / K bands only)
+
+All J/H/K modes use a ThAr arc lamp and a 5" slit (Manual Table 1).
+
+| Mode | Orders | Wavelength range (µm) |
+|---|---|---|
+| J0 | 457–503 | 1.062–1.165 |
+| J1 | 432–477 | 1.115–1.228 |
+| J2 | 406–442 | 1.197–1.303 |
+| J3 | 387–417 | 1.265–1.364 |
+| H1 | 311–355 | 1.473–1.683 |
+| H2 | 299–388 | 1.544–1.748 |
+| H3 | 285–319 | 1.633–1.832 |
+| K1 | 233–270 | 1.918–2.228 |
+| K2 | 218–248 | 2.084–2.382 |
+| Kgas | 211–238 | 2.170–2.468 |
+| K3 | 203–229 | 2.253–2.549 |
+
+Available slit widths: 0.375″, 0.75″, 1.5″, 4.0″.
