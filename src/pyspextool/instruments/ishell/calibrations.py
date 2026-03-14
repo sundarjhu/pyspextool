@@ -381,12 +381,15 @@ def read_line_list(mode_name: str) -> LineList:
         If *mode_name* is not in the mode registry.
     FileNotFoundError
         If the packaged ``.dat`` file is missing.
+    RuntimeError
+        If the packaged file is a Git LFS pointer (run ``git lfs pull``).
     ValueError
         If the file cannot be parsed (unexpected column count or format).
     """
     path = get_mode_resource(mode_name, "line_list")
     label = f"line_list for mode '{mode_name}'"
     _check_file_exists(path, label)
+    _check_lfs(path)
 
     entries: list[LineListEntry] = []
 

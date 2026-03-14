@@ -676,22 +676,12 @@ class TestLfsPointerDetection:
     """Tests for the _check_lfs() internal helper via public functions."""
 
     def test_lfs_pointer_detected_by_read_line_list(self, tmp_path, monkeypatch):
-        """_check_lfs is invoked when reading a line list."""
-        lfs_file = tmp_path / "lfs.dat"
-        lfs_file.write_bytes(
-            b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n"
-        )
+        """RuntimeError with 'Git LFS' message is raised for an LFS pointer line-list."""
         monkeypatch.setattr(
             cal_mod, "get_mode_resource",
-            lambda m, k: _make_text_path(lfs_file)
+            lambda m, k: _make_lfs_path(tmp_path)
         )
-        # LFS check is done by _check_lfs before parsing.
-        # For a line-list file the _check_lfs step is skipped
-        # (text files don't embed LFS magic), so the RuntimeError path
-        # belongs to FITS readers.  Instead verify that FileNotFoundError
-        # is NOT raised (the file does exist) and ValueError IS raised
-        # (the LFS bytes are not valid pipe-delimited lines).
-        with pytest.raises(ValueError):
+        with pytest.raises(RuntimeError, match="Git LFS"):
             read_line_list("J0")
 
     def test_lfs_pointer_detected_by_read_flatinfo(self, tmp_path, monkeypatch):
