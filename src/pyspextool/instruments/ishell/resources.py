@@ -7,6 +7,14 @@ import yaml
 _ISHELL_PACKAGE = "pyspextool.instruments.ishell"
 DATA_PACKAGE = "pyspextool.instruments.ishell.data"
 
+# Detector-level calibration files (all stored in the data/ sub-package).
+_DETECTOR_FILES = {
+    "linearity": "ishell_lincorr_CDS.fits",
+    "bad_pixel_mask": "ishell_bdpxmk.fits",
+    "hot_pixel_mask": "ishell_htpxmk.fits",
+    "bias": "ishell_bias.fits",
+}
+
 
 @lru_cache(maxsize=None)
 def _load_modes_registry():
@@ -110,7 +118,7 @@ def get_linearity_cube():
         If the calibration file is missing or replaced by a Git LFS pointer.
     """
 
-    path = files(DATA_PACKAGE) / "ishell_lincorr_CDS.fits"
+    path = get_detector_resource("linearity")
 
     if not path.is_file():
         raise RuntimeError(
@@ -131,3 +139,81 @@ def get_linearity_cube():
         )
 
     return fits.open(path)
+
+
+def get_detector_resource(resource_key):
+    """
+    Return an :class:`importlib.resources` path for a detector-level
+    calibration file.
+
+    Parameters
+    ----------
+    resource_key : str
+        One of ``"linearity"``, ``"bad_pixel_mask"``, ``"hot_pixel_mask"``,
+        or ``"bias"``.
+
+    Returns
+    -------
+    importlib.resources.abc.Traversable
+        A path object pointing to the packaged file.  Call ``.is_file()``
+        to verify it exists; pass it to ``astropy.io.fits.open()`` directly.
+
+    Raises
+    ------
+    KeyError
+        If *resource_key* is not a known detector resource.
+    """
+    if resource_key not in _DETECTOR_FILES:
+        raise KeyError(
+            f"Unknown detector resource '{resource_key}'. "
+            f"Available keys: {sorted(_DETECTOR_FILES)}"
+        )
+    return files(DATA_PACKAGE) / _DETECTOR_FILES[resource_key]
+
+
+def get_bad_pixel_mask():
+    """
+    Load the iSHELL bad-pixel mask.
+
+    Returns
+    -------
+    astropy.io.fits.HDUList
+
+    Raises
+    ------
+    OSError
+        If the file cannot be opened (e.g. missing from the package).
+    """
+    return fits.open(get_detector_resource("bad_pixel_mask"))
+
+
+def get_hot_pixel_mask():
+    """
+    Load the iSHELL hot-pixel mask.
+
+    Returns
+    -------
+    astropy.io.fits.HDUList
+
+    Raises
+    ------
+    OSError
+        If the file cannot be opened (e.g. missing from the package).
+    """
+    return fits.open(get_detector_resource("hot_pixel_mask"))
+
+
+def get_bias():
+    """
+    Load the iSHELL bias frame.
+
+    Returns
+    -------
+    astropy.io.fits.HDUList
+
+    Raises
+    ------
+    OSError
+        If the file cannot be opened (e.g. missing from the package).
+    """
+    return fits.open(get_detector_resource("bias"))
