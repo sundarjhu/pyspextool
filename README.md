@@ -1,6 +1,21 @@
 # pySpextool
 Python code to reduce data obtained with the SpeX spectrograph.
 
+## Git LFS requirement for developers
+
+This repository stores some large instrument calibration files using
+[Git Large File Storage (Git LFS)](https://git-lfs.com/).
+
+If you are cloning the repository for development, install Git LFS first:
+```git lfs install
+```
+The clone ethe repository normally:
+```git clone https://github.com/sundarjhu/pyspextool.git
+```
+If Git LFS is not installed, large calibration files (for example, the
+iSHELL detector linearity cube) will be replaced with small pointer files
+and the data reduction code will not run correctly.
+
 # Recommended Installation Instructions
 
 1) Setup your computer and install miniforge, if you haven't already.
