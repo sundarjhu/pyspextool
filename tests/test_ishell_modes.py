@@ -5,12 +5,19 @@ These tests verify:
   - the registry loads successfully,
   - every supported mode is present,
   - each mode has the required keys,
-  - every declared resource path resolves to an existing packaged file.
+  - every declared resource path resolves to an existing packaged file,
+  - detector-level resource paths resolve correctly,
+  - detector FITS loaders return valid HDUList objects.
 """
 
 import pytest
+from astropy.io import fits
 
 from pyspextool.instruments.ishell.resources import (
+    get_bad_pixel_mask,
+    get_bias,
+    get_detector_resource,
+    get_hot_pixel_mask,
     get_mode_config,
     get_mode_resource,
     get_registry,
@@ -129,3 +136,66 @@ def test_h_modes_have_h_family():
 def test_k_modes_have_k_family():
     for mode in ("K1", "K2", "K3", "Kgas"):
         assert get_mode_config(mode)["family"] == "K"
+
+
+# ---------------------------------------------------------------------------
+# Detector-level resource paths
+# ---------------------------------------------------------------------------
+
+DETECTOR_RESOURCE_KEYS = ("linearity", "bad_pixel_mask", "hot_pixel_mask", "bias")
+
+
+@pytest.mark.parametrize("resource_key", DETECTOR_RESOURCE_KEYS)
+def test_detector_resource_file_exists(resource_key):
+    """Every detector resource must resolve to a real packaged file."""
+    path = get_detector_resource(resource_key)
+    assert path.is_file(), (
+        f"Detector resource '{resource_key}' not found at {path}"
+    )
+
+
+def test_get_detector_resource_unknown_key():
+    """get_detector_resource must raise KeyError for an unknown resource key."""
+    with pytest.raises(KeyError, match="Unknown detector resource"):
+        get_detector_resource("nonexistent_resource")
+
+
+# ---------------------------------------------------------------------------
+# Detector FITS loaders
+# ---------------------------------------------------------------------------
+
+
+def test_get_bad_pixel_mask_returns_hdulist():
+    """get_bad_pixel_mask must return a valid HDUList."""
+    with get_bad_pixel_mask() as hdul:
+        assert isinstance(hdul, fits.HDUList)
+
+
+def test_get_hot_pixel_mask_returns_hdulist():
+    """get_hot_pixel_mask must return a valid HDUList."""
+    with get_hot_pixel_mask() as hdul:
+        assert isinstance(hdul, fits.HDUList)
+
+
+def test_get_bias_returns_hdulist():
+    """get_bias must return a valid HDUList."""
+    with get_bias() as hdul:
+        assert isinstance(hdul, fits.HDUList)
+
+
+def test_bad_pixel_mask_shape():
+    """Bad-pixel mask must match the iSHELL detector size (2048×2048)."""
+    with get_bad_pixel_mask() as hdul:
+        assert hdul[0].data.shape == (2048, 2048)
+
+
+def test_hot_pixel_mask_shape():
+    """Hot-pixel mask must match the iSHELL detector size (2048×2048)."""
+    with get_hot_pixel_mask() as hdul:
+        assert hdul[0].data.shape == (2048, 2048)
+
+
+def test_bias_shape():
+    """Bias frame must match the iSHELL detector size (2048×2048)."""
+    with get_bias() as hdul:
+        assert hdul[0].data.shape == (2048, 2048)
