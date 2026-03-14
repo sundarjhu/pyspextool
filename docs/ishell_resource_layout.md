@@ -52,7 +52,7 @@ src/pyspextool/instruments/ishell/
 | `data/IP_coefficients.dat` | `data/` | telluric module (future) | Real IP coefficients for 3 slit widths (Cushing 2014) |
 | `data/<Mode>_lines.dat` | `data/` | wavecal module (future) | Real ThAr line lists (Cushing Oct 2017) |
 | `data/<Mode>_flatinfo.fits` | `data/` | flat module (future) | Real IDL-era flat calibrations |
-| `data/<Mode>_wavecalinfo.fits` | `data/` | wavecal module (future) | Real polynomial coefficients; spectral data arrays are NaN |
+| `data/<Mode>_wavecalinfo.fits` | `data/` | wavecal module (future) | Structure validated; header-keyword coefficients and spectral-array semantics only partially confirmed |
 
 ---
 
@@ -127,9 +127,12 @@ Before Phase 1 reduction logic can be implemented:
 1. **`data/ishell_bdpxmk.fits`** – Replace with real bad-pixel map from IRTF.
 2. **`data/ishell_htpxmk.fits`** – Replace with real hot-pixel map from IRTF.
 3. **`data/ishell_bias.fits`** – Verify format and epoch; replace if necessary.
-4. **`data/<Mode>_wavecalinfo.fits`** – The polynomial-coefficient headers are
-   real, but spectral data arrays are all NaN.  A valid wavecal solution is
-   needed before `get_header()` / `load_data()` can be implemented.
+4. **`data/<Mode>_wavecalinfo.fits`** – Structure is validated (shape, NORDERS,
+   NORDERS header keyword).  Header-keyword values that appear to be polynomial
+   coefficients are present, but their exact scientific meaning has not been
+   confirmed by reverse-engineering the IDL pipeline.  Spectral data arrays are
+   all NaN and a valid wavecal solution is needed before reduction logic can use
+   this file.
 5. **`telluric_modeinfo.dat`** – All numeric columns are empty (TBD).
 6. **`telluric_ewadjustments.dat`** – No data rows (TBD).
 7. **`telluric_shiftinfo.dat`** – No data rows (TBD).
