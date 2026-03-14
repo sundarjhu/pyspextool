@@ -1,0 +1,36 @@
+#
+# iSHELL instrument configuration file for pySpextool
+#
+# NASA IRTF iSHELL cross-dispersed echelle spectrograph
+# Teledyne H2RG 2048x2048 near-IR detector
+#
+# NOTE: Values marked TBD must be confirmed against real iSHELL data and
+#       IRTF instrument documentation before use in production.
+#
+#============================================================================
+#
+# NINT: number of readout channels (H2RG uses a single output in most modes)
+ NINT=1
+ BADPIXMASK=ishell_bdpxmk.fits
+ SUFFIX=.[ab]
+ READFITS=read_ishell_fits
+# TBD: confirm the actual DN saturation/linearity limit for the H2RG
+# detector in the readout modes used at IRTF.  Typical H2RG values
+# are in the range 40000-60000 DN depending on gain and sampling.
+ LINCORMAX=55000
+#
+# Additional instrument FITS header keywords to retain.
+# Will already get the standard set (INSTRUME, OBJECT, ITIME, DATE_OBS, etc.)
+# as normalised via get_header().
+#
+KEYWORD=OBJECT combine telluric merge
+KEYWORD=OBSERVER combine telluric merge
+KEYWORD=PROG_ID combine telluric merge
+KEYWORD=BEAM
+KEYWORD=CO_ADDS combine
+KEYWORD=SLIT combine
+KEYWORD=MODE combine
+KEYWORD=GRATING combine
+KEYWORD=ECHANG combine
+KEYWORD=XDTILT combine
+KEYWORD=PASSBAND combine

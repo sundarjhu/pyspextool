@@ -1,0 +1,18 @@
+#
+# iSHELL instrumental-profile (IP) coefficients for pySpextool
+#
+# NASA IRTF iSHELL cross-dispersed echelle spectrograph
+# Scope: J, H, and K modes only.
+#
+# Format: slit_width_arcsec  c0  c1  c2
+# These coefficients parameterise the IP FWHM as a function of slit width.
+# See the pySpextool telluric module for usage.
+#
+# NOTE: All numeric values are placeholders (TBD) and must be measured from
+#       real iSHELL arc-lamp or standard-star observations for each slit.
+#       iSHELL slit widths: 0.375", 0.75", 1.5", 4.0"
+#
+0.375 0.0 0.0 0.0
+0.750 0.0 0.0 0.0
+1.500 0.0 0.0 0.0
+4.000 0.0 0.0 0.0

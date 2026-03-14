@@ -1,0 +1,17 @@
+#
+# iSHELL J-band arc-lamp emission line list for pySpextool wavelength calibration
+#
+# NASA IRTF iSHELL cross-dispersed echelle spectrograph
+# Wavelength range: ~1.14 - 1.34 microns
+# Arc lamp: Ar + Xe
+# Scope: J mode only.
+#
+# NOTE: This file is a placeholder (TBD).  Real line positions, window
+#       widths, and fit parameters must be derived from actual iSHELL
+#       arc-lamp spectra.  Consult the NIST Atomic Spectra Database for
+#       Ar I and Xe I vacuum wavelengths in this passband.
+#
+#=======================================================================================================
+#Order   | Vacuum Wavelength   | Species   | Left Window   | Right Window   | Fit Type   | Fit N Terms
+#        | (microns)           |           | (Angstroms)   | (Angstroms)    |            |            
+#=======================================================================================================

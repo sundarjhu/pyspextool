@@ -1,4 +1,4 @@
-state = {"instruments": ['uspex', 'spex'],
+state = {"instruments": ['uspex', 'spex', 'ishell'],
          "qa_extensions": ['.png', '.pdf'],
          "search_extensions": ['.fits*', '.fits','.fits.gz'],         
          "units":['W m-2 um-1', 'erg s-1 cm-2 A-1', 'W m-2 Hz-1',

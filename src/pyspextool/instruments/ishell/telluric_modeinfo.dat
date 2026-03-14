@@ -1,0 +1,28 @@
+#
+# iSHELL telluric mode information for pySpextool
+#
+# NASA IRTF iSHELL cross-dispersed echelle spectrograph
+# Scope: J, H, and K modes only.
+#
+# NOTE: All numeric values are placeholders (TBD) and must be derived from
+#       real iSHELL A0 V standard-star observations before production use.
+#       The column format must match the SpeX/uSpeX telluric_modeinfo.dat
+#       exactly so that the existing pySpextool telluric module can parse it.
+#
+# Instrument Mode      : instrument mode name (must match <Mode>_flatinfo.fits)
+# Method               : deconvolution or ip
+# Vega Model           : Resolving power of model (50000 or 5000)
+# Order                : Order number for line work
+# Deconvolution Line   : The wavelength of the line to deconvolve (microns)
+# Normalization Range  : The range over which to normalize the line
+# Poly Deg             : The polynomial degree used to fit the continuum
+# Fit Type             : the model for the line, lorentzian or gaussian
+# RV N_FWHM            : The number of FWHMs around which to do the xcorrelation
+# Deconvolution N_FWHM : The number of FWHMs around which to do the deconvolution
+#
+#===============================================================================================================================================================================
+# Instrument Mode  | Method        | Vega Model  | Order  |  Line      | Normalization Ranges  | Poly Deg  | Fit Type   | RV N_FWHM  | Deconvolution N_FWHM |
+#===============================================================================================================================================================================
+J                  | deconvolution | 50000       |        |            |                       |           |            |            |                      |
+H                  | deconvolution | 50000       |        |            |                       |           |            |            |                      |
+K                  | deconvolution | 50000       |        |            |                       |           |            |            |                      |
