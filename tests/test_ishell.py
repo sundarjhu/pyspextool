@@ -197,20 +197,63 @@ def test_bad_pixel_mask_fits_exists():
 
 
 # ---------------------------------------------------------------------------
-# NotImplementedError is raised (Phase 0 behaviour)
+# Phase 1 behaviour: get_header and load_data are now implemented
 # ---------------------------------------------------------------------------
 
 
-def test_get_header_raises_not_implemented():
-    """get_header must raise NotImplementedError until Phase 1 is complete."""
+def test_get_header_returns_required_keys():
+    """get_header must return all pySpextool-standard output keys."""
     from astropy.io.fits import Header
     mod = importlib.import_module('pyspextool.instruments.ishell.ishell')
-    with pytest.raises(NotImplementedError):
-        mod.get_header(Header(), [])
+
+    hdr = Header()
+    hdr['ITIME'] = 30.0
+    hdr['CO_ADDS'] = 1
+    hdr['DATE_OBS'] = '2024-01-01'
+    hdr['TIME_OBS'] = '05:00:00.0'
+    hdr['MJD_OBS'] = 60310.208333
+    hdr['TCS_RA'] = '05:35:17.3'
+    hdr['TCS_DEC'] = '-05:23:28'
+    hdr['TCS_HA'] = '00:00:00'
+    hdr['TCS_AM'] = 1.05
+    hdr['POSANGLE'] = 90.0
+    hdr['IRAFNAME'] = 'ishell_0001.fits'
+    hdr['PASSBAND'] = 'K1'
+
+    result = mod.get_header(hdr, [])
+
+    required_keys = ['AM', 'HA', 'PA', 'RA', 'DEC', 'ITIME', 'NCOADDS',
+                     'IMGITIME', 'TIME', 'DATE', 'MJD', 'FILENAME', 'MODE',
+                     'INSTR']
+    for key in required_keys:
+        assert key in result, f"get_header missing required output key '{key}'"
+        assert isinstance(result[key], list) and len(result[key]) == 2, (
+            f"get_header['{key}'] must be a [value, comment] list")
 
 
-def test_load_data_raises_not_implemented():
-    """load_data must raise NotImplementedError until Phase 1 is complete."""
+def test_get_header_instr_is_ishell():
+    """get_header must always set INSTR to 'iSHELL'."""
+    from astropy.io.fits import Header
     mod = importlib.import_module('pyspextool.instruments.ishell.ishell')
-    with pytest.raises(NotImplementedError):
-        mod.load_data('dummy.fits', {'max': 55000, 'bit': 0}, [])
+    result = mod.get_header(Header(), [])
+    assert result['INSTR'][0] == 'iSHELL'
+
+
+def test_get_header_missing_keywords_produce_nan():
+    """get_header must substitute nan/nan for missing numeric/string keys."""
+    import math as _math
+    from astropy.io.fits import Header
+    mod = importlib.import_module('pyspextool.instruments.ishell.ishell')
+
+    # Completely empty header
+    result = mod.get_header(Header(), [])
+    assert _math.isnan(result['AM'][0])
+    assert _math.isnan(result['PA'][0])
+    assert _math.isnan(result['ITIME'][0])
+    assert result['HA'][0] == 'nan'
+    assert result['RA'][0] == 'nan'
+    assert result['DEC'][0] == 'nan'
+    assert result['TIME'][0] == 'nan'
+    assert result['DATE'][0] == 'nan'
+    assert result['FILENAME'][0] == 'unknown'
+    assert result['MODE'][0] == 'unknown'
