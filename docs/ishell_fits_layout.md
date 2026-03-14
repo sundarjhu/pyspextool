@@ -1,6 +1,6 @@
 # iSHELL Raw FITS Layout
 
-**Status:** Phase 1 (ingestion implemented)  
+**Status:** Phase 1 (ingestion implemented; consistency pass applied)  
 **Scope:** J/H/K modes only (J0–J3, H1–H3, K1–K3, Kgas)  
 **Source:** iSHELL Spextool Manual v10jan2020 (Cushing et al.); iSHELL
 xSpextool heritage keyword list.
@@ -60,11 +60,32 @@ standard pySpextool output keys:
 | `PASSBAND` | `GRAT` |
 
 Missing keywords produce `nan` (numeric) or `'nan'`/`'unknown'` (string)
-rather than raising exceptions.
+rather than raising exceptions, **with the exception of the `MODE` field**
+(see §8).
 
 ---
 
-## 3. Non-Linearity Flagging
+## 3. Supported Observing Modes and Validation
+
+`get_header()` validates the `MODE` value (derived from `PASSBAND` or `GRAT`)
+against the supported J/H/K sub-mode list:
+
+| Band | Supported sub-modes |
+|---|---|
+| J | J0, J1, J2, J3 |
+| H | H1, H2, H3 |
+| K | K1, K2, K3, Kgas |
+
+**L, Lp, and M modes are explicitly out of scope** and raise
+`pySpextoolError: "observing mode '…' is not supported"` immediately.
+
+A completely absent `PASSBAND`/`GRAT` keyword yields `MODE = 'unknown'` and
+does **not** raise; downstream stages are responsible for handling this
+gracefully.
+
+---
+
+## 4. Non-Linearity Flagging
 
 Following §2.3 of the iSHELL Spextool Manual:
 
@@ -82,7 +103,7 @@ have bit `linearity_info['bit']` set in the returned `uint8` bitmask.
 
 ---
 
-## 4. Image Normalisation
+## 5. Image Normalisation
 
 The science image returned by `load_data()` is in **DN s⁻¹**:
 
@@ -94,7 +115,7 @@ where `S` is the signal difference from extension 0 (total DN).
 
 ---
 
-## 5. Variance Estimation
+## 6. Variance Estimation
 
 A simple Poisson + read-noise variance is estimated (in (DN s⁻¹)²):
 
@@ -110,7 +131,38 @@ and `ron = READNOISE_ELECTRONS = 8.0 e⁻`.
 
 ---
 
-## 6. What Is Not Yet Implemented (Phase 2)
+## 7. `hdrinfo` List Contract
+
+`read_fits()` always returns **exactly one header dictionary per output image**
+regardless of the `pair_subtract` mode:
+
+| `pair_subtract` | `len(files)` | `len(hdrinfo)` returned | Header retained |
+|---|---|---|---|
+| `False` | N | N | header from each file |
+| `True` | 2 N | N | **A-beam** header (first of each pair) |
+
+**Rationale for keeping the A-beam header:** in the standard A–B nod pattern
+the A-beam carries the positive source signal and the sky is removed by the
+subtraction.  The A-beam header is the natural reference for the resulting
+pair-subtracted image.
+
+---
+
+## 8. Metadata Sanity Checks
+
+`load_data()` validates the following header fields before processing any
+pixel data, raising `pySpextoolError` if they are out of range:
+
+| Field | Requirement | Error text |
+|---|---|---|
+| `ITIME` | Present and numeric | `ITIME missing or non-numeric` |
+| `ITIME` | `> 0` | `ITIME must be positive` |
+| `CO_ADDS` | `>= 1` (defaults to 1 if absent) | `CO_ADDS must be >= 1` |
+| `PASSBAND` / `GRAT` | In `SUPPORTED_MODES` if present | `observing mode '…' is not supported` |
+
+---
+
+## 9. What Is Not Yet Implemented (Phase 2)
 
 | Feature | Status | Function |
 |---|---|---|
@@ -120,7 +172,7 @@ and `ron = READNOISE_ELECTRONS = 8.0 e⁻`.
 
 ---
 
-## 7. Synthetic Fixture for Testing
+## 10. Synthetic Fixture for Testing
 
 Since real iSHELL raw frames are not bundled in the repository, the test suite
 in `tests/test_ishell_ingestion.py` creates **synthetic MEF fixtures** using

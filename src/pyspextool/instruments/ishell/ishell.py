@@ -202,7 +202,15 @@ def read_fits(
     var : ndarray, same shape as *data*
         Variance images in (DN s⁻¹)².
     hdrinfo : list of dict
-        Normalised header keyword dictionaries (one per image).
+        Normalised header keyword dictionaries.  There is **exactly one
+        dictionary per returned output image**:
+
+        * No pair-subtract: ``len(hdrinfo) == len(files)``.
+        * Pair-subtract: ``len(hdrinfo) == len(files) // 2`` — the
+          header retained for each pair is the **A-beam** (first of the
+          two files), because the A-beam carries the source-positive
+          signal.
+
     bitmask : ndarray, same shape as *data*
         Integer bitmask (non-linear pixels flagged).
     """
@@ -256,8 +264,6 @@ def read_fits(
         data_list.append(img_a)
         var_list.append(var_a)
         hdrinfo_list.append(hdr_a)
-        if pair_subtract:
-            hdrinfo_list.append(hdr_b)
         bitmask_list.append(mask_a)
 
     data = np.squeeze(np.stack(data_list, axis=0))
@@ -434,6 +440,18 @@ def get_header(header: fits.Header, keywords: list) -> dict:
             mode = str(header['GRAT']).strip()
         except KeyError:
             mode = 'unknown'
+
+    # Validate that the mode is one of the supported J/H/K sub-modes.
+    # An explicit unsupported mode (L, Lp, M, …) is a hard error; an absent
+    # PASSBAND/GRAT keyword (mode == 'unknown') is allowed and produces a
+    # warning so that test headers with no mode do not fail.
+    if mode != 'unknown' and mode not in SUPPORTED_MODES:
+        raise pySpextoolError(
+            f"get_header: observing mode '{mode}' is not supported.  "
+            f"This module handles J/H/K sub-modes only "
+            f"({', '.join(SUPPORTED_MODES)}).  "
+            f"L, Lp, and M modes are explicitly out of scope.")
+
     hdrinfo['MODE'] = [mode, ' Instrument Mode']
 
     # ---- INSTR (hardcoded) ----------------------------------------------------
@@ -501,7 +519,12 @@ def load_data(
     pySpextoolError
         If ITIME is missing or non-numeric.
     pySpextoolError
-        If the total exposure time (ITIME × CO_ADDS) is zero.
+        If ITIME is not positive (``ITIME <= 0``).
+    pySpextoolError
+        If CO_ADDS is less than 1.
+    pySpextoolError
+        If the MODE parsed from the header is an unsupported iSHELL mode
+        (L, Lp, M, …); raised inside :func:`get_header`.
 
     Notes
     -----
@@ -553,17 +576,24 @@ def load_data(
             f'load_data: FITS keyword ITIME missing or non-numeric '
             f'in {file!r}.') from exc
 
+    if itime <= 0.0:
+        hdul.close()
+        raise pySpextoolError(
+            f'load_data: ITIME must be positive; got ITIME={itime} '
+            f'in {file!r}.')
+
     try:
         coadds = int(primary_header['CO_ADDS'])
     except (KeyError, TypeError, ValueError):
         coadds = 1
 
-    total_exptime = itime * coadds
-    if total_exptime == 0.0:
+    if coadds < 1:
         hdul.close()
         raise pySpextoolError(
-            f'load_data: total exposure time is zero (ITIME={itime}, '
-            f'CO_ADDS={coadds}) in {file!r}.')
+            f'load_data: CO_ADDS must be >= 1; got CO_ADDS={coadds} '
+            f'in {file!r}.')
+
+    total_exptime = itime * coadds
 
     # ---- read the three data planes -------------------------------------------
     # ext0: signal difference S (the science data, total DN)

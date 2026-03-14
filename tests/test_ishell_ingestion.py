@@ -428,12 +428,13 @@ class TestReadFits:
             [a, b], self._linearity_info, pair_subtract=True)
         assert data.ndim == 2
 
-    def test_pair_subtract_hdrinfo_has_both_headers(self, synthetic_mef_pair):
-        """pair_subtract=True stores headers for both A and B."""
+    def test_pair_subtract_hdrinfo_has_one_header_per_image(self, synthetic_mef_pair):
+        """pair_subtract=True must store exactly 1 header per output image (A-beam)."""
         a, b = synthetic_mef_pair
         data, var, hdrinfo, mask = read_fits(
             [a, b], self._linearity_info, pair_subtract=True)
-        assert len(hdrinfo) == 2
+        assert len(hdrinfo) == 1, (
+            f'Expected 1 header for 1 pair-subtracted image; got {len(hdrinfo)}')
 
     def test_pair_subtract_values(self, synthetic_mef_pair):
         """A - B must equal (5000 - 3000) / (30 * 2) = 33.333… DN/s."""
@@ -480,3 +481,113 @@ class TestReadFits:
     def test_verbose_does_not_raise(self, synthetic_mef):
         """verbose=True must not raise an exception."""
         read_fits([str(synthetic_mef)], self._linearity_info, verbose=True)
+
+
+# ---------------------------------------------------------------------------
+# Supported-mode validation (get_header + load_data)
+# ---------------------------------------------------------------------------
+
+
+class TestModeValidation:
+    """Tests for the SUPPORTED_MODES guard added to get_header()."""
+
+    _linearity_info = {'max': 30000, 'bit': 0}
+
+    def test_supported_mode_does_not_raise(self):
+        """All J/H/K modes must be accepted without error."""
+        from pyspextool.instruments.ishell.ishell import SUPPORTED_MODES
+        for mode in SUPPORTED_MODES:
+            hdr = _make_ishell_header(PASSBAND=mode)
+            result = get_header(hdr, [])
+            assert result['MODE'][0] == mode
+
+    @pytest.mark.parametrize('bad_mode', ['L', 'Lp', 'M', 'Lc', 'M_short'])
+    def test_unsupported_mode_raises_pyspextoolerror(self, bad_mode):
+        """Explicitly unsupported modes (L / Lp / M family) must raise."""
+        hdr = _make_ishell_header(PASSBAND=bad_mode)
+        with pytest.raises(pySpextoolError, match='not supported'):
+            get_header(hdr, [])
+
+    def test_unknown_mode_does_not_raise(self):
+        """A header with no PASSBAND/GRAT ('unknown') must not raise."""
+        hdr = fits.Header()
+        hdr['ITIME'] = 10.0
+        hdr['CO_ADDS'] = 1
+        result = get_header(hdr, [])
+        assert result['MODE'][0] == 'unknown'
+
+    def test_unsupported_mode_in_load_data_raises(self, tmp_path):
+        """load_data must propagate the mode error from get_header."""
+        path = _make_synthetic_mef(tmp_path / 'lmode.fits', PASSBAND='M')
+        with pytest.raises(pySpextoolError, match='not supported'):
+            load_data(str(path), self._linearity_info, [])
+
+
+# ---------------------------------------------------------------------------
+# Metadata sanity checks (load_data)
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataSanityChecks:
+    """Tests for the ITIME > 0 and CO_ADDS >= 1 guards in load_data()."""
+
+    _linearity_info = {'max': 30000, 'bit': 0}
+
+    def _write_mef(self, path, *, itime, coadds):
+        """Write a minimal 3-ext MEF with the given ITIME and CO_ADDS."""
+        hdr = _make_ishell_header(ITIME=itime, CO_ADDS=coadds)
+        ext0 = fits.PrimaryHDU(
+            data=np.ones((_NROWS, _NCOLS), dtype=np.float32), header=hdr)
+        hdul = fits.HDUList([
+            ext0,
+            fits.ImageHDU(data=np.ones((_NROWS, _NCOLS), dtype=np.float32)),
+            fits.ImageHDU(data=np.ones((_NROWS, _NCOLS), dtype=np.float32)),
+        ])
+        hdul.writeto(str(path), overwrite=True)
+        return str(path)
+
+    def test_positive_itime_and_valid_coadds_ok(self, tmp_path):
+        """Normal values must not raise."""
+        path = self._write_mef(tmp_path / 'ok.fits', itime=30.0, coadds=4)
+        img, var, hdr, mask = load_data(path, self._linearity_info, [])
+        assert img.shape == (_NROWS, _NCOLS)
+
+    def test_zero_itime_raises(self, tmp_path):
+        """ITIME = 0 must raise pySpextoolError."""
+        path = self._write_mef(tmp_path / 'zero_itime.fits',
+                               itime=0.0, coadds=1)
+        with pytest.raises(pySpextoolError, match='ITIME'):
+            load_data(path, self._linearity_info, [])
+
+    def test_negative_itime_raises(self, tmp_path):
+        """ITIME < 0 must raise pySpextoolError."""
+        path = self._write_mef(tmp_path / 'neg_itime.fits',
+                               itime=-5.0, coadds=1)
+        with pytest.raises(pySpextoolError, match='ITIME'):
+            load_data(path, self._linearity_info, [])
+
+    def test_zero_coadds_raises(self, tmp_path):
+        """CO_ADDS = 0 must raise pySpextoolError."""
+        path = self._write_mef(tmp_path / 'zero_coadds.fits',
+                               itime=10.0, coadds=0)
+        with pytest.raises(pySpextoolError, match='CO_ADDS'):
+            load_data(path, self._linearity_info, [])
+
+    def test_negative_coadds_raises(self, tmp_path):
+        """CO_ADDS < 0 must raise pySpextoolError."""
+        path = self._write_mef(tmp_path / 'neg_coadds.fits',
+                               itime=10.0, coadds=-2)
+        with pytest.raises(pySpextoolError, match='CO_ADDS'):
+            load_data(path, self._linearity_info, [])
+
+    def test_pair_subtract_hdrinfo_is_abeam(self, tmp_path):
+        """pair_subtract=True: hdrinfo must contain the A-beam header."""
+        a = _make_synthetic_mef(tmp_path / 'a.fits', IRAFNAME='abeam.fits',
+                                sig_value=5000.0)
+        b = _make_synthetic_mef(tmp_path / 'b.fits', IRAFNAME='bbeam.fits',
+                                sig_value=3000.0)
+        _, _, hdrinfo, _ = read_fits(
+            [str(a), str(b)], {'max': 30000, 'bit': 0}, pair_subtract=True)
+        assert len(hdrinfo) == 1
+        assert hdrinfo[0]['FILENAME'][0] == 'abeam.fits', (
+            f"Expected A-beam filename; got {hdrinfo[0]['FILENAME'][0]!r}")
