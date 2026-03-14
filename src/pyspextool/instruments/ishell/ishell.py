@@ -93,6 +93,7 @@ from pyspextool.io.fitsheader import get_headerinfo
 from pyspextool.utils.arrays import idl_rotate
 from pyspextool.utils.loop_progress import loop_progress
 from pyspextool.pyspextoolerror import pySpextoolError
+from .geometry import OrderGeometrySet
 
 logger = logging.getLogger(__name__)
 
@@ -724,7 +725,7 @@ def _subtract_reference_pixels(image: npt.ArrayLike) -> npt.ArrayLike:
 
 def _rectify_orders(
         image: npt.ArrayLike,
-        wavecalinfo: dict) -> npt.ArrayLike:
+        geometry: OrderGeometrySet) -> npt.ArrayLike:
     """
     Rectify tilted iSHELL echelle orders onto a rectilinear grid.
 
@@ -737,10 +738,11 @@ def _rectify_orders(
     image : ndarray, shape (nrows, ncols)
         Flat-fielded, linearity-corrected iSHELL science image.
 
-    wavecalinfo : dict
-        Wavelength-calibration information loaded from
-        ``<Mode>_wavecalinfo.fits``.  Must contain tilt/curvature
-        polynomial coefficients describing the order geometry.
+    geometry : :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet`
+        Order geometry set for the observing mode, including per-order edge
+        polynomials, tilt coefficients, and wavelength/spatial calibrations.
+        Must have ``geometry.has_tilt() == True`` before this function can
+        be called.
 
     Returns
     -------
@@ -752,11 +754,18 @@ def _rectify_orders(
     This is the primary new piece of instrument-specific logic required for
     iSHELL and has no equivalent in the SpeX pipeline.
 
+    The implementation depends on the tilt and wavelength polynomial
+    coefficients stored in *geometry*, which are populated during the wavecal
+    step.  Call :func:`~pyspextool.instruments.ishell.geometry.build_order_geometry_set`
+    to create the geometry from flat-field data, then run the wavecal step to
+    fill in tilt/wavelength information before calling this function.
+
     .. todo::
-        Phase 2: implement once ``<Mode>_wavecalinfo.fits`` format is
-        confirmed.  See docs/ishell_design_memo.md §5.3 and Blocker B2.
+        Phase 2: implement interpolation once tilt polynomial format is
+        confirmed from real ThAr arc data.
+        See docs/ishell_geometry_design_note.md §4.
     """
 
     raise NotImplementedError(
         '_rectify_orders() not yet implemented.  '
-        'Phase 2 task.  See docs/ishell_design_memo.md §5.3 and Blocker B2.')
+        'Phase 2 task.  See docs/ishell_geometry_design_note.md §4.')
