@@ -1,6 +1,6 @@
 # iSHELL Resource Layout — Authoritative Inventory
 
-**Status:** Phase 0 (scaffold)  
+**Status:** Phase 1 (typed calibration readers)
 **Scope:** J/H/K modes only (J0–J3, H1–H3, K1–K3, Kgas)  
 **Last updated:** 2026-03
 
@@ -52,7 +52,7 @@ src/pyspextool/instruments/ishell/
 | `data/IP_coefficients.dat` | `data/` | telluric module (future) | Real IP coefficients for 3 slit widths (Cushing 2014) |
 | `data/<Mode>_lines.dat` | `data/` | wavecal module (future) | Real ThAr line lists (Cushing Oct 2017) |
 | `data/<Mode>_flatinfo.fits` | `data/` | flat module (future) | Real IDL-era flat calibrations |
-| `data/<Mode>_wavecalinfo.fits` | `data/` | wavecal module (future) | Real polynomial coefficients; spectral data arrays are NaN |
+| `data/<Mode>_wavecalinfo.fits` | `data/` | wavecal module (future) | Structure validated; header-keyword coefficients and spectral-array semantics only partially confirmed |
 
 ---
 
@@ -127,11 +127,93 @@ Before Phase 1 reduction logic can be implemented:
 1. **`data/ishell_bdpxmk.fits`** – Replace with real bad-pixel map from IRTF.
 2. **`data/ishell_htpxmk.fits`** – Replace with real hot-pixel map from IRTF.
 3. **`data/ishell_bias.fits`** – Verify format and epoch; replace if necessary.
-4. **`data/<Mode>_wavecalinfo.fits`** – The polynomial-coefficient headers are
-   real, but spectral data arrays are all NaN.  A valid wavecal solution is
-   needed before `get_header()` / `load_data()` can be implemented.
+4. **`data/<Mode>_wavecalinfo.fits`** – Structure is validated (shape, NORDERS,
+   NORDERS header keyword).  Header-keyword values that appear to be polynomial
+   coefficients are present, but their exact scientific meaning has not been
+   confirmed by reverse-engineering the IDL pipeline.  Spectral data arrays are
+   all NaN and a valid wavecal solution is needed before reduction logic can use
+   this file.
 5. **`telluric_modeinfo.dat`** – All numeric columns are empty (TBD).
 6. **`telluric_ewadjustments.dat`** – No data rows (TBD).
 7. **`telluric_shiftinfo.dat`** – No data rows (TBD).
 8. **`J_lines.dat`, `H_lines.dat`, `K_lines.dat`** – Band-level placeholder
    lists; per-mode lists in `data/` are real (Cushing 2017).
+
+---
+
+## 7. Typed Calibration Reader API (`calibrations.py`)
+
+The module `pyspextool.instruments.ishell.calibrations` provides typed
+readers that parse each packaged resource into a well-defined Python
+dataclass.  It builds on top of `resources.py` (which only returns
+`importlib.resources` path objects) and adds:
+
+* File-existence validation,
+* Git LFS pointer detection (raises `RuntimeError` with an actionable
+  message instead of silently passing a corrupt file to downstream code),
+* Structural and dimensional consistency checks,
+* Typed Python dataclasses with documented fields.
+
+### Dataclasses
+
+| Class | Returned by | Key fields |
+|---|---|---|
+| `LineListEntry` | (internal) | `order`, `wavelength_um`, `species`, `fit_type`, `fit_n_terms` |
+| `LineList` | `read_line_list(mode)` | `mode`, `entries`, `n_lines`, `orders`, `wavelengths_um` |
+| `FlatInfo` | `read_flatinfo(mode)` | `mode`, `orders`, `n_orders`, `rotation`, `plate_scale_arcsec`, `image` (2048×2048) |
+| `WaveCalInfo` | `read_wavecalinfo(mode)` | `mode`, `n_orders`, `orders`, `resolving_power`, `data` (NORDERS×4×N), `linelist_name` |
+| `LinearityCube` | `read_linearity_cube()` | `data` (9×2048×2048), `dn_lower_limit`, `dn_upper_limit`, `fit_order` |
+| `PixelMask` | `read_pixel_mask(type)` | `mask_type`, `data` (2048×2048), `is_placeholder` |
+| `BiasFrame` | `read_bias()` | `data` (2048×2048), `divisor` |
+| `ModeCalibrations` | `load_mode_calibrations(mode)` | `mode`, `line_list`, `flatinfo`, `wavecalinfo` |
+
+### Runtime-Critical Resources
+
+These resources must be loadable without error before any reduction stage
+can run:
+
+| Resource | Reader | Used by |
+|---|---|---|
+| `data/<Mode>_lines.dat` | `read_line_list(mode)` | wavelength calibration |
+| `data/<Mode>_flatinfo.fits` | `read_flatinfo(mode)` | order tracing / flat fielding |
+| `data/<Mode>_wavecalinfo.fits` | `read_wavecalinfo(mode)` | wavelength solution |
+| `data/ishell_lincorr_CDS.fits` | `read_linearity_cube()` | detector non-linearity correction |
+| `data/ishell_bdpxmk.fits` | `read_pixel_mask("bad")` | bad-pixel masking |
+| `data/ishell_htpxmk.fits` | `read_pixel_mask("hot")` | hot-pixel masking |
+| `data/ishell_bias.fits` | `read_bias()` | bias subtraction |
+
+### Partially-Understood Formats
+
+The following aspects of the packaged files are not yet fully documented
+and may require further reverse-engineering of the IDL pipeline:
+
+1. **`*_flatinfo.fits` per-order polynomial coefficients** – Header keywords
+   `OR{n}_B1`..`OR{n}_B5` (bottom-edge polynomial) and `OR{n}_T1`..`OR{n}_T5`
+   (top-edge polynomial) encode the order-trace geometry, but the polynomial
+   variable (pixel column vs. row) is not confirmed.
+
+2. **`*_wavecalinfo.fits` data cube planes** – The cube shape is
+   `(NORDERS, 4, N_PIXELS)`.  The four planes are spectral arrays of some
+   kind (wavelength, sky, signal, uncertainty?) but the exact labels have
+   not yet been recovered from the IDL source.
+
+3. **`ishell_bias.fits`** – The file contains an apparently real iSHELL
+   calibration observation from 2016.  The `DIVISOR=10` header suggests
+   it is a mean of 10 co-adds.  Whether the epoch is appropriate for
+   current observations has not been verified.
+
+### Quick-Start Example
+
+```python
+from pyspextool.instruments.ishell.calibrations import load_mode_calibrations, read_linearity_cube
+
+# Load all mode-specific resources at once
+cal = load_mode_calibrations("K1")
+print(cal.line_list.n_lines)      # e.g. 120
+print(cal.flatinfo.n_orders)      # e.g. 38
+print(cal.wavecalinfo.data.shape) # e.g. (38, 4, 2028)
+
+# Load detector resources individually
+lin = read_linearity_cube()
+print(lin.dn_upper_limit)         # 37000.0 DN
+```
