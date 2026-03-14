@@ -7,6 +7,8 @@ Coverage:
   - RectificationMap creation from populated geometry.
   - Basic rectification behaviour on synthetic inputs.
   - Failure cases for malformed or inconsistent calibration inputs.
+  - Arc-line centroid measurement (fit_arc_line_centroids).
+  - Measured wavelength solution from arc-line centroids (build_geometry_from_arc_lines).
 """
 
 from __future__ import annotations
@@ -16,8 +18,11 @@ import pytest
 
 from pyspextool.instruments.ishell.calibrations import (
     FlatInfo,
+    LineList,
+    LineListEntry,
     WaveCalInfo,
     read_flatinfo,
+    read_line_list,
     read_wavecalinfo,
 )
 from pyspextool.instruments.ishell.geometry import (
@@ -27,8 +32,10 @@ from pyspextool.instruments.ishell.geometry import (
     build_order_geometry_set,
 )
 from pyspextool.instruments.ishell.wavecal import (
+    build_geometry_from_arc_lines,
     build_geometry_from_wavecalinfo,
     build_rectification_maps,
+    fit_arc_line_centroids,
 )
 
 
@@ -685,3 +692,463 @@ class TestCalibrationsBackwardCompatibility:
         )
         assert wci.xranges is None
         assert wci.n_pixels == 100
+
+
+# ===========================================================================
+# 6.  fit_arc_line_centroids – arc-line identification and centroid measurement
+# ===========================================================================
+
+
+def _make_synthetic_line_list(
+    mode: str = "K1",
+    orders: list[int] | None = None,
+    n_lines_per_order: int = 6,
+    start_wav: float = 2.20,
+    disp: float = 5e-4,
+) -> LineList:
+    """Construct a synthetic LineList for use in centroid-measurement tests."""
+    if orders is None:
+        orders = list(range(233, 233 + 3))
+    entries = []
+    for o_idx, order in enumerate(orders):
+        for j in range(n_lines_per_order):
+            wav = start_wav + o_idx * 0.01 + j * disp * 50
+            entries.append(
+                LineListEntry(
+                    order=order,
+                    wavelength_um=wav,
+                    species="Ar I",
+                    fit_window_angstrom=1.0,
+                    fit_type="G",
+                    fit_n_terms=5,
+                )
+            )
+    return LineList(mode=mode, entries=entries)
+
+
+class TestFitArcLineCentroids:
+    """Tests for the first measured arc-line centroid fitting step."""
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_returns_dict_keyed_by_order(self, mode):
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        result = fit_arc_line_centroids(wci, ll)
+        assert isinstance(result, dict)
+        # Every order in wavecalinfo must appear as a key
+        for order in wci.orders:
+            assert order in result
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_results_are_lists_of_triples(self, mode):
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        result = fit_arc_line_centroids(wci, ll)
+        for order, measurements in result.items():
+            assert isinstance(measurements, list)
+            for item in measurements:
+                assert len(item) == 3, (
+                    f"Order {order}: expected (centroid, wavelength, snr) triple, got {item}"
+                )
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_centroids_within_column_range(self, mode):
+        """Measured centroids must fall within the valid detector column range."""
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        result = fit_arc_line_centroids(wci, ll)
+        for i, order in enumerate(wci.orders):
+            x0, x1 = int(wci.xranges[i, 0]), int(wci.xranges[i, 1])
+            for centroid, wav, snr in result[order]:
+                assert x0 <= centroid <= x1, (
+                    f"Order {order}: centroid {centroid:.2f} outside [{x0},{x1}]"
+                )
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_snr_above_threshold(self, mode):
+        """All accepted centroids must have SNR >= snr_min."""
+        snr_min = 5.0
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        result = fit_arc_line_centroids(wci, ll, snr_min=snr_min)
+        for order, measurements in result.items():
+            for centroid, wav, snr in measurements:
+                assert snr >= snr_min, (
+                    f"Order {order}: accepted centroid with SNR {snr:.1f} < {snr_min}"
+                )
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_wavelengths_match_line_list(self, mode):
+        """Returned wavelengths must match the input line list wavelengths."""
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        result = fit_arc_line_centroids(wci, ll)
+        known_wavs = {e.wavelength_um for e in ll.entries}
+        for order, measurements in result.items():
+            for centroid, wav, snr in measurements:
+                assert wav in known_wavs, (
+                    f"Order {order}: returned wavelength {wav} not in line list"
+                )
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_at_least_one_order_with_measurements(self, mode):
+        """At least one order must have accepted centroid measurements."""
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        result = fit_arc_line_centroids(wci, ll)
+        total = sum(len(v) for v in result.values())
+        assert total > 0, f"Mode {mode}: no arc lines identified"
+
+    def test_missing_xranges_raises_value_error(self):
+        """fit_arc_line_centroids must raise ValueError when xranges is None."""
+        wci = read_wavecalinfo("K1")
+        ll = read_line_list("K1")
+        wci_bad = WaveCalInfo(
+            mode=wci.mode, n_orders=wci.n_orders, orders=wci.orders,
+            resolving_power=wci.resolving_power, data=wci.data,
+            linelist_name=wci.linelist_name, wcal_type=wci.wcal_type,
+            home_order=wci.home_order, disp_degree=wci.disp_degree,
+            order_degree=wci.order_degree,
+            xranges=None,
+        )
+        with pytest.raises(ValueError, match="xranges"):
+            fit_arc_line_centroids(wci_bad, ll)
+
+    def test_empty_line_list_returns_empty_results(self):
+        """An empty line list should return empty result lists for all orders."""
+        wci = read_wavecalinfo("K1")
+        empty_ll = LineList(mode="K1", entries=[])
+        result = fit_arc_line_centroids(wci, empty_ll)
+        for order, measurements in result.items():
+            assert measurements == [], (
+                f"Order {order}: expected empty list for empty line list"
+            )
+
+    def test_very_high_snr_threshold_rejects_all(self):
+        """An extremely high SNR threshold must result in no accepted lines."""
+        wci = read_wavecalinfo("K1")
+        ll = read_line_list("K1")
+        result = fit_arc_line_centroids(wci, ll, snr_min=1e9)
+        total = sum(len(v) for v in result.values())
+        assert total == 0, (
+            f"Expected no accepted lines at SNR=1e9, got {total}"
+        )
+
+    def test_centroids_near_predicted_wavelength(self):
+        """Measured centroid wavelengths (from plane-0 eval) must be close
+        to the known line wavelengths from the line list.
+
+        This verifies that the centroid is located near the correct line,
+        not at some random arc feature.
+        """
+        mode = "K1"
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        result = fit_arc_line_centroids(wci, ll, snr_min=10.0)
+
+        for i, order in enumerate(wci.orders):
+            measurements = result[order]
+            if not measurements:
+                continue
+            # Build wavelength function from plane 0 for this order
+            wav_arr = wci.data[i, 0, :]
+            valid = ~np.isnan(wav_arr)
+            x0 = int(wci.xranges[i, 0])
+            cols_v = np.arange(int(valid.sum()), dtype=float) + x0
+            wav_v = wav_arr[valid]
+
+            for centroid, known_wav, snr in measurements:
+                # Interpolate wavelength at centroid from the reference grid
+                measured_wav = float(np.interp(centroid, cols_v, wav_v))
+                # Allow ±0.005 µm (5 nm) tolerance
+                assert abs(measured_wav - known_wav) < 0.005, (
+                    f"Order {order}: centroid at {centroid:.1f} px → wav "
+                    f"{measured_wav:.6f} µm; expected {known_wav:.6f} µm"
+                )
+
+
+# ===========================================================================
+# 7.  build_geometry_from_arc_lines – measured wavelength solution
+# ===========================================================================
+
+
+class TestBuildGeometryFromArcLines:
+    """Tests for the first real measured arc-line fitting stage."""
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_returns_order_geometry_set(self, mode):
+        fi = read_flatinfo(mode)
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        geom = build_geometry_from_arc_lines(wci, fi, ll)
+        assert isinstance(geom, OrderGeometrySet)
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_mode_attribute(self, mode):
+        fi = read_flatinfo(mode)
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        geom = build_geometry_from_arc_lines(wci, fi, ll)
+        assert geom.mode == mode
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_n_orders_correct(self, mode):
+        fi = read_flatinfo(mode)
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        geom = build_geometry_from_arc_lines(wci, fi, ll)
+        assert geom.n_orders == fi.n_orders
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_has_wavelength_solution(self, mode):
+        fi = read_flatinfo(mode)
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        geom = build_geometry_from_arc_lines(wci, fi, ll)
+        assert geom.has_wavelength_solution()
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_wave_coeffs_in_band_range(self, mode):
+        """Wavelength solution at mid-order column must fall in the correct band."""
+        fi = read_flatinfo(mode)
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        geom = build_geometry_from_arc_lines(wci, fi, ll)
+
+        band_limits = {
+            "J": (1.0, 1.4),
+            "H": (1.4, 1.9),
+            "K": (1.85, 2.5),
+        }
+        band = mode[0]
+        lo, hi = band_limits[band]
+        for g in geom.geometries:
+            col_mid = 0.5 * (g.x_start + g.x_end)
+            val = float(np.polynomial.polynomial.polyval(col_mid, g.wave_coeffs))
+            assert lo < val < hi, (
+                f"Mode {mode}, order {g.order}: wavelength {val:.4f} µm "
+                f"outside band [{lo}, {hi}]"
+            )
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_tilt_is_placeholder_zero(self, mode):
+        """Tilt coefficients must be placeholder zero – 1-D arc data cannot
+        provide tilt measurement (see module docstring for limitation)."""
+        fi = read_flatinfo(mode)
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        geom = build_geometry_from_arc_lines(wci, fi, ll)
+        for g in geom.geometries:
+            assert g.tilt_coeffs is not None
+            np.testing.assert_allclose(
+                g.tilt_coeffs, [0.0],
+                err_msg=(
+                    f"Order {g.order}: tilt_coeffs must be placeholder zero "
+                    "(tilt requires 2-D arc images not available in stored data)"
+                ),
+            )
+
+    @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
+    def test_spatcal_coeffs_linear(self, mode):
+        fi = read_flatinfo(mode)
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        geom = build_geometry_from_arc_lines(wci, fi, ll)
+        for g in geom.geometries:
+            assert g.spatcal_coeffs is not None
+            assert len(g.spatcal_coeffs) == 2
+            assert g.spatcal_coeffs[0] == pytest.approx(0.0)
+            assert g.spatcal_coeffs[1] == pytest.approx(fi.plate_scale_arcsec)
+
+    def test_mode_mismatch_raises_value_error(self):
+        fi = read_flatinfo("J0")
+        wci = read_wavecalinfo("K1")
+        ll = read_line_list("K1")
+        with pytest.raises(ValueError, match="mode"):
+            build_geometry_from_arc_lines(wci, fi, ll)
+
+    def test_missing_edge_coeffs_raises_value_error(self):
+        fi = read_flatinfo("K1")
+        wci = read_wavecalinfo("K1")
+        ll = read_line_list("K1")
+        fi_bad = FlatInfo(
+            mode=fi.mode, orders=fi.orders, rotation=fi.rotation,
+            plate_scale_arcsec=fi.plate_scale_arcsec,
+            slit_height_pixels=fi.slit_height_pixels,
+            slit_height_arcsec=fi.slit_height_arcsec,
+            slit_range_pixels=fi.slit_range_pixels,
+            resolving_power_pixel=fi.resolving_power_pixel,
+            step=fi.step, flat_fraction=fi.flat_fraction,
+            comm_window=fi.comm_window, image=fi.image,
+            xranges=fi.xranges,
+            edge_coeffs=None,
+        )
+        with pytest.raises(ValueError, match="edge_coeffs"):
+            build_geometry_from_arc_lines(wci, fi_bad, ll)
+
+    def test_fallback_to_bootstrap_when_few_lines(self):
+        """Orders with fewer accepted lines than min_lines_per_order must
+        fall back to the plane-0 bootstrap and emit RuntimeWarning."""
+        fi = read_flatinfo("K1")
+        wci = read_wavecalinfo("K1")
+        ll = read_line_list("K1")
+        # Use an absurdly high SNR threshold so nothing is accepted → all fallback
+        with pytest.warns(RuntimeWarning, match="falling back"):
+            geom = build_geometry_from_arc_lines(wci, fi, ll, snr_min=1e9)
+        # Result must still be a valid geometry set
+        assert isinstance(geom, OrderGeometrySet)
+        assert geom.has_wavelength_solution()
+
+    def test_measured_orders_differ_from_bootstrap(self):
+        """For orders with enough arc lines, the measured wave_coeffs must
+        differ from the bootstrap (plane-0) coefficients.
+
+        Both are derived from the same stored data but via different fitting
+        procedures: measured uses arc-line centroids from plane 1 while
+        bootstrap fits the plane-0 wavelength array directly.
+        """
+        mode = "K1"
+        fi = read_flatinfo(mode)
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+
+        geom_boot = build_geometry_from_wavecalinfo(wci, fi)
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", RuntimeWarning)
+            geom_meas = build_geometry_from_arc_lines(wci, fi, ll, snr_min=3.0)
+
+        # Find an order that was fitted from measured centroids
+        centroids = fit_arc_line_centroids(wci, ll, snr_min=3.0)
+        measured_orders = {o for o, v in centroids.items() if len(v) >= 4}
+
+        if not measured_orders:
+            pytest.skip("No orders with enough measured centroids for K1 at snr_min=3")
+
+        any_differ = False
+        for g_boot, g_meas in zip(geom_boot.geometries, geom_meas.geometries):
+            if g_boot.order in measured_orders:
+                # Coefficients need not be identical (different fitting approach)
+                if not np.allclose(g_boot.wave_coeffs, g_meas.wave_coeffs, rtol=1e-12):
+                    any_differ = True
+                    break
+
+        assert any_differ, (
+            "Measured and bootstrap wave_coeffs are identical for all measured "
+            "orders; the measured path should produce different coefficients."
+        )
+
+    def test_custom_dispersion_degree(self):
+        """dispersion_degree parameter overrides wavecalinfo.disp_degree."""
+        fi = read_flatinfo("K1")
+        wci = read_wavecalinfo("K1")
+        ll = read_line_list("K1")
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", RuntimeWarning)
+            geom = build_geometry_from_arc_lines(wci, fi, ll, dispersion_degree=2)
+        for g in geom.geometries:
+            assert len(g.wave_coeffs) == 3  # degree 2 → 3 terms
+
+    @pytest.mark.parametrize("mode", ALL_MODES)
+    def test_all_modes_succeed(self, mode):
+        """build_geometry_from_arc_lines must complete without error for
+        every supported J/H/K mode and return a valid OrderGeometrySet."""
+        fi = read_flatinfo(mode)
+        wci = read_wavecalinfo(mode)
+        ll = read_line_list(mode)
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", RuntimeWarning)
+            geom = build_geometry_from_arc_lines(wci, fi, ll)
+        assert geom.has_wavelength_solution()
+        assert geom.has_tilt()
+        assert geom.n_orders > 0
+
+    def test_synthetic_measured_wave_coeffs(self):
+        """For a synthetic arc spectrum with known Gaussian lines, the
+        measured centroids must recover the correct wavelengths to high
+        accuracy."""
+        import scipy.stats
+
+        # Build a synthetic wavecalinfo with plane-0 wavelength grid and
+        # plane-1 arc spectrum containing narrow Gaussian lines
+        n_orders = 2
+        n_pixels = 400
+        orders = [233, 234]
+        x0 = 50
+        disp = 5e-4  # µm/pixel
+
+        data = np.full((n_orders, 4, n_pixels), np.nan)
+        xranges = np.zeros((n_orders, 2), dtype=int)
+
+        # Known line positions: 3 lines per order at fixed pixel offsets
+        line_pixel_offsets = [80, 200, 320]  # pixel offsets into the order
+        known_wavs = []
+
+        for i, order in enumerate(orders):
+            cols = np.arange(n_pixels, dtype=float) + x0
+            wavs = 2.20 + i * 0.05 + cols * disp
+            data[i, 0, :] = wavs
+
+            # Build synthetic arc spectrum with Gaussian lines
+            arc = np.random.default_rng(42 + i).normal(0, 0.5, n_pixels)
+            for pix_offset in line_pixel_offsets:
+                amplitude = 200.0
+                sigma = 1.5
+                arc += amplitude * np.exp(
+                    -0.5 * ((np.arange(n_pixels) - pix_offset) / sigma) ** 2
+                )
+
+            data[i, 1, :] = arc
+            xranges[i] = [x0, x0 + n_pixels - 1]
+
+            order_wavs = [float(wavs[p]) for p in line_pixel_offsets]
+            known_wavs.append(order_wavs)
+
+        wci = WaveCalInfo(
+            mode="K1",
+            n_orders=n_orders,
+            orders=orders,
+            resolving_power=70000.0,
+            data=data,
+            linelist_name="K1_lines.dat",
+            wcal_type="2DXD",
+            home_order=250,
+            disp_degree=1,
+            order_degree=2,
+            xranges=xranges,
+        )
+
+        # Build a LineList with the known lines
+        entries = []
+        for i, order in enumerate(orders):
+            for wav in known_wavs[i]:
+                entries.append(
+                    LineListEntry(
+                        order=order,
+                        wavelength_um=wav,
+                        species="Ar I",
+                        fit_window_angstrom=1.0,
+                        fit_type="G",
+                        fit_n_terms=5,
+                    )
+                )
+        ll = LineList(mode="K1", entries=entries)
+
+        # Measure centroids
+        result = fit_arc_line_centroids(wci, ll, snr_min=5.0)
+
+        for i, order in enumerate(orders):
+            measurements = result[order]
+            assert len(measurements) >= 2, (
+                f"Order {order}: expected >= 2 measured centroids, got {len(measurements)}"
+            )
+            for centroid, wav, snr in measurements:
+                # expected_pix is the column number (= array_index + x0)
+                expected_pix = (wav - (2.20 + i * 0.05)) / disp
+                # Centroid should be within ±1 pixel of the true position
+                assert abs(centroid - expected_pix) < 1.0, (
+                    f"Order {order}: centroid {centroid:.2f} != expected "
+                    f"{expected_pix:.2f} for line at {wav:.6f} µm"
+                )
