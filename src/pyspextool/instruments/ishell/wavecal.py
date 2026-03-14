@@ -1,9 +1,27 @@
 """
-iSHELL-specific ThAr wavelength calibration and rectification support.
+iSHELL-specific geometry population and rectification support.
 
-This module implements the first working iSHELL J/H/K ThAr wavecal and
-rectification pipeline, operating on the stored calibration data packaged
-with pySpextool.
+.. warning::
+    **This module is a structural bootstrap, not a full wavecal pipeline.**
+
+    It reads the pre-packaged ``*_wavecalinfo.fits`` files and fits
+    polynomials to the values stored in plane 0 of the data cube.  Those
+    stored values are *inferred* to represent wavelengths in microns (the
+    numbers fall in the expected J/H/K band ranges and the FITS header
+    contains 2DXD polynomial coefficients), but the exact provenance and
+    physical meaning of each data-cube plane are **not formally documented**
+    in the packaged files.  See the "Confirmed vs inferred" table in
+    ``docs/ishell_wavecal_design_note.md``.
+
+    In particular:
+
+    * Tilt coefficients are set to a **placeholder zero** – no real
+      spectral-line tilt measurement is performed.  With zero tilt the
+      resampling step is an identity within each order footprint.
+    * Spatial calibration uses a simple linear plate-scale model with no
+      curvature correction.
+    * The implementation does **not** replicate the interactive 1DXD/2DXD
+      arc-line fitting procedure from legacy IDL Spextool.
 
 Public API
 ----------
@@ -14,42 +32,42 @@ Public API
   :class:`~pyspextool.instruments.ishell.geometry.RectificationMap` for
   every order in an ``OrderGeometrySet``.
 
-Numerical approach (1DXD-style)
---------------------------------
-The stored ``WaveCalInfo.data`` cube (plane 0) contains wavelengths
-pre-computed by the reference 2DXD polynomial solution derived from real
-ThAr arc frames.  For each order we:
+Implementation approach (polynomial fit to stored reference arrays)
+--------------------------------------------------------------------
+For each echelle order this module:
 
-1. Extract the stored wavelength array ``data[i, 0, :]``.
-2. Map array indices to detector columns using the ``xranges`` parsed
+1. Extracts the stored array from plane 0 of ``WaveCalInfo.data``
+   (structurally validated; semantics inferred as wavelengths in µm).
+2. Maps array indices to detector columns using the ``xranges`` parsed
    from the FITS header (``OR{n}_XR`` keywords).
-3. Fit a polynomial (degree = ``wavecalinfo.disp_degree``) to
-   ``(columns, wavelengths)`` within the valid column range.
-4. Store the fitted polynomial coefficients as
+3. Fits a polynomial (degree = ``wavecalinfo.disp_degree``) to
+   ``(columns, plane-0 values)`` within the valid column range.
+4. Stores the fitted polynomial coefficients as
    :attr:`~pyspextool.instruments.ishell.geometry.OrderGeometry.wave_coeffs`.
 
-Tilt model (provisional / zero approximation)
-----------------------------------------------
-True spectral-line tilt measurement requires fitting arc-line centroids at
-multiple row positions from real ThAr arc data.  That step is not yet
-implemented (see *What remains incomplete* below).
+This is **not** a re-implementation of the 1DXD/2DXD wavecal procedure;
+it is a compact representation of the values that were already stored in
+the packaged reference files.
 
-As a first approximation, ``tilt_coeffs`` is set to ``[0.0]`` (constant
-zero) for every order.  This means the rectification reduces to a simple
-resampling that accounts for the curved edges of each order but does not
-remove in-order spectral-line tilt.  The approximation is acceptable for
-bright-line preview extraction; science use requires real tilt measurement.
+Tilt model (placeholder: constant zero)
+----------------------------------------
+``tilt_coeffs`` is set to ``[0.0]`` for every order.  This is a
+**temporary placeholder** – no arc-line centroid fitting is performed.
+With zero tilt the rectification step applies no horizontal correction and
+the output within each order footprint equals the bilinearly-interpolated
+input.  Science-quality rectification requires real tilt measurement from
+ThAr arc frames (see *What remains incomplete* below).
 
-Spatial calibration
--------------------
+Spatial calibration (provisional linear model)
+-----------------------------------------------
 The spatial calibration maps row offset from the order centerline to
 arcseconds::
 
     arcsec = spatcal_coeffs[0] + spatcal_coeffs[1] * row_offset
 
-where ``row_offset = row − centerline_row(col)``.  A simple linear
-model ``spatcal_coeffs = [0.0, plate_scale_arcsec]`` is used, derived
-from ``FlatInfo.plate_scale_arcsec``.
+A simple linear model ``spatcal_coeffs = [0.0, plate_scale_arcsec]`` is
+used, derived from ``FlatInfo.plate_scale_arcsec``.  No curvature
+correction is applied.
 
 What remains incomplete relative to legacy IDL Spextool
 ---------------------------------------------------------
@@ -57,13 +75,17 @@ What remains incomplete relative to legacy IDL Spextool
     at multiple rows to measure spectral-line tilt as a function of column.
     This requires ThAr arc frames, not just stored calibration data.
 2.  **Slit curvature / higher-order distortion** – curvature within each
-    order is not modelled by the current zero-tilt approximation.
+    order is not modelled by the current zero-tilt placeholder.
 3.  **Full 2DXD wavecal iteration** – interactive arc-line identification
     and iterative outlier rejection are not implemented here; the stored
-    wavelength arrays are used directly.
+    reference arrays are used directly.
 4.  **Wavelength uncertainty propagation** – fit residuals and covariance
     are not stored in the geometry objects.
-5.  **L/Lp/M modes** – out of scope per the problem statement.
+5.  **Plane 0 semantic validation** – the assumption that plane 0 contains
+    wavelengths in µm is inferred from value ranges, not formally
+    documented.  Planes 1–3 of the data cube are not used and their
+    meanings are not confirmed.
+6.  **L/Lp/M modes** – out of scope per the problem statement.
 """
 
 from __future__ import annotations
@@ -101,30 +123,30 @@ def build_geometry_from_wavecalinfo(
 ) -> OrderGeometrySet:
     """Populate an :class:`~.geometry.OrderGeometrySet` from stored calibrations.
 
-    Uses the stored wavelength arrays in ``WaveCalInfo`` (plane 0 of the
-    data cube) to derive per-order wavelength polynomial coefficients,
-    and the edge polynomials from ``FlatInfo`` to set up the order
-    geometry.
+    Reads plane 0 of the ``WaveCalInfo`` data cube (inferred to contain
+    wavelength-like values in µm) and fits a polynomial to those values for
+    each order.  Edge polynomials come from the ``FlatInfo``.  The tilt is
+    set to a **placeholder zero** and the spatial calibration uses a simple
+    linear plate-scale model – neither is scientifically validated.
 
     Parameters
     ----------
     wavecalinfo : :class:`~.calibrations.WaveCalInfo`
-        Stored wavelength-calibration metadata for the mode.  Must have
-        ``xranges`` populated (i.e. parsed from the ``OR{n}_XR`` FITS
-        header keywords).
+        Stored calibration metadata for the mode.  Must have ``xranges``
+        populated (parsed from the ``OR{n}_XR`` FITS header keywords).
     flatinfo : :class:`~.calibrations.FlatInfo`
         Flat-field calibration for the same mode.  Must have
         ``edge_coeffs`` and ``xranges`` populated.
     dispersion_degree : int or None, optional
-        Polynomial degree for the per-order wavelength fit.  Defaults
-        to ``wavecalinfo.disp_degree`` when ``None``.
+        Polynomial degree for the per-order fit to plane 0 values.
+        Defaults to ``wavecalinfo.disp_degree`` when ``None``.
 
     Returns
     -------
     :class:`~.geometry.OrderGeometrySet`
-        Geometry set with ``wave_coeffs``, ``tilt_coeffs``, and
-        ``spatcal_coeffs`` populated for every order.  The tilt
-        coefficients are set to a constant zero (see module docstring).
+        Geometry set with ``wave_coeffs``, ``tilt_coeffs`` (placeholder
+        zero), and ``spatcal_coeffs`` (linear plate-scale model) populated
+        for every order.
 
     Raises
     ------
@@ -294,11 +316,15 @@ def _derive_wave_coeffs(
     x_end: int,
     degree: int,
 ) -> np.ndarray:
-    """Fit a wavelength polynomial for one order from the stored data cube.
+    """Fit a polynomial to plane 0 of the stored data cube for one order.
 
-    The stored wavelength array (plane 0 of the data cube) maps array
-    position ``j`` to detector column ``x_start + j``.  Valid pixels are
-    those without NaN in the wavelength plane.
+    .. note::
+        The physical meaning of plane 0 is **inferred** (values fall in the
+        expected J/H/K wavelength ranges in µm) but is not formally
+        documented.  The column mapping ``array_index -> x_start + array_index``
+        is a structural assumption based on how ``OR{n}_XR`` header ranges
+        relate to NaN boundaries in the cube; it is not directly confirmed
+        by instrument documentation.
 
     Parameters
     ----------
@@ -322,8 +348,8 @@ def _derive_wave_coeffs(
 
     if not valid.any():
         raise ValueError(
-            f"wavecalinfo order index {order_idx} has no valid wavelength "
-            "pixels (all NaN in plane 0)."
+            f"wavecalinfo order index {order_idx} has no valid (non-NaN) values "
+            "in data cube plane 0."
         )
 
     n_valid = int(valid.sum())

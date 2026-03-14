@@ -732,11 +732,21 @@ def _rectify_orders(
         geometry: OrderGeometrySet,
         plate_scale_arcsec: float = _DEFAULT_PLATE_SCALE) -> np.ndarray:
     """
-    Rectify tilted iSHELL echelle orders onto a rectilinear grid.
+    Resample iSHELL echelle orders using the geometry stored in *geometry*.
+
+    .. warning::
+        The current implementation uses a **placeholder zero-tilt** model.
+        The resampling within each order is effectively the identity
+        transformation; no spectral-line tilt is measured or corrected.
+        See ``docs/ishell_wavecal_design_note.md`` §5 for what remains
+        to be implemented before this function delivers science-quality
+        rectification.
 
     iSHELL echelle orders are tilted with respect to the detector columns.
-    This function resamples each order onto a uniform wavelength-vs-spatial
-    grid so that the generic ``extract_1dxd()`` routine can be applied.
+    This function resamples each order using the tilt model in *geometry*
+    so that the output can be passed to the generic ``extract_1dxd()``
+    routine.  With the current placeholder zero-tilt model, no horizontal
+    column correction is applied.
 
     Parameters
     ----------
@@ -756,27 +766,32 @@ def _rectify_orders(
     Returns
     -------
     rectified : ndarray, shape (nrows, ncols)
-        Rectified image with orders resampled to remove spectral-line tilt.
-        Pixels outside all orders are set to NaN.
+        Image resampled according to the tilt model stored in *geometry*.
+        With the current placeholder zero-tilt model, pixels inside each
+        order footprint equal the bilinearly-interpolated input values (i.e.
+        the transformation is effectively the identity within each order).
+        Pixels outside all order footprints are set to NaN.
+
+        .. warning::
+            The current implementation uses a **placeholder zero-tilt**
+            model.  No spectral-line tilt is measured or removed.  The
+            output is structurally valid (NaN masking and edge geometry
+            are applied) but is not a scientifically rectified image.
 
     Notes
     -----
-    This is the primary new piece of instrument-specific logic required for
-    iSHELL and has no equivalent in the SpeX pipeline.
-
     The implementation uses :func:`scipy.ndimage.map_coordinates` with
-    bilinear interpolation (``order=1``) to resample each order from the
-    tilted raw frame onto a rectilinear grid.  Each output pixel at
-    ``(row, col)`` within an order is mapped to a source column via the
-    tilt polynomial::
+    bilinear interpolation (``order=1``) to resample each order.  Each
+    output pixel at ``(row, col)`` within an order is mapped to a source
+    column via the tilt polynomial stored in *geometry*::
 
         src_col = col + tilt(col) * (row - centerline(col))
-        src_row = row          # rows are not shifted
+        src_row = row          # rows are not shifted in the tilt model
 
-    With the current zero-tilt approximation (``tilt_coeffs = [0.0]``),
-    the mapping is the identity and the output equals the input within the
-    order boundaries.  Real tilt measurement from arc frames will make
-    the correction non-trivial.
+    With the current placeholder zero-tilt (``tilt_coeffs = [0.0]``),
+    the mapping is the identity and the output equals the bilinearly-
+    interpolated input within the order boundaries.  Real tilt correction
+    requires measured tilt coefficients from arc frames.
 
     The function requires ``geometry.has_wavelength_solution()`` to be
     ``True``; if the geometry is empty (no orders) the input image is

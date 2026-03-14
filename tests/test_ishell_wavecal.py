@@ -169,7 +169,8 @@ class TestBuildGeometryFromWaveCalInfo:
         assert geom.has_wavelength_solution()
 
     @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
-    def test_has_tilt(self, mode):
+    def test_has_tilt_placeholder(self, mode):
+        """tilt_coeffs is set (placeholder zero) for all orders."""
         fi = read_flatinfo(mode)
         wci = read_wavecalinfo(mode)
         geom = build_geometry_from_wavecalinfo(wci, fi)
@@ -196,7 +197,7 @@ class TestBuildGeometryFromWaveCalInfo:
 
     @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
     def test_tilt_coeffs_zero(self, mode):
-        """Current implementation uses zero tilt."""
+        """tilt_coeffs is the placeholder [0.0] for all orders."""
         fi = read_flatinfo(mode)
         wci = read_wavecalinfo(mode)
         geom = build_geometry_from_wavecalinfo(wci, fi)
@@ -218,14 +219,19 @@ class TestBuildGeometryFromWaveCalInfo:
             assert g.spatcal_coeffs[1] == pytest.approx(fi.plate_scale_arcsec)
 
     @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
-    def test_wavelength_physically_plausible(self, mode):
-        """Wavelengths evaluated at the center of each order should be
-        in the correct band for the mode."""
+    def test_plane0_values_in_band_range(self, mode):
+        """Plane 0 of the stored data cube has values consistent with the
+        expected J/H/K wavelength ranges (µm).
+
+        This is a *structural* range check: the stored values happen to fall
+        in the expected band for each mode.  It does NOT confirm that plane 0
+        is formally documented as wavelengths – that semantic is inferred.
+        """
         fi = read_flatinfo(mode)
         wci = read_wavecalinfo(mode)
         geom = build_geometry_from_wavecalinfo(wci, fi)
 
-        # Rough band boundaries
+        # Rough band boundaries (µm) used only as a sanity range check
         band_limits = {
             "J": (1.0, 1.4),
             "H": (1.4, 1.9),
@@ -235,10 +241,10 @@ class TestBuildGeometryFromWaveCalInfo:
         lo, hi = band_limits[band]
         for g in geom.geometries:
             col_mid = 0.5 * (g.x_start + g.x_end)
-            wav = np.polynomial.polynomial.polyval(col_mid, g.wave_coeffs)
-            assert lo < wav < hi, (
-                f"Mode {mode}, order {g.order}: wavelength {wav:.4f} µm "
-                f"outside expected band [{lo}, {hi}]"
+            val = np.polynomial.polynomial.polyval(col_mid, g.wave_coeffs)
+            assert lo < val < hi, (
+                f"Mode {mode}, order {g.order}: plane-0 fitted value {val:.4f} "
+                f"outside expected band range [{lo}, {hi}] µm"
             )
 
     def test_mode_mismatch_raises_value_error(self):
@@ -356,7 +362,12 @@ class TestBuildRectificationMaps:
             assert m.n_spectral == expected_n_spec
 
     def test_wavelengths_increasing(self, k1_geom):
-        """K-band wavelengths should increase with column."""
+        """Plane-0 fitted values increase with column for K1 stored data.
+
+        This checks the structural property of the stored reference arrays
+        (which are inferred to represent wavelengths); it is not a test of
+        a live wavelength measurement.
+        """
         geom, fi = k1_geom
         maps = build_rectification_maps(geom, plate_scale_arcsec=fi.plate_scale_arcsec)
         for m in maps:
@@ -492,7 +503,8 @@ class TestRectifyOrders:
             rectify_func(img, geom)
 
     def test_zero_tilt_identity_within_order(self, rectify_func):
-        """With zero tilt, rectified pixels inside the order equal source pixels."""
+        """With placeholder zero tilt, output pixels inside the order equal
+        the bilinearly-interpolated input (identity mapping)."""
         fi = _make_synthetic_flatinfo(mode="K1", n_orders=1)
         wci = _make_synthetic_wavecalinfo(mode="K1", n_orders=1, n_pixels=100)
         geom = build_geometry_from_wavecalinfo(wci, fi, dispersion_degree=1)
@@ -532,7 +544,9 @@ class TestRectifyOrders:
         assert np.isnan(result[0, 0])
 
     def test_real_k1_geometry_runs_without_error(self, rectify_func):
-        """End-to-end: rectify a random 2048×2048 image with K1 geometry."""
+        """Smoke test: resampling a random image with K1 geometry completes
+        without error and produces some non-NaN output (structural test only;
+        no physical correctness is implied with the placeholder zero-tilt)."""
         fi = read_flatinfo("K1")
         wci = read_wavecalinfo("K1")
         geom = build_geometry_from_wavecalinfo(wci, fi)
@@ -553,7 +567,10 @@ class TestIntegrationPipeline:
 
     @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
     def test_full_pipeline_produces_valid_output(self, mode):
-        """Full pipeline: read cals → build geometry → build maps → rectify."""
+        """Structural smoke test: read cals → build geometry (placeholder tilt)
+        → build maps → resample.  Verifies the pipeline runs without error and
+        produces an output with the correct shape and some non-NaN pixels.
+        No physical correctness of wavelengths or rectification is asserted."""
         from pyspextool.instruments.ishell.ishell import _rectify_orders
 
         fi = read_flatinfo(mode)
@@ -573,13 +590,15 @@ class TestIntegrationPipeline:
 
     @pytest.mark.parametrize("mode", ALL_MODES)
     def test_all_modes_geometry_build_succeeds(self, mode):
-        """build_geometry_from_wavecalinfo must succeed for every supported mode."""
+        """build_geometry_from_wavecalinfo must succeed for every supported mode
+        and produce an OrderGeometrySet with all structural fields populated
+        (wave_coeffs from plane 0, placeholder tilt, linear spatcal)."""
         fi = read_flatinfo(mode)
         wci = read_wavecalinfo(mode)
         geom = build_geometry_from_wavecalinfo(wci, fi)
         assert geom.has_wavelength_solution()
-        assert geom.has_tilt()
-        assert geom.has_spatcal()
+        assert geom.has_tilt()      # placeholder zero tilt is set
+        assert geom.has_spatcal()   # placeholder linear spatcal is set
         assert geom.n_orders > 0
 
 

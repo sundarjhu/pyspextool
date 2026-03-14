@@ -252,7 +252,7 @@ class FlatInfo:
 
 @dataclass
 class WaveCalInfo:
-    """Wavelength-calibration metadata and spectral arrays for one mode.
+    """Calibration metadata and data cube read from ``*_wavecalinfo.fits``.
 
     Parameters
     ----------
@@ -265,27 +265,26 @@ class WaveCalInfo:
     resolving_power : float
         Nominal spectral resolving power.
     data : numpy.ndarray, shape (n_orders, 4, n_pixels)
-        Spectral data cube.  Plane 0 contains the stored reference
-        wavelength solution (microns).  Plane 1 contains the arc-lamp
-        spectrum (DN/s).  Plane 2 contains the uncertainty.  Plane 3
-        contains quality flags.  Pixels outside the valid column range
-        for each order are set to NaN.
+        Data cube read from the FITS file.  The plane labelling is **not
+        fully documented** in the packaged files.  Based on structural
+        inspection: plane 0 contains values inferred to be wavelengths in
+        µm (range-checked against J/H/K bands); planes 1–3 are not used
+        and their meanings are unconfirmed.  Pixels outside the valid
+        column range for each order are set to NaN.
     linelist_name : str
-        Filename of the arc-line list used for calibration.
+        Filename of the arc-line list referenced by this calibration.
     wcal_type : str
-        Wavelength calibration type (e.g. ``"2DXD"``).
+        Calibration type string from the FITS header (e.g. ``"2DXD"``).
     home_order : int
-        Reference order for the 2D cross-dispersed polynomial fit.
+        Reference order from the FITS header (``HOMEORDR``).
     disp_degree : int
-        Degree of the dispersion-direction polynomial.
+        Dispersion polynomial degree from the FITS header (``DISPDEG``).
     order_degree : int
-        Degree of the cross-order polynomial.
+        Cross-order polynomial degree from the FITS header (``ORDRDEG``).
     xranges : numpy.ndarray, shape (n_orders, 2) or None
         Per-order column ranges ``[x_start, x_end]`` parsed from the
-        ``OR{n}_XR`` header keywords.  Array index 0 of the data cube
-        third axis corresponds to detector column ``xranges[i, 0]`` for
-        order *i*.  ``None`` if the header does not contain these
-        keywords.
+        ``OR{n}_XR`` header keywords.  ``None`` if the header does not
+        contain these keywords.
     """
 
     mode: str
