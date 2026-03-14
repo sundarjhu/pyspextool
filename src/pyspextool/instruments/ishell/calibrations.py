@@ -472,11 +472,25 @@ def read_flatinfo(mode_name: str) -> FlatInfo:
             f"keywords: {missing}"
         )
 
-    orders = [int(o) for o in hdr["ORDERS"].split(",")]
+    try:
+        orders = [int(o) for o in hdr["ORDERS"].split(",")]
+    except ValueError as exc:
+        raise ValueError(
+            f"flatinfo for mode '{mode_name}': cannot parse ORDERS header "
+            f"value {hdr['ORDERS']!r} as a comma-separated list of integers."
+        ) from exc
 
-    # Parse optional-but-expected keywords with sensible fallbacks
+    # Parse optional-but-expected keywords.
+    # Floats default to NaN (signals "not available" to callers without
+    # masking real zero values).  Integer counts default to 0.
     slit_range_raw = hdr.get("SLTH_RNG", "0,0")
-    slit_range = tuple(int(x) for x in slit_range_raw.split(","))
+    try:
+        slit_range = tuple(int(x) for x in slit_range_raw.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            f"flatinfo for mode '{mode_name}': cannot parse SLTH_RNG header "
+            f"value {slit_range_raw!r} as a comma-separated pair of integers."
+        ) from exc
 
     return FlatInfo(
         mode=mode_name,
@@ -535,7 +549,13 @@ def read_wavecalinfo(mode_name: str) -> WaveCalInfo:
         )
 
     n_orders = int(hdr["NORDERS"])
-    orders = [int(o) for o in hdr["ORDERS"].split(",")]
+    try:
+        orders = [int(o) for o in hdr["ORDERS"].split(",")]
+    except ValueError as exc:
+        raise ValueError(
+            f"wavecalinfo for mode '{mode_name}': cannot parse ORDERS header "
+            f"value {hdr['ORDERS']!r} as a comma-separated list of integers."
+        ) from exc
 
     # Validate cube shape: must be (n_orders, 4, n_pixels)
     if data.ndim != 3:

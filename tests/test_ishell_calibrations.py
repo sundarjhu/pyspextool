@@ -12,14 +12,11 @@ These tests verify:
 
 from __future__ import annotations
 
-import io
-import tempfile
-import os
-
 import numpy as np
 import pytest
 from astropy.io import fits
 
+import pyspextool.instruments.ishell.calibrations as cal_mod
 from pyspextool.instruments.ishell.calibrations import (
     DETECTOR_NCOLS,
     DETECTOR_NROWS,
@@ -52,9 +49,63 @@ SUPPORTED_MODES = [
 _DETECTOR_SHAPE = (DETECTOR_NROWS, DETECTOR_NCOLS)
 
 
-# ===========================================================================
-# read_line_list
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Shared helpers / fixtures
+# ---------------------------------------------------------------------------
+
+
+def _make_lfs_path(tmp_path):
+    """Return a fake Traversable-like path object backed by a Git LFS pointer."""
+    lfs_file = tmp_path / "lfs_pointer.fits"
+    lfs_file.write_bytes(
+        b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n"
+    )
+
+    class _LfsPath:
+        def is_file(self):
+            return True
+
+        def open(self, mode="rb", encoding=None):
+            return lfs_file.open("rb")
+
+        def __str__(self):
+            return str(lfs_file)
+
+    return _LfsPath()
+
+
+def _make_fits_path(fits_file):
+    """Return a fake Traversable-like path object backed by *fits_file* (Path)."""
+
+    class _FitsPath:
+        def is_file(self):
+            return True
+
+        def open(self, mode="rb", encoding=None):
+            return fits_file.open("rb")
+
+        def __str__(self):
+            return str(fits_file)
+
+    return _FitsPath()
+
+
+def _make_text_path(text_file):
+    """Return a fake Traversable-like path backed by *text_file* (Path)."""
+
+    class _TextPath:
+        def is_file(self):
+            return True
+
+        def open(self, mode="r", encoding=None):
+            if "b" in mode:
+                return text_file.open("rb")
+            return text_file.open(mode, encoding=encoding)
+
+        def __str__(self):
+            return str(text_file)
+
+    return _TextPath()
 
 
 class TestReadLineList:
@@ -132,52 +183,32 @@ class TestReadLineList:
 
     def test_missing_file_raises_file_not_found(self, tmp_path, monkeypatch):
         """read_line_list must raise FileNotFoundError if the file is missing."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
-        def fake_get_mode_resource(mode_name, resource_key):
-            # Return a path object pointing to a non-existent file
-            return tmp_path / "nonexistent.dat"
-
-        monkeypatch.setattr(cal_mod, "get_mode_resource", fake_get_mode_resource)
+        monkeypatch.setattr(
+            cal_mod, "get_mode_resource",
+            lambda m, k: tmp_path / "nonexistent.dat"
+        )
         with pytest.raises(FileNotFoundError):
             read_line_list("J0")
 
     def test_malformed_file_raises_value_error(self, tmp_path, monkeypatch):
         """read_line_list must raise ValueError if column count is wrong."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
-        # Write a file with wrong column count
         bad_file = tmp_path / "bad.dat"
         bad_file.write_text("457 | 1.234 | Th I\n")  # only 3 columns
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="r", encoding=None):
-                return bad_file.open(mode, encoding=encoding)
-            def __str__(self):
-                return str(bad_file)
-
-        monkeypatch.setattr(cal_mod, "get_mode_resource", lambda m, k: _FakePath())
+        monkeypatch.setattr(
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_text_path(bad_file)
+        )
         with pytest.raises(ValueError, match="Unexpected number of columns"):
             read_line_list("J0")
 
     def test_empty_file_raises_value_error(self, tmp_path, monkeypatch):
         """read_line_list must raise ValueError if the file has no data rows."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         comment_only = tmp_path / "comments_only.dat"
         comment_only.write_text("# comment\n# another comment\n")
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="r", encoding=None):
-                return comment_only.open(mode, encoding=encoding)
-            def __str__(self):
-                return str(comment_only)
-
-        monkeypatch.setattr(cal_mod, "get_mode_resource", lambda m, k: _FakePath())
+        monkeypatch.setattr(
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_text_path(comment_only)
+        )
         with pytest.raises(ValueError, match="empty"):
             read_line_list("J0")
 
@@ -248,8 +279,6 @@ class TestReadFlatInfo:
 
     def test_missing_file_raises_file_not_found(self, tmp_path, monkeypatch):
         """read_flatinfo must raise FileNotFoundError if the file is missing."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         monkeypatch.setattr(
             cal_mod, "get_mode_resource",
             lambda m, k: tmp_path / "nonexistent.fits"
@@ -259,49 +288,22 @@ class TestReadFlatInfo:
 
     def test_lfs_pointer_raises_runtime_error(self, tmp_path, monkeypatch):
         """read_flatinfo must raise RuntimeError for a Git LFS pointer file."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
-        lfs_file = tmp_path / "lfs_pointer.fits"
-        lfs_file.write_bytes(
-            b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 12345\n"
-        )
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                if "b" in mode:
-                    return lfs_file.open("rb")
-                return lfs_file.open(mode, encoding=encoding)
-            def __str__(self):
-                return str(lfs_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_mode_resource", lambda m, k: _FakePath()
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_lfs_path(tmp_path)
         )
         with pytest.raises(RuntimeError, match="Git LFS"):
             read_flatinfo("J0")
 
     def test_missing_orders_header_raises(self, tmp_path, monkeypatch):
         """read_flatinfo must raise ValueError if ORDERS header keyword is absent."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
-        # Create a FITS file without ORDERS keyword
         hdu = fits.PrimaryHDU(data=np.zeros(_DETECTOR_SHAPE, dtype=np.int16))
         hdu.header["ROTATION"] = 5
         fits_file = tmp_path / "bad_flatinfo.fits"
         hdu.writeto(str(fits_file))
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return fits_file.open("rb")
-            def __str__(self):
-                return str(fits_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_mode_resource", lambda m, k: _FakePath()
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_fits_path(fits_file)
         )
         with pytest.raises(ValueError, match="ORDERS"):
             read_flatinfo("J0")
@@ -369,8 +371,6 @@ class TestReadWaveCalInfo:
 
     def test_missing_file_raises_file_not_found(self, tmp_path, monkeypatch):
         """read_wavecalinfo must raise FileNotFoundError if the file is missing."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         monkeypatch.setattr(
             cal_mod, "get_mode_resource",
             lambda m, k: tmp_path / "nonexistent.fits"
@@ -380,70 +380,36 @@ class TestReadWaveCalInfo:
 
     def test_lfs_pointer_raises_runtime_error(self, tmp_path, monkeypatch):
         """read_wavecalinfo must raise RuntimeError for a Git LFS pointer."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
-        lfs_file = tmp_path / "lfs.fits"
-        lfs_file.write_bytes(
-            b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n"
-        )
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return lfs_file.open("rb")
-            def __str__(self):
-                return str(lfs_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_mode_resource", lambda m, k: _FakePath()
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_lfs_path(tmp_path)
         )
         with pytest.raises(RuntimeError, match="Git LFS"):
             read_wavecalinfo("J0")
 
     def test_missing_norders_header_raises(self, tmp_path, monkeypatch):
         """read_wavecalinfo must raise ValueError if NORDERS is absent."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         hdu = fits.PrimaryHDU(data=np.zeros((47, 4, 100), dtype=np.float64))
         # intentionally omit NORDERS / ORDERS
         fits_file = tmp_path / "bad_wci.fits"
         hdu.writeto(str(fits_file))
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return fits_file.open("rb")
-            def __str__(self):
-                return str(fits_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_mode_resource", lambda m, k: _FakePath()
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_fits_path(fits_file)
         )
         with pytest.raises(ValueError, match="NORDERS"):
             read_wavecalinfo("J0")
 
     def test_norders_mismatch_raises(self, tmp_path, monkeypatch):
         """read_wavecalinfo must raise ValueError if data cube first axis != NORDERS."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         hdu = fits.PrimaryHDU(data=np.zeros((10, 4, 100), dtype=np.float64))
         hdu.header["NORDERS"] = 47  # mismatch: data has 10 but header says 47
         hdu.header["ORDERS"] = ",".join(str(i) for i in range(457, 457 + 47))
         fits_file = tmp_path / "mismatch_wci.fits"
         hdu.writeto(str(fits_file))
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return fits_file.open("rb")
-            def __str__(self):
-                return str(fits_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_mode_resource", lambda m, k: _FakePath()
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_fits_path(fits_file)
         )
         with pytest.raises(ValueError, match="NORDERS"):
             read_wavecalinfo("J0")
@@ -526,8 +492,6 @@ class TestReadLinearityCube:
 
     def test_missing_file_raises_file_not_found(self, tmp_path, monkeypatch):
         """read_linearity_cube must raise FileNotFoundError for a missing file."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         monkeypatch.setattr(
             cal_mod, "get_detector_resource",
             lambda k: tmp_path / "nonexistent.fits"
@@ -537,31 +501,15 @@ class TestReadLinearityCube:
 
     def test_lfs_pointer_raises_runtime_error(self, tmp_path, monkeypatch):
         """read_linearity_cube must raise RuntimeError for a Git LFS pointer."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
-        lfs_file = tmp_path / "lfs.fits"
-        lfs_file.write_bytes(
-            b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n"
-        )
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return lfs_file.open("rb")
-            def __str__(self):
-                return str(lfs_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_detector_resource", lambda k: _FakePath()
+            cal_mod, "get_detector_resource",
+            lambda k: _make_lfs_path(tmp_path)
         )
         with pytest.raises(RuntimeError, match="Git LFS"):
             read_linearity_cube()
 
     def test_wrong_shape_raises_value_error(self, tmp_path, monkeypatch):
         """read_linearity_cube must raise ValueError for wrong spatial dimensions."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         hdu = fits.PrimaryHDU(data=np.zeros((9, 512, 512), dtype=np.float32))
         hdu.header["DNLOLIM"] = 0.0
         hdu.header["DNUPLIM"] = 37000.0
@@ -569,17 +517,9 @@ class TestReadLinearityCube:
         hdu.header["NPEDS"] = 2
         fits_file = tmp_path / "bad_lin.fits"
         hdu.writeto(str(fits_file))
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return fits_file.open("rb")
-            def __str__(self):
-                return str(fits_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_detector_resource", lambda k: _FakePath()
+            cal_mod, "get_detector_resource",
+            lambda k: _make_fits_path(fits_file)
         )
         with pytest.raises(ValueError, match="spatial dimensions"):
             read_linearity_cube()
@@ -624,8 +564,6 @@ class TestReadPixelMask:
 
     def test_missing_file_raises_file_not_found(self, tmp_path, monkeypatch):
         """read_pixel_mask must raise FileNotFoundError for a missing file."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         monkeypatch.setattr(
             cal_mod, "get_detector_resource",
             lambda k: tmp_path / "nonexistent.fits"
@@ -635,27 +573,15 @@ class TestReadPixelMask:
 
     def test_wrong_shape_raises_value_error(self, tmp_path, monkeypatch):
         """read_pixel_mask must raise ValueError for wrong detector dimensions."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         hdu = fits.PrimaryHDU(data=np.zeros((512, 512), dtype=np.uint8))
         hdu.header.add_comment("PLACEHOLDER: test stub")
         fits_file = tmp_path / "bad_mask.fits"
         hdu.writeto(str(fits_file))
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return fits_file.open("rb")
-            def __str__(self):
-                return str(fits_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_detector_resource", lambda k: _FakePath()
+            cal_mod, "get_detector_resource",
+            lambda k: _make_fits_path(fits_file)
         )
-        monkeypatch.setattr(
-            cal_mod, "is_placeholder_resource", lambda k: True
-        )
+        monkeypatch.setattr(cal_mod, "is_placeholder_resource", lambda k: True)
         with pytest.raises(ValueError, match="shape"):
             read_pixel_mask("bad")
 
@@ -686,8 +612,6 @@ class TestReadBias:
 
     def test_missing_file_raises_file_not_found(self, tmp_path, monkeypatch):
         """read_bias must raise FileNotFoundError for a missing file."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         monkeypatch.setattr(
             cal_mod, "get_detector_resource",
             lambda k: tmp_path / "nonexistent.fits"
@@ -697,23 +621,13 @@ class TestReadBias:
 
     def test_wrong_shape_raises_value_error(self, tmp_path, monkeypatch):
         """read_bias must raise ValueError for wrong detector dimensions."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         hdu = fits.PrimaryHDU(data=np.zeros((512, 512), dtype=np.int32))
         hdu.header["DIVISOR"] = 10
         fits_file = tmp_path / "bad_bias.fits"
         hdu.writeto(str(fits_file))
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return fits_file.open("rb")
-            def __str__(self):
-                return str(fits_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_detector_resource", lambda k: _FakePath()
+            cal_mod, "get_detector_resource",
+            lambda k: _make_fits_path(fits_file)
         )
         with pytest.raises(ValueError, match="shape"):
             read_bias()
@@ -763,25 +677,13 @@ class TestLfsPointerDetection:
 
     def test_lfs_pointer_detected_by_read_line_list(self, tmp_path, monkeypatch):
         """_check_lfs is invoked when reading a line list."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
         lfs_file = tmp_path / "lfs.dat"
         lfs_file.write_bytes(
             b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n"
         )
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                if "b" in mode:
-                    return lfs_file.open("rb")
-                return lfs_file.open(mode, encoding=encoding)
-            def __str__(self):
-                return str(lfs_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_mode_resource", lambda m, k: _FakePath()
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_text_path(lfs_file)
         )
         # LFS check is done by _check_lfs before parsing.
         # For a line-list file the _check_lfs step is skipped
@@ -794,69 +696,27 @@ class TestLfsPointerDetection:
 
     def test_lfs_pointer_detected_by_read_flatinfo(self, tmp_path, monkeypatch):
         """RuntimeError with 'Git LFS' message is raised for LFS pointer FITS."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
-        lfs_file = tmp_path / "lfs.fits"
-        lfs_file.write_bytes(
-            b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n"
-        )
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return lfs_file.open("rb")
-            def __str__(self):
-                return str(lfs_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_mode_resource", lambda m, k: _FakePath()
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_lfs_path(tmp_path)
         )
         with pytest.raises(RuntimeError, match="Git LFS"):
             read_flatinfo("J0")
 
     def test_lfs_pointer_detected_by_read_wavecalinfo(self, tmp_path, monkeypatch):
         """RuntimeError with 'Git LFS' message is raised for LFS pointer FITS."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
-        lfs_file = tmp_path / "lfs.fits"
-        lfs_file.write_bytes(
-            b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n"
-        )
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return lfs_file.open("rb")
-            def __str__(self):
-                return str(lfs_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_mode_resource", lambda m, k: _FakePath()
+            cal_mod, "get_mode_resource",
+            lambda m, k: _make_lfs_path(tmp_path)
         )
         with pytest.raises(RuntimeError, match="Git LFS"):
             read_wavecalinfo("J0")
 
     def test_lfs_pointer_detected_by_read_linearity_cube(self, tmp_path, monkeypatch):
         """RuntimeError with 'Git LFS' message is raised for LFS pointer FITS."""
-        import pyspextool.instruments.ishell.calibrations as cal_mod
-
-        lfs_file = tmp_path / "lfs.fits"
-        lfs_file.write_bytes(
-            b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n"
-        )
-
-        class _FakePath:
-            def is_file(self):
-                return True
-            def open(self, mode="rb", encoding=None):
-                return lfs_file.open("rb")
-            def __str__(self):
-                return str(lfs_file)
-
         monkeypatch.setattr(
-            cal_mod, "get_detector_resource", lambda k: _FakePath()
+            cal_mod, "get_detector_resource",
+            lambda k: _make_lfs_path(tmp_path)
         )
         with pytest.raises(RuntimeError, match="Git LFS"):
             read_linearity_cube()
