@@ -1,0 +1,50 @@
+#
+# iSHELL telluric mode information for pySpextool
+#
+# NASA IRTF iSHELL cross-dispersed echelle spectrograph
+# Scope: J, H, and K modes only.
+#
+# IMPORTANT: The deconvolution method is NOT available for iSHELL.
+# The iSHELL Spextool Manual (v10jan2020, §6.2) states explicitly:
+#   "The deconvolution method is not available for ISHELL data so simply
+#    click the Construct Kernel button in Box #2 and the appropriate kernel
+#    for the slit width will be loaded into memory."
+# Therefore ALL iSHELL modes use Method = ip.
+#
+# Mode names follow Table 1 of the iSHELL Spextool Manual:
+#   J-band sub-modes:  J0, J1, J2, J3           (wavelength: 1.062–1.364 µm)
+#   H-band sub-modes:  H1, H2, H3               (wavelength: 1.473–1.832 µm)
+#   K-band sub-modes:  K1, K2, Kgas, K3         (wavelength: 1.918–2.549 µm)
+# All near-IR modes use a ThAr arc lamp and a 5" slit (Manual Table 1).
+#
+# NOTE: All numeric values (order, line wavelength, normalization ranges,
+#       poly degree, fit type, RV/deconvolution N_FWHM) are placeholders
+#       (TBD) and must be derived from real iSHELL A0 V standard-star
+#       observations before production use.
+#       Only Method and Vega Model are confirmed from the manual.
+#
+# Instrument Mode      : instrument mode name (must match <Mode>_flatinfo.fits)
+# Method               : ip  (deconvolution is not available for iSHELL)
+# Vega Model           : Resolving power of model (50000 or 5000)
+# Order                : Order number for line work
+# Deconvolution Line   : The wavelength of the line to deconvolve (microns)
+# Normalization Range  : The range over which to normalize the line
+# Poly Deg             : The polynomial degree used to fit the continuum
+# Fit Type             : the model for the line, lorentzian or gaussian
+# RV N_FWHM            : The number of FWHMs around which to do the xcorrelation
+# Deconvolution N_FWHM : The number of FWHMs around which to do the deconvolution
+#
+#===============================================================================================================================================================================
+# Instrument Mode  | Method  | Vega Model  | Order  |  Line      | Normalization Ranges  | Poly Deg  | Fit Type   | RV N_FWHM  | Deconvolution N_FWHM |
+#===============================================================================================================================================================================
+J0                 | ip      | 50000       |        |            |                       |           |            |            |                      |
+J1                 | ip      | 50000       |        |            |                       |           |            |            |                      |
+J2                 | ip      | 50000       |        |            |                       |           |            |            |                      |
+J3                 | ip      | 50000       |        |            |                       |           |            |            |                      |
+H1                 | ip      | 50000       |        |            |                       |           |            |            |                      |
+H2                 | ip      | 50000       |        |            |                       |           |            |            |                      |
+H3                 | ip      | 50000       |        |            |                       |           |            |            |                      |
+K1                 | ip      | 50000       |        |            |                       |           |            |            |                      |
+K2                 | ip      | 50000       |        |            |                       |           |            |            |                      |
+Kgas               | ip      | 50000       |        |            |                       |           |            |            |                      |
+K3                 | ip      | 50000       |        |            |                       |           |            |            |                      |

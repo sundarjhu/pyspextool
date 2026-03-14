@@ -1,0 +1,12 @@
+#
+# iSHELL telluric EW adjustment information for pySpextool
+#
+# NASA IRTF iSHELL cross-dispersed echelle spectrograph
+# Scope: J, H, and K modes only.
+#
+# NOTE: All values are placeholders (TBD) and must be derived from real
+#       iSHELL A0 V standard-star observations.
+#
+#===========================================================================
+# Mode    | Order Number | Min Range | Max Range | Poly Degree | Tolerance |
+#===========================================================================

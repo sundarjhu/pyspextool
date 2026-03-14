@@ -1,0 +1,22 @@
+#
+# iSHELL K-band arc-lamp emission line list for pySpextool wavelength calibration
+#
+# NASA IRTF iSHELL cross-dispersed echelle spectrograph
+# K-band sub-modes (Manual Table 1):
+#   K1:   orders 233–270, wavelength 1.918–2.228 µm
+#   K2:   orders 218–248, wavelength 2.084–2.382 µm
+#   Kgas: orders 211–238, wavelength 2.170–2.468 µm
+#   K3:   orders 203–229, wavelength 2.253–2.549 µm
+# Arc lamp: ThAr (thorium-argon) — confirmed from Manual Table 1.
+# Slit length for K-band modes: 5 arcseconds (Manual Table 1).
+#
+# NOTE: This file is a placeholder (TBD).  Real line positions, window
+#       widths, and fit parameters must be derived from actual iSHELL
+#       ThAr arc-lamp spectra.  Consult the NIST Atomic Spectra Database
+#       for Th I, Th II, Ar I, and Ar II vacuum wavelengths in the
+#       1.92–2.55 µm passband.
+#
+#=======================================================================================================
+#Order   | Vacuum Wavelength   | Species   | Left Window   | Right Window   | Fit Type   | Fit N Terms
+#        | (microns)           |           | (Angstroms)   | (Angstroms)    |            |            
+#=======================================================================================================

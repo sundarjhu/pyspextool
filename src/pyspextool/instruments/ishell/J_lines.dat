@@ -1,0 +1,22 @@
+#
+# iSHELL J-band arc-lamp emission line list for pySpextool wavelength calibration
+#
+# NASA IRTF iSHELL cross-dispersed echelle spectrograph
+# J-band sub-modes (Manual Table 1):
+#   J0: orders 457–503, wavelength 1.062–1.165 µm
+#   J1: orders 432–477, wavelength 1.115–1.228 µm
+#   J2: orders 406–442, wavelength 1.197–1.303 µm
+#   J3: orders 387–417, wavelength 1.265–1.364 µm
+# Arc lamp: ThAr (thorium-argon) — confirmed from Manual Table 1.
+# Slit length for J-band modes: 5 arcseconds (Manual Table 1).
+#
+# NOTE: This file is a placeholder (TBD).  Real line positions, window
+#       widths, and fit parameters must be derived from actual iSHELL
+#       ThAr arc-lamp spectra.  Consult the NIST Atomic Spectra Database
+#       for Th I, Th II, Ar I, and Ar II vacuum wavelengths in the
+#       1.06–1.37 µm passband.
+#
+#=======================================================================================================
+#Order   | Vacuum Wavelength   | Species   | Left Window   | Right Window   | Fit Type   | Fit N Terms
+#        | (microns)           |           | (Angstroms)   | (Angstroms)    |            |            
+#=======================================================================================================

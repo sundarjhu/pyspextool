@@ -1,0 +1,16 @@
+#
+# iSHELL telluric shift information for pySpextool
+#
+# NASA IRTF iSHELL cross-dispersed echelle spectrograph
+# Scope: J, H, and K modes only.
+#
+# Each line gives the mode, order, and wavelength range over which the noise
+# is minimized by shifting the telluric correction spectrum relative to the
+# object spectrum.
+#
+# NOTE: All values are placeholders (TBD) and must be derived from real
+#       iSHELL cross-correlation measurements with A0 V standard stars.
+#
+#============================================================
+#  Mode        Order  Minimum Wavelength   Maximum Wavelength
+#============================================================

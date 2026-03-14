@@ -401,7 +401,7 @@ def set_instrument(instrument_name: str):
 
     instrument_info = read_instrument_file(instrument_info_file)
 
-    if instrument_name in ["uspex", "spex"]:
+    if instrument_name in ["uspex", "spex", "ishell"]:
         setup.state["irtf"] = True
 
     # Fill out the state variables
