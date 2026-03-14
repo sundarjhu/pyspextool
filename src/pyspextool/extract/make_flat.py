@@ -1,5 +1,7 @@
 import importlib
+import os
 from os.path import join, basename
+import re
 import numpy as np
 import logging
 from decimal import *
@@ -163,6 +165,12 @@ def make_flat(files:list | str,
     
     mode = hdr[0]['MODE'][0]
     modefile = join(setup.state['instrument_path'], mode + '_flatinfo.fits')
+
+    # Some instruments (e.g. iSHELL) store per-mode calibration resources in a
+    # ``data/`` subdirectory of the instrument package rather than at the root.
+    if not os.path.isfile(modefile):
+        modefile = join(setup.state['instrument_path'], 'data',
+                        mode + '_flatinfo.fits')
 
     modeinfo = read_flatcal_file(modefile)
 
@@ -340,7 +348,17 @@ def make_flat(files:list | str,
 
     # Get the slit widths and resolving power and write to disk
 
-    slitw_arc = float(average_header['SLIT'][0][0:3])
+    # Extract the slit width in arcseconds.  Different instruments encode the
+    # slit in different formats, for example:
+    #   SpeX/uSpeX: '0.3x15', '0.5x15'  (width × length in arcsec)
+    #   iSHELL:     '0.375_K1', '0.75_K1' (width_mode)
+    # Use a regex to extract the leading numeric field.
+    slit_str = str(average_header['SLIT'][0])
+    m = re.match(r'^([0-9]+(?:\.[0-9]+)?)', slit_str)
+    if m:
+        slitw_arc = float(m.group(1))
+    else:
+        slitw_arc = float(slit_str[0:3])
     getcontext().prec = 2
     slitw_pix = float(Decimal(slitw_arc) / Decimal(modeinfo['ps']))
     resolvingpower =int(Decimal(modeinfo['rpppix']) / Decimal(slitw_pix))
