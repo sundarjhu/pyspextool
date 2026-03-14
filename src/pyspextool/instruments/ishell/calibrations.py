@@ -48,6 +48,12 @@ from .resources import (
     get_mode_resource,
     is_placeholder_resource,
 )
+from .geometry import (  # noqa: F401 – re-exported for convenience
+    OrderGeometry,
+    OrderGeometrySet,
+    RectificationMap,
+    build_order_geometry_set,
+)
 
 __all__ = [
     "LineListEntry",
@@ -65,6 +71,11 @@ __all__ = [
     "read_pixel_mask",
     "read_bias",
     "load_mode_calibrations",
+    # Geometry data-model (iSHELL order geometry support)
+    "OrderGeometry",
+    "OrderGeometrySet",
+    "RectificationMap",
+    "build_order_geometry_set",
 ]
 
 # iSHELL detector dimensions (Teledyne H2RG)
