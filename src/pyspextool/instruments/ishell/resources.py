@@ -8,12 +8,33 @@ _ISHELL_PACKAGE = "pyspextool.instruments.ishell"
 DATA_PACKAGE = "pyspextool.instruments.ishell.data"
 
 # Detector-level calibration files (all stored in the data/ sub-package).
+#
+# Placeholder status (as of Phase 0):
+#   linearity     – real data (IDL-era cube from Dec 2016; format TBC for Phase 1)
+#   bad_pixel_mask – PLACEHOLDER: all-zeros (no real bad-pixel map available yet)
+#   hot_pixel_mask – PLACEHOLDER: all-zeros (no real hot-pixel map available yet)
+#   bias          – candidate real data (iSHELL arc observation); format TBC
+#
+# Files that DO NOT belong here (removed):
+#   ishell.dat          – top-level pySpextool config; read by set_instrument()
+#   xtellcor_modeinfo.dat – legacy IDL xSpextool format; superseded by
+#                           ishell/telluric_modeinfo.dat
+#
+# See docs/ishell_resource_layout.md for a full authoritative-vs-placeholder inventory.
 _DETECTOR_FILES = {
     "linearity": "ishell_lincorr_CDS.fits",
     "bad_pixel_mask": "ishell_bdpxmk.fits",
     "hot_pixel_mask": "ishell_htpxmk.fits",
     "bias": "ishell_bias.fits",
 }
+
+# Files in data/ that are placeholder stubs awaiting real IRTF calibration data.
+# A PLACEHOLDER FITS file contains a COMMENT header card starting with
+# "PLACEHOLDER:" and has all-zero data arrays.
+_PLACEHOLDER_FILES = frozenset({
+    "bad_pixel_mask",
+    "hot_pixel_mask",
+})
 
 
 @lru_cache(maxsize=None)
@@ -169,6 +190,39 @@ def get_detector_resource(resource_key):
             f"Available keys: {sorted(_DETECTOR_FILES)}"
         )
     return files(DATA_PACKAGE) / _DETECTOR_FILES[resource_key]
+
+
+def is_placeholder_resource(resource_key):
+    """
+    Return True if *resource_key* refers to a placeholder detector resource.
+
+    Placeholder files exist only so the resource API resolves without error.
+    They contain all-zero data and a ``PLACEHOLDER:`` FITS COMMENT header
+    card.  They must be replaced with real calibration data before
+    production use.
+
+    Parameters
+    ----------
+    resource_key : str
+        One of ``"linearity"``, ``"bad_pixel_mask"``, ``"hot_pixel_mask"``,
+        or ``"bias"``.
+
+    Returns
+    -------
+    bool
+        ``True`` if the resource is a known placeholder; ``False`` otherwise.
+
+    Raises
+    ------
+    KeyError
+        If *resource_key* is not a known detector resource.
+    """
+    if resource_key not in _DETECTOR_FILES:
+        raise KeyError(
+            f"Unknown detector resource '{resource_key}'. "
+            f"Available keys: {sorted(_DETECTOR_FILES)}"
+        )
+    return resource_key in _PLACEHOLDER_FILES
 
 
 def get_bad_pixel_mask():
