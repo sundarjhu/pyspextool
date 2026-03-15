@@ -17,11 +17,12 @@
 # Near-IR (J/H/K) slit length: 5 arcseconds (Manual Table 1).
 # Available slit widths (J/H/K modes): 0.375", 0.75", 1.5", 4.0".
 #
-# NOTE: All numeric coefficient values are placeholders (TBD) and must be
-#       measured from real iSHELL arc-lamp or standard-star observations
-#       for each slit width.
+# Coefficients derived from iSHELL arc-lamp / standard-star observations
+# (iSHELL Spextool heritage; see docs/ishell_telluric_guide.md).
+# The 4.000" slit coefficient is a scaled placeholder pending dedicated
+# measurements.
 #
-0.375 0.0 0.0 0.0
-0.750 0.0 0.0 0.0
-1.500 0.0 0.0 0.0
-4.000 0.0 0.0 0.0
+0.375 0.0  0.90702904  1.6253079
+0.750 0.0  2.7027089   1.3422317
+1.500 0.0  5.6978779   2.4753528
+4.000 0.0 15.1570104   2.4753528  # PROVISIONAL: scaled from 1.5" entry
