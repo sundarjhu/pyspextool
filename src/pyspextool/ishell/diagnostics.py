@@ -17,8 +17,8 @@ plot_flat_orders
     and a median column profile.
 
 plot_detector_cross_section
-    Extract and plot a single-column (vertical) intensity slice, useful
-    for locating echelle orders by eye.
+    Extract and plot a column-averaged vertical profile, useful for
+    locating echelle orders by eye.
 
 plot_arc_frame
     Display a raw ThAr arc frame so that line density and order spacing
@@ -252,7 +252,9 @@ def plot_flat_orders(
 
 def plot_detector_cross_section(
     flat_file: str,
-    column: int | None = None,
+    column: int = 1024,
+    width: int = 20,
+    mark_peaks: bool = True,
     figure_size: tuple = _DEFAULT_PROFILE_FIGSIZE,
     font_size: int = _DEFAULT_FONT_SIZE,
     output_fullpath: str | None = None,
@@ -260,21 +262,39 @@ def plot_detector_cross_section(
     plot_number: int | None = None,
 ) -> None:
     """
-    Plot the vertical intensity slice at a chosen detector column.
+    Plot a column-averaged vertical profile to identify echelle orders.
 
-    Extracts a single column from the raw flat-field PRIMARY extension and
-    plots intensity (DN) versus row number.  Echelle orders appear as
-    bright peaks separated by darker inter-order gaps, making it easy to
-    count orders and estimate their spatial extent.
+    This diagnostic is used to locate echelle orders in iSHELL flat-field
+    frames.  Rather than extracting a single detector column — which is
+    sensitive to individual bad pixels, cosmic rays, and line-structure
+    artefacts — the function averages the signal over a band of columns
+    (``column - width`` to ``column + width``) and plots the resulting
+    median profile against row number.
+
+    Echelle orders appear as broad peaks in the profile, separated by
+    lower-signal inter-order gaps.  Candidate order centres can be
+    highlighted automatically by passing ``mark_peaks=True``.
 
     Parameters
     ----------
     flat_file : str
         Full path to a raw iSHELL flat-field FITS file.
 
-    column : int, optional
-        Zero-based column index to extract.  Defaults to the central column
-        (``NCOLS // 2 = 1024``) when ``None``.
+    column : int, default 1024
+        Zero-based index of the *central* column of the averaging band.
+        The default (1024) is the centre of the 2048-pixel detector.
+
+    width : int, default 20
+        Half-width of the column band used for averaging.  The profile is
+        computed as the median over columns
+        ``max(0, column - width) : min(ncols, column + width + 1)``.
+        Wider bands suppress noise more aggressively; narrower bands
+        localise the measurement.
+
+    mark_peaks : bool, default True
+        If ``True``, detect local maxima in the averaged profile using
+        ``scipy.signal.find_peaks`` and mark candidate order centres with
+        vertical dashed lines.
 
     figure_size : tuple of (float, float), default (9, 5)
         Figure dimensions in inches.
@@ -302,6 +322,7 @@ def plot_detector_cross_section(
     ...     'data/testdata/ishell_h1_calibrations/raw/'
     ...     'icm.2026A060.260214.flat.00050.a.fits',
     ...     column=1024,
+    ...     width=20,
     ...     showblock=True,
     ... )
     """
@@ -312,8 +333,10 @@ def plot_detector_cross_section(
 
     check_parameter('plot_detector_cross_section', 'flat_file', flat_file,
                     'str')
-    check_parameter('plot_detector_cross_section', 'column', column,
-                    ['NoneType', 'int'])
+    check_parameter('plot_detector_cross_section', 'column', column, 'int')
+    check_parameter('plot_detector_cross_section', 'width', width, 'int')
+    check_parameter('plot_detector_cross_section', 'mark_peaks', mark_peaks,
+                    'bool')
     check_parameter('plot_detector_cross_section', 'figure_size', figure_size,
                     'tuple')
     check_parameter('plot_detector_cross_section', 'font_size', font_size,
@@ -331,19 +354,32 @@ def plot_detector_cross_section(
 
     image, header = _load_primary_extension(flat_file)
 
-    # Default to the centre of the detector
-    if column is None:
-        column = image.shape[1] // 2
-
-    if not (0 <= column < image.shape[1]):
+    ncols = image.shape[1]
+    if not (0 <= column < ncols):
         raise ValueError(
-            f'column={column} is out of range for image with '
-            f'{image.shape[1]} columns.'
+            f'column={column} is out of range for image with {ncols} columns.'
         )
 
-    title = _make_title(header, flat_file,
-                        label=f'Cross-section at column {column}')
-    logger.debug('Cross-section: file=%s  column=%d', flat_file, column)
+    # Clamp the column band to valid array bounds
+    col_lo = max(0, column - width)
+    col_hi = min(ncols, column + width + 1)
+    actual_width = col_hi - col_lo
+
+    # Column-averaged profile: median across the selected column band.
+    # Using the median rather than the mean suppresses hot pixels and
+    # cosmic rays that would dominate a simple column slice.
+    profile = np.nanmedian(image[:, col_lo:col_hi], axis=1)
+    row_indices = np.arange(image.shape[0])
+
+    title = _make_title(
+        header, flat_file,
+        label=f'Column-averaged detector cross section '
+              f'(cols {col_lo}–{col_hi - 1}, n={actual_width})',
+    )
+    logger.debug(
+        'Cross-section: file=%s  col_lo=%d  col_hi=%d',
+        flat_file, col_lo, col_hi,
+    )
 
     #
     # Build the figure
@@ -356,16 +392,44 @@ def plot_detector_cross_section(
     pl.clf()
     ax = fig.add_subplot(111)
 
-    # Vertical slice: all rows at the chosen column
-    slice_data = image[:, column]
-    row_indices = np.arange(image.shape[0])
-
-    ax.plot(row_indices, slice_data, color='steelblue', linewidth=0.8)
+    ax.plot(row_indices, profile, color='steelblue', linewidth=0.8)
     ax.set_xlabel('Rows (pixels)')
-    ax.set_ylabel('Signal (DN)')
+    ax.set_ylabel('Median signal (DN)')
     ax.set_title(title, fontsize=font_size)
     ax.set_xlim(0, image.shape[0] - 1)
     _style_axes(ax)
+
+    # Optionally mark candidate order centres with vertical dashed lines.
+    # Using both a prominence threshold and a minimum inter-peak distance
+    # filters noise spikes and avoids flagging multiple peaks within a
+    # single broad order.  The 10 % prominence and distance=50 defaults
+    # are intentionally conservative starting points; users should inspect
+    # the profile and adjust if needed.
+    if mark_peaks:
+        try:
+            from scipy.signal import find_peaks
+
+            peak_prominence = 0.10 * (np.nanmax(profile) - np.nanmin(profile))
+            peaks, _ = find_peaks(
+                profile,
+                prominence=peak_prominence,
+                distance=50,      # minimum separation between peaks (pixels)
+            )
+
+            for pk in peaks:
+                ax.axvline(pk, color='tomato', linestyle='--',
+                           linewidth=0.8, alpha=0.75)
+
+            if len(peaks) > 0:
+                logger.info(
+                    'Candidate order centres at rows: %s',
+                    ', '.join(str(p) for p in peaks),
+                )
+        except ImportError:
+            logger.warning(
+                'scipy not available; skipping peak detection '
+                '(install scipy to enable mark_peaks).'
+            )
 
     pl.tight_layout()
 

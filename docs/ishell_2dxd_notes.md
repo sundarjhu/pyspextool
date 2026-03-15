@@ -8,13 +8,29 @@ this work prepares for implementing automated order tracing.
 
 ---
 
-## iSHELL Detector and Raw Data
+## Test Dataset
+
+The calibration data used for these diagnostics are located at:
+
+    data/testdata/ishell_h1_calibrations/raw/
+
+The directory contains raw iSHELL **H1-mode** (≈1.49–1.80 µm) calibration
+frames acquired with the instrument in its standard slit configuration:
+
+| File pattern             | Type          | Description                    |
+|--------------------------|---------------|--------------------------------|
+| `*.flat.*.fits`          | QTH flat      | Quartz–tungsten–halogen lamp   |
+| `*.arc.*.fits`           | ThAr arc      | Thorium–argon hollow-cathode   |
+
+These FITS files are stored with Git LFS.  Run `git lfs pull` before trying
+to open them.
+
+---
+
+## iSHELL Detector and Raw Data Format
 
 iSHELL is a cross-dispersed echelle spectrograph at NASA IRTF.  It uses a
-**Teledyne H2RG 2048 × 2048 near-IR detector** operating across the
-J (1.1–1.4 µm), H (1.5–1.8 µm) and K (2.0–2.4 µm) bands.
-
-### Raw FITS Format
+**Teledyne H2RG 2048 × 2048 near-IR detector**.
 
 Each raw iSHELL FITS file contains **three extensions**:
 
@@ -24,17 +40,9 @@ Each raw iSHELL FITS file contains **three extensions**:
 | 1         | SUM_PED  | Sum of all pedestal reads                           |
 | 2         | SUM_SAM  | Sum of all signal reads                             |
 
-The PRIMARY extension is sufficient for visual diagnostics and is the only
-extension read by the functions in `pyspextool.ishell.diagnostics`.
-
-### Supported H-Band Sub-modes
-
-This test dataset uses H1 mode (1.49–1.80 µm).  The full set of iSHELL
-sub-modes supported by pySpextool is:
-
-* **J-band**: J0, J1, J2, J3
-* **H-band**: H1, H2, H3
-* **K-band**: K1, K2, Kgas, K3
+The PRIMARY extension (extension 0) is sufficient for visual diagnostics
+and is the only extension read by the functions in
+`pyspextool.ishell.diagnostics`.
 
 ---
 
@@ -45,7 +53,8 @@ In a cross-dispersed echelle spectrograph the grating produces multiple
 On the iSHELL detector this results in:
 
 1. **Multiple horizontal bands** across the image.  Each band is one echelle
-   order.  In H1 mode approximately six to eight orders are visible.
+   order.  The exact number of orders visible depends on the observing mode;
+   use the diagnostic plots to determine this empirically for a given dataset.
 
 2. **Dispersion along columns** (left–right).  Wavelength increases from left
    to right within each order.
@@ -55,38 +64,34 @@ On the iSHELL detector this results in:
    and below.
 
 4. **Tilt and curvature**.  iSHELL echelle orders are not perfectly horizontal.
-   The spectral trace is tilted by several degrees and exhibits a slight
-   curvature along the dispersion direction.  This is more pronounced in
-   shorter-wavelength modes.
+   The spectral trace can be tilted and exhibit a slight curvature along the
+   dispersion direction.
 
-5. **Curved order edges**.  The upper and lower boundaries of each order are
-   not straight lines; they follow low-order polynomials in column position.
-   Accurate order tracing therefore requires polynomial fitting, not simple
-   row-centroid tracking.
+5. **Curved order edges**.  The upper and lower boundaries of each order follow
+   low-order polynomials in column position, not simple horizontal lines.
+   Accurate order tracing requires polynomial fitting.
 
-### QTH Flat-Field Illumination
+### QTH Flat-Field Frames
 
 A quartz–tungsten–halogen (QTH) lamp illuminates the full slit width and all
 echelle orders simultaneously.  The flat-field frame therefore shows:
 
 * **Bright bands** where echelle orders fall.
 * **Dark inter-order gaps** between orders.
-* A smooth cross-dispersion envelope that follows the blaze function of the
+* A smooth cross-dispersion envelope following the blaze function of the
   echelle.
 * No sharp spectral features — making flats ideal for mapping the order
   geometry.
 
-### ThAr Arc Frame
+### ThAr Arc Frames
 
-A thorium–argon (ThAr) hollow-cathode lamp produces thousands of narrow
-emission lines.  The arc frame reveals:
+A thorium–argon (ThAr) hollow-cathode lamp produces narrow emission lines
+spread across all echelle orders.  The arc frame reveals:
 
-* The same order pattern as the flat (now appearing as stripes of bright dots
-  rather than continuous bands).
-* **Line density varies by order**: shorter-wavelength orders contain more
-  ThAr lines per unit wavelength interval than longer-wavelength orders.
-* The spatial extent of each slit in both the target and calibration
-  positions.
+* The same order pattern as the flat, now as stripes of bright dots.
+* **Variable line density per order**: line density depends on wavelength
+  coverage and the density of ThAr transitions in that region.
+* The spatial extent of each slit position.
 
 ---
 
@@ -94,13 +99,14 @@ emission lines.  The arc frame reveals:
 
 ### `plot_flat_orders(flat_file, …)`
 
-**Purpose**: Quick visual assessment of the flat-field frame.
+**Purpose**: Quick visual assessment of the full flat-field frame.
 
 **What it shows**:
 
 * A 2-D ZScale-scaled grey-scale image of the entire detector.  Echelle
   orders appear as horizontal bright bands.
-* Optional **horizontal cut lines** (dashed cyan) for marking order centres.
+* Optional **horizontal cut lines** (dashed cyan) for marking positions
+  found by eye.
 * An optional **median column profile** panel showing the cross-dispersion
   brightness envelope.  Peaks in this profile correspond to order centres;
   troughs correspond to inter-order gaps.
@@ -108,32 +114,32 @@ emission lines.  The arc frame reveals:
 **Diagnostic use**:
 
 1. Confirm that all expected orders are illuminated.
-2. Estimate the row positions of order centres (needed as seeds for order
-   tracing).
-3. Check for bad columns, vignetting, or other detector artefacts.
+2. Identify row positions of order centres for use as seeds in future
+   order-tracing routines.
+3. Check for bad columns, vignetting, or detector artefacts.
 
 ---
 
-### `plot_detector_cross_section(flat_file, column=None, …)`
+### `plot_detector_cross_section(flat_file, column=1024, width=20, …)`
 
-**Purpose**: Quantitative view of order structure at a chosen column.
+**Purpose**: Robust quantitative view of order structure along the spatial
+(row) axis at a chosen detector location.
 
 **What it shows**:
 
-* Intensity (DN) versus row number at a single detector column.
-* By default the **central column** (column 1024) is used; pass `column=N`
-  to inspect a different location.
-* Echelle orders appear as peaks; inter-order gaps are the dips between
-  them.
+* **Median signal (DN) versus row number**, computed by averaging over a
+  band of columns `column - width` to `column + width`.  Using the median
+  over multiple columns suppresses hot pixels and cosmic rays that would
+  dominate a single-column slice.
+* Optional **candidate order-centre markers** (dashed red lines) derived
+  from local maxima in the profile.
 
 **Diagnostic use**:
 
-1. Count the number of illuminated orders.
-2. Measure the approximate row position and FWHM of each order at the
-   chosen column.
-3. Assess order overlap (if any) at the detector edges.
-4. Provide initial seed positions for automated order-finding algorithms
-   (e.g. peak-finding on the cross-section profile).
+1. Count the number of illuminated orders at the inspection location.
+2. Estimate row positions and widths of each order.
+3. Obtain initial seed positions for future peak-finding or order-tracing
+   algorithms.
 
 ---
 
@@ -144,73 +150,66 @@ emission lines.  The arc frame reveals:
 **What it shows**:
 
 * A ZScale-scaled grey-scale image of the arc frame, with contrast tuned
-  to show both bright lines and faint inter-order regions.
+  to show both bright emission lines and faint inter-order regions.
 * Bright vertical streaks indicate high-intensity ThAr emission lines.
-* The cross-order pattern of lines reveals the tilt and curvature of the
-  spectral trace within each order.
+* The pattern of lines across orders reveals tilt and curvature of the
+  spectral trace.
 
 **Diagnostic use**:
 
-1. Verify that arc lamps fired correctly and that lines are sharp.
-2. Assess line density per order (important for wavelength calibration
-   quality).
-3. Check that the slit is uniformly illuminated (no vignetting).
-4. Visually confirm the dispersion direction (wavelength increasing left
-   to right).
+1. Verify that the arc lamp fired correctly and that lines are sharp.
+2. Assess line density per order.
+3. Check for uniform slit illumination.
+4. Visually confirm the dispersion direction.
 
 ---
 
 ## How These Diagnostics Prepare for Order Tracing
 
-Automated order tracing requires several inputs that can be estimated
-directly from these diagnostic plots:
+The information extracted visually from these diagnostics directly informs
+future automated order-tracing development:
 
-| Input                    | Source diagnostic                  |
-|--------------------------|------------------------------------|
-| Number of orders         | `plot_flat_orders` image            |
-| Approximate order centres (rows) | `plot_detector_cross_section` peaks |
-| Order extent (FWHM in rows)    | `plot_detector_cross_section`  |
-| Order tilt and curvature | `plot_arc_frame` line positions    |
-| Inter-order gap width    | `plot_detector_cross_section` dips |
-
-Once these parameters have been estimated visually, they can be fed into
-the order-tracing algorithms in `pyspextool.instruments.ishell.geometry`
-as initial guesses, enabling automated polynomial edge fitting.
+| Input needed for order tracing         | Diagnostic source                      |
+|----------------------------------------|----------------------------------------|
+| Number of illuminated orders           | `plot_flat_orders` image               |
+| Approximate order-centre rows          | `plot_detector_cross_section` peaks    |
+| Order spatial width (rows)             | `plot_detector_cross_section` profile  |
+| Order tilt and spectral-trace shape    | `plot_arc_frame` line positions        |
+| Inter-order gap width                  | `plot_detector_cross_section` troughs  |
 
 ### Recommended Workflow
 
-1. Run `plot_flat_orders` to confirm data quality.
-2. Run `plot_detector_cross_section` at several columns (e.g. 512, 1024,
-   1536) to characterise order positions across the dispersion range.
-3. Run `plot_arc_frame` to verify arc quality and inspect tilt.
-4. Use the extracted order-centre estimates as seeds for
-   `pyspextool.instruments.ishell.geometry.locate_orders`.
+1. Run `plot_flat_orders` to confirm data quality and get a global view.
+2. Run `plot_detector_cross_section` at a few column positions (e.g. 512,
+   1024, 1536) to characterise order positions across the detector.
+3. Run `plot_arc_frame` to verify arc quality and note any spectral-trace
+   tilt.
+4. Record the candidate order-centre row positions printed by
+   `plot_detector_cross_section` as seeds for future order-tracing work.
 
 ---
 
 ## Running the Diagnostics Script
 
-A convenience script is provided at `scripts/ishell_diagnostics.py`.  To
-run it from the repository root::
+A convenience script is provided at `scripts/ishell_diagnostics.py`.  Run
+it from the repository root::
 
     python scripts/ishell_diagnostics.py
 
-This automatically loads the first flat and arc files from::
-
-    data/testdata/ishell_h1_calibrations/raw/
+This automatically loads the first flat and arc files from
+`data/testdata/ishell_h1_calibrations/raw/` and runs all three diagnostics.
 
 To save PNG files instead of displaying interactive windows::
 
     python scripts/ishell_diagnostics.py --save --output-dir /tmp/diag
 
-> **Note**: The test FITS files are stored with Git LFS.  Run
-> `git lfs pull` to download them before executing the script.
+The diagnostics have been verified by import checks and interactive plotting
+with the H1 calibration dataset described above.
 
 ---
 
 ## References
 
 * iSHELL Spextool Manual v10jan2020, Cushing et al.
-* Vacca et al. (2004), PASP 116, 352 — SpeX spectral reduction procedures.
-* `docs/ishell_geometry_design_note.md` — order geometry design for iSHELL.
 * `docs/ishell_fits_layout.md` — iSHELL raw FITS keyword reference.
+* `docs/ishell_geometry_design_note.md` — order geometry design notes.

@@ -175,6 +175,7 @@ def main(save_plots: bool = False, output_dir: str | None = None) -> None:
     plot_detector_cross_section(
         flat_file,
         column=1024,         # central column of the 2048-pixel detector
+        width=20,            # half-width of the averaging band (width=20 → up to 41 columns)
         showblock=False,
         plot_number=2,
         output_fullpath=(
