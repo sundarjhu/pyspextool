@@ -12,12 +12,13 @@ The implementation provides two distinct wavelength-calibration paths:
    a compact polynomial re-encoding of stored values; it is not a
    re-measurement from arc data.
 
-2. **First measured arc-line fitting** (`build_geometry_from_arc_lines`):
-   uses the stored ThAr arc-lamp spectra (plane 1 of the wavecalinfo cube)
-   together with the packaged line lists to measure arc-line centroids via
-   Gaussian profile fitting, then derives a polynomial wavelength solution
-   from those measured positions.  This is the **first true measured** arc-
-   line fitting stage.
+2. **Measured centerline wavelength solution** (`build_geometry_from_arc_lines`):
+   uses data stored in plane 1 of the wavecalinfo cube (interpreted as the
+   arc-lamp spectrum based on header units, but not yet verified against
+   the IDL source) together with the packaged line lists to measure
+   arc-line centroids via Gaussian profile fitting, then derives a
+   per-order centerline polynomial wavelength solution from those centroid
+   positions.  Tilt and full 2-D line tracing are **not** implemented.
 
 The **tilt model is still a provisional placeholder zero** because tilt
 measurement requires 2-D arc images (spatial variation of line positions
@@ -67,16 +68,16 @@ _rectify_orders(image, geom_set, plate_scale_arcsec)
 resampled image (same shape; NaN outside orders; provisional zero-tilt)
 ```
 
-### Data flow (first measured arc-line fitting path)
+### Data flow (measured centerline wavelength solution path)
 
 ```
 read_flatinfo(mode)     → FlatInfo
 read_wavecalinfo(mode)  → WaveCalInfo     (plane 0: wavelength grid,
-read_line_list(mode)    → LineList         plane 1: arc-lamp spectrum)
+read_line_list(mode)    → LineList         plane 1: interpreted as arc spectrum)
           ↓
 fit_arc_line_centroids(wci, line_list)
-  – for each order: identify expected line positions from plane 0
-  – extract window of arc spectrum (plane 1) around each position
+  – for each order: predict line positions from plane-0 wavelength grid
+  – extract window of plane-1 data (interpreted as arc spectrum) around each position
   – fit Gaussian profile → measured centroid pixel
   – filter by SNR and reject blended lines
           ↓
@@ -89,18 +90,23 @@ OrderGeometrySet  (wave_coeffs from measured centroids, tilt_coeffs=0 provisiona
 
 ---
 
-## 2. Confirmed Data-Cube Plane Semantics
+## 2. Data-Cube Plane Semantics (Partially Confirmed)
 
 Every `*_wavecalinfo.fits` file is a data cube of shape `(n_orders, 4, n_pixels)`.
-Inspection of the FITS header keywords `XUNITS="um"` and `YUNITS="DN / s"`
-together with value ranges confirms:
+The FITS header keywords `XUNITS="um"` and `YUNITS="DN / s"` provide partial
+evidence about plane contents, but only plane 0 has been independently
+verified:
 
-| Plane | Status | Meaning |
-|-------|--------|---------|
+| Plane | Status | Interpretation |
+|-------|--------|----------------|
 | 0 | **Confirmed** (XUNITS="um", values in J/H/K bands) | Wavelength grid in µm along the order centerline |
-| 1 | **Confirmed** (YUNITS="DN / s", full range of real arc spectrum) | ThAr arc-lamp spectrum in DN/s along the order centerline |
-| 2 | **Likely** uncertainty array | Uncertainty (noise) of the arc spectrum |
-| 3 | **Confirmed** quality flags (values 0/1/2) | 0=not a line, 1=identified but excluded by IDL pipeline, 2=used in IDL pipeline fit |
+| 1 | **Consistent with header** (YUNITS="DN / s"), but not verified against IDL source | Appears to be the ThAr arc-lamp spectrum in DN/s; used for centroid measurement |
+| 2 | **Unconfirmed; not used** | Possibly an uncertainty array |
+| 3 | **Unconfirmed; not used** | Observed values 0/1/2; possibly quality flags, but encoding is not verified |
+
+> **Note:** The meanings of planes 2–3 are speculative and they are not used
+> by this code.  Plane 1 is used for centroid fitting but its interpretation
+> should be considered provisional until verified against the IDL source.
 
 The FITS header also contains:
 
@@ -129,18 +135,19 @@ coeffs = np.polynomial.polynomial.polyfit(cols, wavs, degree)
 
 This is a compact polynomial representation of the stored reference values.
 
-### 3b. First measured arc-line fitting: `build_geometry_from_arc_lines()`
+### 3b. Measured centerline wavelength solution: `build_geometry_from_arc_lines()`
 
-Derives coefficients from measured arc-line centroid positions:
+Derives centerline wavelength coefficients from measured arc-line centroid positions:
 
 1. `fit_arc_line_centroids(wci, line_list)` identifies each line from the
-   line list in the stored arc spectrum (plane 1) using the wavelength grid
-   (plane 0) as the reference.  Gaussian profiles are fitted to measure
-   precise centroid pixel positions.  Blended lines (two wavelengths at the
-   same pixel) are rejected.
+   line list using the plane-0 wavelength grid to predict pixel positions,
+   then extracts a window of plane-1 data (interpreted as the arc spectrum)
+   and fits a Gaussian profile to measure the centroid.  Blended lines
+   (two wavelengths at the same pixel) are rejected.
 
-2. For each order with ≥ `min_lines_per_order` accepted centroids, a polynomial
-   is fitted to `(centroid_pixel, known_wavelength_um)` pairs.
+2. For each order with ≥ `min_lines_per_order` accepted centroids, a
+   centerline polynomial is fitted to `(centroid_pixel, known_wavelength_um)`
+   pairs.
 
 3. Orders with fewer accepted lines fall back to the plane-0 bootstrap and
    emit a `RuntimeWarning`.
@@ -155,7 +162,7 @@ After either path, each `OrderGeometry` in the returned `OrderGeometrySet` has:
 | `x_start`, `x_end` | `flatinfo.xranges[i]` | same | Column range from flat |
 | `bottom_edge_coeffs` | `flatinfo.edge_coeffs[i, 0, :]` | same | From `OR{n}_B1…B5` |
 | `top_edge_coeffs` | `flatinfo.edge_coeffs[i, 1, :]` | same | From `OR{n}_T1…T5` |
-| `wave_coeffs` | Poly fit to plane-0 values | Poly fit to measured centroids | Different fitting basis |
+| `wave_coeffs` | Poly fit to plane-0 values | Poly fit to measured centerline centroids | Different fitting basis |
 | `tilt_coeffs` | `[0.0]` **provisional** | `[0.0]` **provisional** | Requires 2-D arc images |
 | `spatcal_coeffs` | `[0.0, plate_scale]` provisional | same | Linear model only |
 | `curvature_coeffs` | `None` | `None` | Not implemented |
@@ -197,7 +204,7 @@ src_row = row_ctr + row_offset_pix
 
 | Gap | Description |
 |-----|-------------|
-| **Tilt measurement** | Requires arc-line centroids at multiple *spatial* row positions (a 2-D arc image). The 1-D centerline arc spectrum stored in plane 1 cannot provide this. `LINEDEG=1` in the FITS header indicates the IDL pipeline used a linear tilt model. |
+| **Tilt measurement** | Requires arc-line centroids at multiple *spatial* row positions (a 2-D arc image). The 1-D centerline data in plane 1 cannot provide this. `LINEDEG=1` in the FITS header likely indicates the IDL pipeline used a linear tilt model, but this is not yet verified. |
 | **2DXD global model** | Full iterative arc-line identification and outlier rejection against the `P2W_C*` 2DXD polynomial are not implemented. |
 | **Slit curvature** | `curvature_coeffs` is not modelled. |
 | **Wavelength uncertainty** | Fit residuals and covariance are not stored. |
@@ -218,12 +225,13 @@ The test suite in `tests/test_ishell_wavecal.py` covers:
 
 - `TestBuildGeometryFromWaveCalInfo` – bootstrap geometry construction from
   all J/H/K modes; structural field types, shapes, plane-0 band ranges.
-- `TestFitArcLineCentroids` – centroid measurement for J0/H1/K1:
+- `TestFitArcLineCentroids` – centroid-based measurement for J0/H1/K1:
   centroids within column range, SNR above threshold, wavelengths matching
   line list, at least one order with accepted measurements, failure cases.
-- `TestBuildGeometryFromArcLines` – measured wavelength solution for J0/H1/K1
-  and all modes; band-range check, provisional zero-tilt verification,
-  fallback behaviour, difference from bootstrap coefficients, synthetic test.
+- `TestBuildGeometryFromArcLines` – centroid-based centerline wavelength
+  solution for J0/H1/K1 and all modes; band-range check, provisional
+  zero-tilt verification, fallback behaviour, difference from bootstrap
+  coefficients, synthetic accuracy test.
 - `TestBuildRectificationMaps` – map shapes, wavelength monotonicity, spatial
   axis symmetry, zero-tilt src_col identity.
 - `TestRectifyOrders` – identity under zero-tilt, NaN masking, smoke tests.

@@ -7,8 +7,8 @@ Coverage:
   - RectificationMap creation from populated geometry.
   - Basic rectification behaviour on synthetic inputs.
   - Failure cases for malformed or inconsistent calibration inputs.
-  - Arc-line centroid measurement (fit_arc_line_centroids).
-  - Measured wavelength solution from arc-line centroids (build_geometry_from_arc_lines).
+  - Arc-line centroid measurement from stored plane-1 data (fit_arc_line_centroids).
+  - Centroid-based centerline wavelength solution (build_geometry_from_arc_lines).
 """
 
 from __future__ import annotations
@@ -695,7 +695,7 @@ class TestCalibrationsBackwardCompatibility:
 
 
 # ===========================================================================
-# 6.  fit_arc_line_centroids – arc-line identification and centroid measurement
+# 6.  fit_arc_line_centroids – arc-line centroid measurement from stored data
 # ===========================================================================
 
 
@@ -727,7 +727,7 @@ def _make_synthetic_line_list(
 
 
 class TestFitArcLineCentroids:
-    """Tests for the first measured arc-line centroid fitting step."""
+    """Tests for arc-line centroid measurement from stored plane-1 data."""
 
     @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
     def test_returns_dict_keyed_by_order(self, mode):
@@ -835,11 +835,11 @@ class TestFitArcLineCentroids:
         )
 
     def test_centroids_near_predicted_wavelength(self):
-        """Measured centroid wavelengths (from plane-0 eval) must be close
-        to the known line wavelengths from the line list.
+        """Measured centroid positions (evaluated against the plane-0 wavelength
+        grid) must be close to the known line wavelengths from the line list.
 
-        This verifies that the centroid is located near the correct line,
-        not at some random arc feature.
+        This verifies that centroids are located near the correct spectral
+        features, not at unrelated peaks in the plane-1 data.
         """
         mode = "K1"
         wci = read_wavecalinfo(mode)
@@ -868,12 +868,12 @@ class TestFitArcLineCentroids:
 
 
 # ===========================================================================
-# 7.  build_geometry_from_arc_lines – measured wavelength solution
+# 7.  build_geometry_from_arc_lines – centroid-based centerline wavelength solution
 # ===========================================================================
 
 
 class TestBuildGeometryFromArcLines:
-    """Tests for the first real measured arc-line fitting stage."""
+    """Tests for the centroid-based centerline wavelength solution."""
 
     @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
     def test_returns_order_geometry_set(self, mode):
@@ -932,8 +932,9 @@ class TestBuildGeometryFromArcLines:
 
     @pytest.mark.parametrize("mode", REPRESENTATIVE_MODES)
     def test_tilt_is_placeholder_zero(self, mode):
-        """Tilt coefficients must be placeholder zero – 1-D arc data cannot
-        provide tilt measurement (see module docstring for limitation)."""
+        """Tilt coefficients must be placeholder zero – the stored 1-D
+        centerline data cannot provide tilt measurement (see module
+        docstring for limitation)."""
         fi = read_flatinfo(mode)
         wci = read_wavecalinfo(mode)
         ll = read_line_list(mode)
@@ -944,7 +945,7 @@ class TestBuildGeometryFromArcLines:
                 g.tilt_coeffs, [0.0],
                 err_msg=(
                     f"Order {g.order}: tilt_coeffs must be placeholder zero "
-                    "(tilt requires 2-D arc images not available in stored data)"
+                    "(tilt requires 2-D arc images; stored 1-D centerline data insufficient)"
                 ),
             )
 
@@ -1000,12 +1001,12 @@ class TestBuildGeometryFromArcLines:
         assert geom.has_wavelength_solution()
 
     def test_measured_orders_differ_from_bootstrap(self):
-        """For orders with enough arc lines, the measured wave_coeffs must
+        """For orders with enough arc lines, the centroid-based wave_coeffs must
         differ from the bootstrap (plane-0) coefficients.
 
         Both are derived from the same stored data but via different fitting
-        procedures: measured uses arc-line centroids from plane 1 while
-        bootstrap fits the plane-0 wavelength array directly.
+        procedures: the centroid-based path fits measured positions from plane-1
+        data while the bootstrap fits the plane-0 wavelength array directly.
         """
         mode = "K1"
         fi = read_flatinfo(mode)
@@ -1053,7 +1054,8 @@ class TestBuildGeometryFromArcLines:
     @pytest.mark.parametrize("mode", ALL_MODES)
     def test_all_modes_succeed(self, mode):
         """build_geometry_from_arc_lines must complete without error for
-        every supported J/H/K mode and return a valid OrderGeometrySet."""
+        every supported J/H/K mode and return a valid OrderGeometrySet
+        with a centerline wavelength solution."""
         fi = read_flatinfo(mode)
         wci = read_wavecalinfo(mode)
         ll = read_line_list(mode)
@@ -1067,8 +1069,8 @@ class TestBuildGeometryFromArcLines:
 
     def test_synthetic_measured_wave_coeffs(self):
         """For a synthetic arc spectrum with known Gaussian lines, the
-        measured centroids must recover the correct wavelengths to high
-        accuracy."""
+        centroid-based wavelength solution must recover the correct wavelengths
+        to high accuracy."""
         import scipy.stats
 
         # Build a synthetic wavecalinfo with plane-0 wavelength grid and

@@ -9,40 +9,49 @@ This module provides two distinct wavecal paths:
    polynomial re-encoding of values that were already stored by the
    IDL Spextool pipeline; it is not a re-measurement.
 
-2. **First measured arc-line fitting** (:func:`build_geometry_from_arc_lines`):
-   Uses the packaged ThAr line lists together with the stored arc-lamp
-   spectra (plane 1 of ``WaveCalInfo.data``) to measure line centroids via
-   Gaussian profile fitting and derive a wavelength solution from those
-   measured centroid positions.  This is the **first true measured** fitting
-   stage – it identifies real arc lines in the stored arc spectrum, fits
-   their positions, and builds a polynomial wavelength solution from the
-   measurements.
+2. **Measured centerline wavelength solution** (:func:`build_geometry_from_arc_lines`):
+   Uses the packaged ThAr line lists together with the data stored in
+   plane 1 of ``WaveCalInfo.data`` (which appears to be the arc-lamp
+   spectrum based on header units, but is not yet verified against the IDL
+   source) to measure arc-line centroids via Gaussian profile fitting and
+   derive a per-order centerline wavelength solution from those centroid
+   positions.
 
-   Tilt coefficients are still set to a placeholder zero because tilt
-   measurement requires 2-D arc-image data (spatial variation of line
-   positions across the slit), which is not stored in the packaged
-   ``*_wavecalinfo.fits`` files.  This limitation is clearly documented
-   below and in ``docs/ishell_wavecal_design_note.md``.
+   This derives wavelength coefficients from actual arc-line position
+   measurements rather than from a polynomial re-fit of the pre-stored
+   plane-0 reference array.  It does **not** implement full 2-D line
+   tracing, tilt measurement, or the 2DXD global model.  Tilt coefficients
+   remain the placeholder zero because tilt measurement requires spatial
+   variation of line positions across the slit (a 2-D arc image), which is
+   not stored in the packaged ``*_wavecalinfo.fits`` files.  This
+   limitation is documented below and in
+   ``docs/ishell_wavecal_design_note.md``.
 
-Data cube plane semantics (now confirmed)
------------------------------------------
+Data cube plane semantics (partially confirmed)
+-------------------------------------------------
 Inspection of the packaged ``*_wavecalinfo.fits`` files together with the
 FITS header keywords ``XUNITS`` (``"um"``) and ``YUNITS`` (``"DN / s"``)
-confirms:
+provides partial evidence about the plane contents:
 
-* **Plane 0** – wavelength grid in µm along the order centerline.
-* **Plane 1** – ThAr arc-lamp spectrum in DN/s along the order centerline.
-* **Plane 2** – uncertainty (noise) of the arc spectrum.
-* **Plane 3** – quality flags (0 = not a line, 1 = identified but
-  excluded, 2 = identified and used in the IDL pipeline fit).
+* **Plane 0** – wavelength grid in µm along the order centerline (confirmed
+  by ``XUNITS="um"`` and value ranges consistent with J/H/K bands).
+* **Plane 1** – appears to contain the ThAr arc-lamp spectrum in DN/s based
+  on ``YUNITS="DN / s"`` and value ranges consistent with a real arc
+  spectrum, but this interpretation has not been verified against the IDL
+  source code.
+* **Planes 2–3** – meanings are not confirmed and are not used by this code.
+  Plane 2 may be an uncertainty array; plane 3 appears to carry integer
+  flags (observed values 0, 1, 2) but the exact encoding is unverified.
 
 Public API
 ----------
-- :func:`fit_arc_line_centroids` – identify ThAr arc lines in the stored
-  arc spectrum and measure their centroids via Gaussian fitting.
+- :func:`fit_arc_line_centroids` – identify ThAr arc lines in the data
+  stored in plane 1 of the wavecalinfo cube (interpreted as arc spectrum)
+  and measure their centroids via Gaussian fitting.
 - :func:`build_geometry_from_arc_lines` – populate an
-  :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet` from
-  measured arc-line centroid positions (first real measured fitting stage).
+  :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet` with
+  a centerline wavelength solution derived from measured arc-line centroid
+  positions.
 - :func:`build_geometry_from_wavecalinfo` – structural bootstrap: populate
   an :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet` from
   the stored plane-0 reference arrays.
@@ -50,14 +59,14 @@ Public API
   :class:`~pyspextool.instruments.ishell.geometry.RectificationMap` for
   every order in an ``OrderGeometrySet``.
 
-Measured vs bootstrap wavelength solution
-------------------------------------------
-:func:`build_geometry_from_arc_lines` (measured):
+Measured centerline wavelength solution vs bootstrap
+------------------------------------------------------
+:func:`build_geometry_from_arc_lines` (measured centerline):
 
-1. For each order in the line list, locates each expected arc line in the
-   stored arc spectrum using the plane-0 wavelength grid.
-2. Extracts a window of the arc spectrum (plane 1) centred on the
-   predicted line position.
+1. For each order in the line list, locates each expected arc line using
+   the plane-0 wavelength grid to predict the pixel position.
+2. Extracts a window of the plane-1 data (interpreted as arc spectrum)
+   centred on the predicted position.
 3. Fits a Gaussian profile to measure the precise pixel centroid.
 4. Filters measurements by minimum SNR and centroid-within-window checks.
 5. Fits a polynomial to the accepted ``(centroid_pixel, wavelength_um)``
@@ -243,15 +252,16 @@ def fit_arc_line_centroids(
     snr_min: float = 3.0,
     half_window_pix: int = 15,
 ) -> dict[int, list[tuple[float, float, float]]]:
-    """Identify ThAr arc lines and measure their centroids from stored spectra.
+    """Identify ThAr arc lines and measure their centroids from stored data.
 
     For each echelle order this function:
 
-    1. Retrieves the wavelength grid (plane 0) and arc-lamp spectrum
-       (plane 1) from ``wavecalinfo.data``.
+    1. Retrieves the wavelength grid (plane 0) and the plane-1 data
+       (interpreted as the arc-lamp spectrum; see module docstring for
+       caveats about plane semantics) from ``wavecalinfo.data``.
     2. For every line in ``line_list`` that belongs to the order, computes
        the expected pixel position from the wavelength grid.
-    3. Extracts a window of the arc spectrum centred on that position.
+    3. Extracts a window of the plane-1 data centred on that position.
     4. Fits a Gaussian profile to measure the precise pixel centroid.
     5. Keeps only measurements with SNR ≥ ``snr_min`` and centroids that
        fall strictly inside the extraction window.
@@ -260,7 +270,8 @@ def fit_arc_line_centroids(
     ----------
     wavecalinfo : :class:`~.calibrations.WaveCalInfo`
         Must have ``xranges`` populated and ``data`` with valid plane 0
-        (wavelengths in µm) and plane 1 (arc-lamp spectrum in DN/s).
+        (wavelengths in µm) and plane 1 (interpreted as arc-lamp spectrum;
+        not formally verified against the IDL source).
     line_list : :class:`~.calibrations.LineList`
         ThAr arc-line list for the same mode as ``wavecalinfo``.
     snr_min : float, optional
@@ -286,10 +297,9 @@ def fit_arc_line_centroids(
 
     Notes
     -----
-    The arc spectrum stored in plane 1 is a 1-D extraction along the order
-    centerline.  Tilt (spatial variation of line position across the slit)
-    cannot be measured from this 1-D data; see the module docstring for
-    details.
+    Only the order centerline is used (1-D data from the stored spectrum).
+    Tilt (spatial variation of line position across the slit) cannot be
+    measured from this 1-D data; see the module docstring for details.
     """
     if wavecalinfo.xranges is None:
         raise ValueError(
@@ -378,23 +388,27 @@ def build_geometry_from_arc_lines(
     snr_min: float = 3.0,
     min_lines_per_order: int = 4,
 ) -> OrderGeometrySet:
-    """Populate an :class:`~.geometry.OrderGeometrySet` from measured arc-line centroids.
+    """Populate an :class:`~.geometry.OrderGeometrySet` with a measured centerline wavelength solution.
 
-    **First real measured arc-line fitting stage.**  This function
-    identifies ThAr arc lines in the stored arc-lamp spectrum (plane 1 of
-    ``WaveCalInfo.data``), measures their pixel centroids via Gaussian
-    profile fitting, and derives a per-order polynomial wavelength solution
-    from those centroid measurements.
+    **Measured centerline wavelength solution.**  This function
+    identifies ThAr arc lines in the plane-1 data of the stored
+    ``WaveCalInfo`` (interpreted as an arc-lamp spectrum; see module
+    docstring for caveats about plane semantics), measures their pixel
+    centroids via Gaussian profile fitting, and derives a per-order
+    centerline polynomial wavelength solution from those centroid
+    measurements.
 
-    This is qualitatively different from the structural bootstrap
-    (:func:`build_geometry_from_wavecalinfo`): the wavelength coefficients
-    here come from fitting measured arc-line positions, not from refitting
-    a pre-stored wavelength array.
+    This produces wavelength coefficients from arc-line position
+    measurements rather than from refitting the pre-stored plane-0
+    reference array (:func:`build_geometry_from_wavecalinfo`).  It
+    operates only along the order centerline and does **not** measure
+    spectral tilt, implement full 2-D line tracing, or replicate the
+    full 1DXD/2DXD pipeline from legacy IDL Spextool.
 
     Tilt coefficients are still set to a **provisional placeholder zero**
     because tilt measurement requires spatial variation of line positions
     across the slit (i.e. a 2-D arc image), which is not available from
-    the stored 1-D centerline spectra.  See the module docstring for a full
+    the stored 1-D centerline data.  See the module docstring for a full
     discussion.
 
     Parameters
@@ -402,22 +416,22 @@ def build_geometry_from_arc_lines(
     wavecalinfo : :class:`~.calibrations.WaveCalInfo`
         Stored calibration for the mode.  Must have ``xranges`` populated
         and ``data`` with valid plane 0 (wavelengths) and plane 1
-        (arc-lamp spectrum).
+        (interpreted as arc-lamp spectrum; see module docstring).
     flatinfo : :class:`~.calibrations.FlatInfo`
         Flat-field calibration for the same mode.  Must have
         ``edge_coeffs`` and ``xranges`` populated.
     line_list : :class:`~.calibrations.LineList`
         ThAr arc-line list for the same mode.
     dispersion_degree : int or None, optional
-        Polynomial degree for the per-order wavelength fit.  Defaults to
-        ``wavecalinfo.disp_degree`` when ``None``.
+        Polynomial degree for the per-order centerline wavelength fit.
+        Defaults to ``wavecalinfo.disp_degree`` when ``None``.
     snr_min : float, optional
         Minimum arc-line SNR for a centroid to be accepted.  Default 3.0.
     min_lines_per_order : int, optional
         Minimum number of accepted centroid measurements required to
         attempt a polynomial fit for an order.  If fewer lines are
-        measured, that order falls back to the bootstrap (plane-0 fit).
-        Default is 4.
+        measured, that order falls back to the plane-0 bootstrap fit and
+        a ``RuntimeWarning`` is emitted.  Default is 4.
 
     Returns
     -------
