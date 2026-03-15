@@ -5,25 +5,36 @@
 This document describes the iSHELL J/H/K geometry-population and image-
 resampling implementation in pySpextool.
 
-> **Important:** This is a structural bootstrap, not a full
-> wavecal/rectification pipeline.  The current implementation reads
-> pre-packaged calibration files and populates geometry containers with
-> structural best-guesses.  The tilt model is a **placeholder zero**,
-> so no spectral-line tilt is removed.  The spatial calibration is a
-> simple linear plate-scale approximation.  See §5 for a detailed list
-> of what remains to be implemented.
+The implementation provides two distinct wavelength-calibration paths:
+
+1. **Structural bootstrap** (`build_geometry_from_wavecalinfo`): fits
+   polynomials to pre-stored plane-0 reference wavelength arrays.  This is
+   a compact polynomial re-encoding of stored values; it is not a
+   re-measurement from arc data.
+
+2. **Measured centerline wavelength solution** (`build_geometry_from_arc_lines`):
+   uses data stored in plane 1 of the wavecalinfo cube (interpreted as the
+   arc-lamp spectrum based on header units, but not yet verified against
+   the IDL source) together with the packaged line lists to measure
+   arc-line centroids via Gaussian profile fitting, then derives a
+   per-order centerline polynomial wavelength solution from those centroid
+   positions.  Tilt and full 2-D line tracing are **not** implemented.
+
+The **tilt model is still a provisional placeholder zero** because tilt
+measurement requires 2-D arc images (spatial variation of line positions
+across the slit), which are not stored in the packaged calibration files.
+See §5 for the complete list of what remains incomplete.
 
 This document covers:
 
-1. What the implementation currently does (as opposed to what the full
-   legacy IDL Spextool procedure does).
-2. How the geometry objects (`OrderGeometry`, `OrderGeometrySet`) are populated.
-3. The resampling algorithm (`_rectify_orders`).
-4. What remains incomplete relative to legacy IDL Spextool.
+1. What the implementation currently does (and what the two wavecal paths are).
+2. The confirmed data-cube plane semantics.
+3. How the geometry objects are populated.
+4. The resampling algorithm.
+5. What remains incomplete relative to legacy IDL Spextool.
+6. Testing coverage.
 
-**Scope:** J, H, and K bands only.  L/Lp/M modes are out of scope.  This
-document is provisional; scientific accuracy requires validation against
-real ThAr arc data.
+**Scope:** J, H, and K bands only.  L/Lp/M modes are out of scope.
 
 ---
 
@@ -35,10 +46,10 @@ real ThAr arc data.
 |--------|---------|
 | `instruments/ishell/geometry.py` | Data model: `OrderGeometry`, `OrderGeometrySet`, `RectificationMap` |
 | `instruments/ishell/calibrations.py` | Typed readers for packaged calibration files |
-| `instruments/ishell/wavecal.py` | **NEW** geometry-population and rectification-map builder (structural bootstrap; not a full wavecal pipeline) |
-| `instruments/ishell/ishell.py` | **UPDATED** `_rectify_orders()` implementation |
+| `instruments/ishell/wavecal.py` | Geometry population (bootstrap + measured) and rectification-map builder |
+| `instruments/ishell/ishell.py` | `_rectify_orders()` implementation |
 
-### Data flow
+### Data flow (structural bootstrap path)
 
 ```
 read_flatinfo(mode)     → FlatInfo        (edge polynomials, plate scale)
@@ -46,125 +57,127 @@ read_wavecalinfo(mode)  → WaveCalInfo     (stored reference arrays, xranges)
           ↓
 build_geometry_from_wavecalinfo(wci, fi)
           ↓
-OrderGeometrySet  (wave_coeffs, tilt_coeffs, spatcal_coeffs populated)
+OrderGeometrySet  (wave_coeffs from plane-0 fit, tilt_coeffs=0 placeholder)
           ↓
 build_rectification_maps(geom_set, plate_scale_arcsec)
           ↓
-list[RectificationMap]  (src_rows, src_cols for scipy.ndimage.map_coordinates)
+list[RectificationMap]
           ↓
 _rectify_orders(image, geom_set, plate_scale_arcsec)
           ↓
-resampled image (same shape as input; NaN outside all orders; zero-tilt placeholder)
+resampled image (same shape; NaN outside orders; provisional zero-tilt)
+```
+
+### Data flow (measured centerline wavelength solution path)
+
+```
+read_flatinfo(mode)     → FlatInfo
+read_wavecalinfo(mode)  → WaveCalInfo     (plane 0: wavelength grid,
+read_line_list(mode)    → LineList         plane 1: interpreted as arc spectrum)
+          ↓
+fit_arc_line_centroids(wci, line_list)
+  – for each order: predict line positions from plane-0 wavelength grid
+  – extract window of plane-1 data (interpreted as arc spectrum) around each position
+  – fit Gaussian profile → measured centroid pixel
+  – filter by SNR and reject blended lines
+          ↓
+build_geometry_from_arc_lines(wci, fi, line_list)
+  – fit polynomial to (centroid_pixel, known_wavelength) pairs
+  – falls back to plane-0 bootstrap for orders with < 4 accepted lines
+          ↓
+OrderGeometrySet  (wave_coeffs from measured centroids, tilt_coeffs=0 provisional)
 ```
 
 ---
 
-## 2. Geometry Population (polynomial fit to stored reference arrays)
+## 2. Data-Cube Plane Semantics (Partially Confirmed)
 
-### What the packaged `*_wavecalinfo.fits` files contain
+Every `*_wavecalinfo.fits` file is a data cube of shape `(n_orders, 4, n_pixels)`.
+The FITS header keywords `XUNITS="um"` and `YUNITS="DN / s"` provide partial
+evidence about plane contents, but only plane 0 has been independently
+verified:
 
-Every `*_wavecalinfo.fits` file is a data cube of shape
-`(n_orders, 4, n_pixels)`.  Based on structural inspection:
+| Plane | Status | Interpretation |
+|-------|--------|----------------|
+| 0 | **Confirmed** (XUNITS="um", values in J/H/K bands) | Wavelength grid in µm along the order centerline |
+| 1 | **Consistent with header** (YUNITS="DN / s"), but not verified against IDL source | Appears to be the ThAr arc-lamp spectrum in DN/s; used for centroid measurement |
+| 2 | **Unconfirmed; not used** | Possibly an uncertainty array |
+| 3 | **Unconfirmed; not used** | Observed values 0/1/2; possibly quality flags, but encoding is not verified |
 
-| Plane | Status | Observation |
-|-------|--------|-------------|
-| 0 | **Inferred as wavelengths (µm)** – values match J/H/K band ranges and the FITS header contains 2DXD polynomial coefficients; exact provenance not formally documented | Used by this implementation |
-| 1 | **Not confirmed** – non-NaN values of varying sign/scale; possibly a reference arc spectrum but NOT formally documented | Not used |
-| 2 | **Not confirmed** – possibly an uncertainty array; NOT formally documented | Not used |
-| 3 | **Not confirmed** – possibly quality flags; NOT formally documented | Not used |
-
-> **Important:** Only plane 0 is read by the current implementation.  The
-> interpretation of planes 1–3 is entirely speculative and they are not used.
+> **Note:** The meanings of planes 2–3 are speculative and they are not used
+> by this code.  Plane 1 is used for centroid fitting but its interpretation
+> should be considered provisional until verified against the IDL source.
 
 The FITS header also contains:
 
-- `P2W_C00`…`P2W_C11` – 12 polynomial coefficients, consistent with the
-  2DXD cross-dispersed polynomial formula described in the iSHELL Spextool
-  manual.  These are **not re-evaluated** by the current implementation; they
-  are noted here as structural evidence supporting the plane-0 inference.
-- `OR{n}_XR` – per-order column ranges, structurally validated against the
-  NaN boundary in plane 0.
-
-### What the current implementation does
-
-`build_geometry_from_wavecalinfo()` does **not** implement the 1DXD/2DXD
-wavecal procedure from IDL Spextool.  Instead it:
-
-1. Reads the stored values from plane 0 (inferred wavelengths in µm).
-2. Maps array indices to detector columns via `OR{n}_XR` ranges.
-3. Fits a 1D polynomial (degree = `DISPDEG`) to `(column, plane-0 value)` pairs.
-4. Stores the polynomial coefficients in `OrderGeometry.wave_coeffs`.
-
-```python
-# Array index j → detector column x_start + j  (structural assumption)
-cols = np.arange(n_valid) + x_start
-vals = wavecalinfo.data[order_idx, 0, :][~np.isnan(...)]
-coeffs = np.polynomial.polynomial.polyfit(cols, vals, degree)
-```
-
-This is a compact polynomial representation of the stored reference values,
-not a measurement from arc frames.
-
-### Confirmed vs inferred vs not-yet-validated
-
-| Fact | Status |
-|------|--------|
-| Plane 0 values fall in expected J/H/K band ranges (µm) | **Structurally validated** by range inspection |
-| Plane 0 provenance is the 2DXD solution from ThAr arcs | **Inferred** – consistent with header coefficients but not directly confirmed |
-| `OR{n}_XR` gives valid pixel range for plane 0 | **Structurally validated** – NaN boundary matches XR range |
-| `P2W_C00`…`P2W_C11` are 2DXD polynomial coefficients | **Inferred** from header keyword names and formula structure |
-| Planes 1–3 interpretation (arc spectrum / uncertainty / flags) | **Not confirmed** – speculative |
-| `LINEDEG = 1` specifies tilt polynomial degree | **Not yet validated** – tilt fitting is not yet implemented |
+- `P2W_C00`…`P2W_C11` – 12 coefficients of the 2DXD polynomial model from
+  the IDL Spextool pipeline.  These are the full pixel-to-wavelength solution
+  stored by the IDL pipeline; they are not yet used directly by the Python
+  implementation.
+- `OR{n}_XR` – per-order column ranges (confirmed to match the valid non-NaN
+  region of the data cube).
+- `LINEDEG = 1` – degree of the tilt polynomial used by the IDL pipeline.
+  Tilt fitting is not yet implemented in Python (requires 2-D arc images).
 
 ---
 
-## 3. Order Geometry Population
+## 3. Geometry Population
 
-After calling `build_geometry_from_wavecalinfo()`, each `OrderGeometry`
-in the returned `OrderGeometrySet` has:
+### 3a. Structural bootstrap: `build_geometry_from_wavecalinfo()`
 
-| Field | Source | Notes |
-|-------|--------|-------|
-| `order` | `wavecalinfo.orders[i]` | Echelle order number |
-| `x_start`, `x_end` | `flatinfo.xranges[i]` | Column range from flat |
-| `bottom_edge_coeffs` | `flatinfo.edge_coeffs[i, 0, :]` | From `OR{n}_B1…B5` |
-| `top_edge_coeffs` | `flatinfo.edge_coeffs[i, 1, :]` | From `OR{n}_T1…T5` |
-| `wave_coeffs` | Polynomial fit to `wavecalinfo.data[i, 0, :]` | Inferred wavelengths; degree = `DISPDEG`; not a live wavecal measurement |
-| `tilt_coeffs` | `[0.0]` | **Placeholder** – no tilt measured; identity mapping |
-| `spatcal_coeffs` | `[0.0, plate_scale_arcsec]` | **Provisional** linear model; no curvature |
-| `curvature_coeffs` | `None` | Not implemented |
+Fits a polynomial to the stored plane-0 wavelength values:
 
-### Edge polynomials
+```python
+cols = np.arange(n_valid) + x_start   # array_index → column mapping
+wavs = wavecalinfo.data[order_idx, 0, :][~np.isnan(...)]
+coeffs = np.polynomial.polynomial.polyfit(cols, wavs, degree)
+```
 
-The flat FITS header stores per-order edge polynomial coefficients as
-`OR{n}_B1`…`OR{n}_B5` (bottom edge) and `OR{n}_T1`…`OR{n}_T5` (top edge).
-These are degree-4 polynomials in the detector column.  They follow the
-`numpy.polynomial.polynomial` convention: `OR{n}_B1` is the constant term.
+This is a compact polynomial representation of the stored reference values.
 
-The `EDGEDEG` header keyword gives the polynomial degree (4 for all current
-iSHELL modes).
+### 3b. Measured centerline wavelength solution: `build_geometry_from_arc_lines()`
+
+Derives centerline wavelength coefficients from measured arc-line centroid positions:
+
+1. `fit_arc_line_centroids(wci, line_list)` identifies each line from the
+   line list using the plane-0 wavelength grid to predict pixel positions,
+   then extracts a window of plane-1 data (interpreted as the arc spectrum)
+   and fits a Gaussian profile to measure the centroid.  Blended lines
+   (two wavelengths at the same pixel) are rejected.
+
+2. For each order with ≥ `min_lines_per_order` accepted centroids, a
+   centerline polynomial is fitted to `(centroid_pixel, known_wavelength_um)`
+   pairs.
+
+3. Orders with fewer accepted lines fall back to the plane-0 bootstrap and
+   emit a `RuntimeWarning`.
+
+### Populated geometry fields
+
+After either path, each `OrderGeometry` in the returned `OrderGeometrySet` has:
+
+| Field | Bootstrap source | Measured source | Notes |
+|-------|-----------------|-----------------|-------|
+| `order` | `wavecalinfo.orders[i]` | same | Echelle order number |
+| `x_start`, `x_end` | `flatinfo.xranges[i]` | same | Column range from flat |
+| `bottom_edge_coeffs` | `flatinfo.edge_coeffs[i, 0, :]` | same | From `OR{n}_B1…B5` |
+| `top_edge_coeffs` | `flatinfo.edge_coeffs[i, 1, :]` | same | From `OR{n}_T1…T5` |
+| `wave_coeffs` | Poly fit to plane-0 values | Poly fit to measured centerline centroids | Different fitting basis |
+| `tilt_coeffs` | `[0.0]` **provisional** | `[0.0]` **provisional** | Requires 2-D arc images |
+| `spatcal_coeffs` | `[0.0, plate_scale]` provisional | same | Linear model only |
+| `curvature_coeffs` | `None` | `None` | Not implemented |
 
 ---
 
 ## 4. Resampling Algorithm (`_rectify_orders`)
 
-> **Note on terminology:** the function is named `_rectify_orders` to match
-> legacy IDL Spextool naming, but with the current **placeholder zero-tilt**
-> model it does not perform true spectral rectification.  It applies NaN
-> masking outside order footprints and bilinearly resamples the input, but
-> does not correct spectral-line tilt.
+> **Note on tilt:** with the current **provisional zero-tilt** model,
+> `_rectify_orders` applies NaN masking outside order footprints and bilinear
+> resampling but does **not** correct spectral-line tilt.
 
 ### `build_rectification_maps()`
 
-For each order, `build_rectification_maps()` computes source detector
-coordinates `(src_rows, src_cols)` for a regular output grid:
-
-**Output grid:**
-
-- **Spectral axis:** one pixel per detector column from `x_start` to `x_end`
-  (integer columns), labelled by the polynomial fitted to plane-0 values.
-- **Spatial axis:** uniformly spaced from `−half_slit` to `+half_slit`
-  arcseconds (provisional linear model), where `half_slit = 0.5 × slit_height_arcsec`.
+For each order, computes source detector coordinates `(src_rows, src_cols)`:
 
 **Source coordinate computation** (for output pixel `(spatial_i, spectral_j)`):
 
@@ -172,81 +185,65 @@ coordinates `(src_rows, src_cols)` for a regular output grid:
 col_out = x_start + j
 row_ctr = eval_centerline(col_out)
 row_offset_pix = spatial_arcsec[i] / plate_scale_arcsec
-tilt = eval_tilt(col_out)           # = 0.0 – placeholder; no tilt measured
-src_col = col_out + tilt * row_offset_pix   # = col_out (identity when tilt=0)
+tilt = eval_tilt(col_out)           # = 0.0 – provisional; requires 2-D arc images
+src_col = col_out + tilt * row_offset_pix   # = col_out when tilt=0
 src_row = row_ctr + row_offset_pix
 ```
 
-With zero tilt, `src_col = col_out` – no horizontal correction is applied.
-
 ### `_rectify_orders()`
 
-`_rectify_orders(image, geometry, plate_scale_arcsec)` performs the image
-resampling:
-
-1. Calls `build_rectification_maps()` to get `src_rows`, `src_cols` for
-   every order.
-2. For each order, computes a masked grid covering the order footprint.
-3. Applies `scipy.ndimage.map_coordinates` with bilinear interpolation
-   (`order=1`) to resample.
-4. Pixels outside all order footprints are set to NaN.
-
-**Current behaviour with placeholder zero tilt:**
-
-```
-output[r, c] = bilinear_interp(input, r, c)   ∀ (r, c) within an order
-output[r, c] = NaN                            ∀ (r, c) outside all orders
-```
-
-The output is structurally well-formed (correct NaN masking, edge geometry
-applied) but does **not** correct spectral-line tilt.
+1. Calls `build_rectification_maps()` to get `src_rows`, `src_cols`.
+2. Applies `scipy.ndimage.map_coordinates` with bilinear interpolation.
+3. Pixels outside all order footprints are set to NaN.
 
 ---
 
 ## 5. What Remains Incomplete
 
-### Blocking for science quality
+### Blocking for full science quality
 
 | Gap | Description |
 |-----|-------------|
-| **Tilt measurement** | Arc-line centroids must be fitted at multiple row positions to measure `d(col)/d(row)` at each column. Until this is done, `_rectify_orders()` does not correct spectral-line tilt. The `LINEDEG` header keyword (= 1) may indicate the expected polynomial degree for the tilt fit in IDL Spextool (not yet validated). |
-| **Plane 0 formal validation** | The assumption that plane 0 of `*_wavecalinfo.fits` contains wavelengths in µm is inferred from value ranges, not formally documented. Planes 1–3 are unused and their meaning is unknown. |
-| **2DXD re-fitting from arc frames** | Full interactive line identification, robust outlier rejection, and iterative refinement are not implemented; stored reference arrays are used instead. |
-| **Slit curvature** | Higher-order spatial distortion (`curvature_coeffs`) is not modelled. |
-| **Wavelength uncertainty** | Fit residuals and covariance matrices are not stored in the geometry objects. |
+| **Tilt measurement** | Requires arc-line centroids at multiple *spatial* row positions (a 2-D arc image). The 1-D centerline data in plane 1 cannot provide this. `LINEDEG=1` in the FITS header likely indicates the IDL pipeline used a linear tilt model, but this is not yet verified. |
+| **2DXD global model** | Full iterative arc-line identification and outlier rejection against the `P2W_C*` 2DXD polynomial are not implemented. |
+| **Slit curvature** | `curvature_coeffs` is not modelled. |
+| **Wavelength uncertainty** | Fit residuals and covariance are not stored. |
+| **Fallback orders** | Orders with fewer than `min_lines_per_order` accepted centroids fall back to the bootstrap; increasing the line density in the line list files would reduce the fallback count. |
 
 ### Non-blocking for structural use
 
 | Gap | Description |
 |-----|-------------|
-| **Cross-order shift** | `get_spectral_pixelshift()` is available in `extract/wavecal.py` but not wired into the iSHELL-specific path. |
-| **Live wavecal path** | The current code always uses the stored reference arrays; re-fitting from new arc frames is not yet exposed. |
 | **L/Lp/M modes** | Explicitly out of scope. |
+| **Cross-order shift** | Not wired into the iSHELL-specific path. |
 
 ---
 
 ## 6. Testing
 
-The test suite in `tests/test_ishell_wavecal.py` covers **structural**
-behaviour only:
+The test suite in `tests/test_ishell_wavecal.py` covers:
 
-- `TestBuildGeometryFromWaveCalInfo` – geometry construction from all J/H/K
-  modes; structural field types, shapes, and that plane-0 fitted values fall
-  in expected band ranges (structural check; semantic not formally confirmed).
-- `TestBuildRectificationMaps` – map shapes, that plane-0 values increase
-  monotonically with column for stored K1 data, spatial axis symmetry,
-  zero-tilt src_col identity.
-- `TestRectifyOrders` – identity under placeholder zero-tilt, NaN masking
-  outside orders, smoke test with real K1 geometry.
+- `TestBuildGeometryFromWaveCalInfo` – bootstrap geometry construction from
+  all J/H/K modes; structural field types, shapes, plane-0 band ranges.
+- `TestFitArcLineCentroids` – centroid-based measurement for J0/H1/K1:
+  centroids within column range, SNR above threshold, wavelengths matching
+  line list, at least one order with accepted measurements, failure cases.
+- `TestBuildGeometryFromArcLines` – centroid-based centerline wavelength
+  solution for J0/H1/K1 and all modes; band-range check, provisional
+  zero-tilt verification, fallback behaviour, difference from bootstrap
+  coefficients, synthetic accuracy test.
+- `TestBuildRectificationMaps` – map shapes, wavelength monotonicity, spatial
+  axis symmetry, zero-tilt src_col identity.
+- `TestRectifyOrders` – identity under zero-tilt, NaN masking, smoke tests.
 - `TestIntegrationPipeline` – structural pipeline smoke test for all J/H/K modes.
-- `TestCalibrationsBackwardCompatibility` – new optional fields do not
-  break existing readers or `build_order_geometry_set()`.
+- `TestCalibrationsBackwardCompatibility` – new fields do not break existing readers.
 
 Run the test suite with:
 
 ```bash
 pytest tests/test_ishell_wavecal.py -v
 ```
+
 
 ---
 
