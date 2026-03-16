@@ -208,6 +208,154 @@ with the H1 calibration dataset described above.
 
 ---
 
+---
+
+## 2DXD Pipeline Stages and Status
+
+The following table summarises the arc-calibration pipeline stages
+implemented in this branch.  Completed stages are marked ✅; planned but
+not-yet-implemented stages are marked ❌.
+
+| Stage | Module | Output | Status |
+|-------|--------|--------|--------|
+| 1 – Flat-order tracing | `tracing.py` | `FlatOrderTrace` → `OrderGeometrySet` | ✅ |
+| 2 – Arc-line tracing | `arc_tracing.py` | `ArcLineTraceResult` | ✅ |
+| 3 – Per-order provisional wavelength mapping | `wavecal_2d.py` | `ProvisionalWavelengthMap` | ✅ |
+| 4 – Provisional global wavelength-surface | `wavecal_2d_surface.py` | `GlobalSurfaceFitResult` | ✅ |
+| 5 – Coefficient-surface refinement (IDL-style 2DXD) | *not yet implemented* | — | ❌ |
+| 6 – Rectification-index generation | *not yet implemented* | — | ❌ |
+| 7 – 2-D wavecal/spatcal image creation | *not yet implemented* | — | ❌ |
+
+---
+
+## Stage 4: Provisional Global Wavelength-Surface Fitting
+
+### What is being fit
+
+Stage 4 takes the accepted arc-line matches accumulated across **all orders**
+by Stage 3 and fits a single 2-D polynomial::
+
+    wavelength_um ≈ Σ_{i,j}  c_{i,j} · u(col)^i · v(order)^j
+
+where:
+
+* **u** = `(col − col_center) / col_half` — normalized detector column,
+  mapped to `[−1, +1]` over the observed column range.
+* **v** = `order_ref / order_number` — normalized inverse order number.
+  `order_ref` is the **minimum** order number present in the fit data, so
+  `v = 1` for that order and `v < 1` for higher-numbered orders.
+
+The tensor-product polynomial basis (`col_degree + 1) × (order_degree + 1)`
+terms) is used.  The default degrees are `col_degree = 4`,
+`order_degree = 2`, giving 15 free parameters.
+
+Coefficients are estimated by ordinary least squares
+(`numpy.linalg.lstsq`).
+
+### Basis choice and physical motivation
+
+The choice of `v = order_ref / order_number` is physically motivated by the
+echelle grating equation.  For a perfect echelle grating at the blaze angle:
+
+    m · λ ≈ constant     (free spectral range is constant)
+
+so `λ ∝ 1/m` at fixed detector column.  A polynomial in `1/m` (equivalently
+in `v`) therefore captures the inter-order wavelength variation accurately
+with a **low polynomial degree in v**.  An expansion in plain order number
+`m` would need higher degree to approximate the same `1/m` dependence.
+
+### How this differs from the per-order provisional fits (Stage 3)
+
+Stage 3 (`wavecal_2d.py`) fits an **independent 1-D polynomial** per order:
+
+    wavelength_um(col) ≈ Σ_i  a_i · col^i     [per order, independent]
+
+Each per-order polynomial is estimated only from the arc lines matched within
+that order.  Orders with few matched lines (e.g. < 4) receive low-degree or
+no polynomial fits.
+
+Stage 4 combines **all orders simultaneously** into one 2-D model.
+Cross-order smoothness is enforced: information from well-constrained orders
+regularises the wavelength assignment for orders with fewer lines.
+
+### How this differs from the eventual full IDL-style 2DXD coefficient-surface fit
+
+In the full Cushing et al. (2004) 2DXD approach, per-order polynomial
+**coefficients** (not the wavelengths directly) are modelled as smooth
+functions of echelle order number:
+
+    a_i(m) = Σ_k  d_{ik} · (1/m)^k
+
+This defines a *coefficient surface* that is then used to generate a dense
+*rectification map* — a look-up table that assigns a (wavelength, slit
+position) coordinate to every detector pixel.
+
+Stage 4 in this branch is a **simplified precursor**:
+
+* It fits **wavelength directly** over `(order, col)` space, not the
+  polynomial coefficients.
+* It performs a single ordinary-least-squares pass with no iterative
+  refinement or outlier rejection.
+* It produces **no rectification map** and no spatial calibration.
+* It is not science-quality.
+
+### What remains intentionally unimplemented in this PR
+
+The following items are explicitly **out of scope** for this PR:
+
+1. **Iterative outlier rejection** – the fit is a single OLS pass.
+   Sigma-clipping against the residuals is not implemented.
+2. **Coefficient-surface refinement** – fitting per-order polynomial
+   coefficients as functions of order number (the IDL-style 2DXD approach)
+   is not implemented.
+3. **Rectification-index generation** – per-pixel wavelength/slit
+   interpolation arrays are not produced.
+4. **2-D wavecal/spatcal image creation** – the final calibration frames
+   are not generated.
+5. **Order-number validation** – the mapping from traced-order index to
+   echelle order number (currently a heuristic) has not been independently
+   validated.  All order-number assignments should be treated as nominal
+   until confirmed.
+
+### Module location and API
+
+The new module is at::
+
+    src/pyspextool/instruments/ishell/wavecal_2d_surface.py
+
+**Public API:**
+
+* `fit_global_wavelength_surface(wav_map, *, col_degree=4, order_degree=2)`
+  — main entry point.  Returns a `GlobalSurfaceFitResult`.
+* `GlobalSurfaceFitResult` — result dataclass with:
+  - `coeffs` and `coeffs_2d` — polynomial coefficients,
+  - `rms_um`, `max_abs_residual_um`, `residuals_um` — quality metrics,
+  - `eval(order_number, col)` — evaluate surface at one point,
+  - `eval_array(order_numbers, cols)` — evaluate at multiple points,
+  - normalization parameters (`col_center`, `col_half`, `order_ref`).
+
+**Typical usage:**
+
+```python
+from pyspextool.instruments.ishell.wavecal_2d import (
+    fit_provisional_wavelength_map)
+from pyspextool.instruments.ishell.wavecal_2d_surface import (
+    fit_global_wavelength_surface)
+
+# … obtain arc_result, wci, ll via stages 1–2 …
+wav_map = fit_provisional_wavelength_map(arc_result, wci, ll)
+surface = fit_global_wavelength_surface(wav_map)
+
+print(f"Global surface RMS: {surface.rms_um * 1e3:.2f} nm")
+print(f"Coefficient array shape: {surface.coeffs_2d.shape}")
+
+# Evaluate at a specific (order, column):
+wav = surface.eval(order_number=330, col=1024)
+print(f"Predicted wavelength at order 330, col 1024: {wav:.6f} µm")
+```
+
+---
+
 ## References
 
 * iSHELL Spextool Manual v10jan2020, Cushing et al.
