@@ -2,14 +2,19 @@
 
 ## Overview
 
-This document describes the order-centre tracing implementation for iSHELL
-2DXD reduction in `pyspextool`.  The tracing scaffold lives in:
+This document describes the **first-pass order-centre tracing scaffold** for
+iSHELL 2DXD reduction in `pyspextool`.  The tracing scaffold lives in:
 
     src/pyspextool/instruments/ishell/tracing.py
 
 It is the first quantitative analysis stage after the visual diagnostics
 in `pyspextool.ishell.diagnostics` and before full 2DXD wavelength
 calibration.
+
+> **Status**: This is a development scaffold, not a finalised geometry
+> calibration.  The outputs are suitable for smoke-testing the pipeline and
+> exploring the data, but should **not** be used for science-quality spectral
+> rectification without further validation and refinement.
 
 ---
 
@@ -38,8 +43,7 @@ What it does **not** do (yet):
 
 ## Data Used
 
-The implementation was developed and validated against the real
-H1-mode calibration dataset at:
+The scaffold was exercised against the real H1-mode calibration dataset at:
 
     data/testdata/ishell_h1_calibrations/raw/
 
@@ -123,31 +127,41 @@ to build approximate edge polynomials.
 
 ---
 
-## What Was Confirmed from the H1 Dataset
+## What Was Observed from the H1 Dataset
 
-The implementation was validated against the five H1 flat frames in the
-calibration dataset described above.  Key findings:
+The following measurements were made when running this first-pass scaffold
+against the five H1 flat frames in the calibration dataset described above.
+These are **observed results from a development scaffold**, not a finalised
+or validated calibration.
 
-| Measurement                              | Result                       |
+| Measurement                              | Observed value               |
 |------------------------------------------|------------------------------|
-| Orders detected at col 1100             | 42–43 (45 expected)          |
-| Median polynomial fit RMS               | ≈ 3.8 pixels                 |
-| Maximum polynomial fit RMS              | < 7 pixels                   |
+| Orders detected at col 1100             | ~42–43 (45 expected)         |
+| Median polynomial fit RMS               | ~3–4 pixels                  |
+| Maximum polynomial fit RMS              | < 8 pixels                   |
 | Order centre range (rows) at col 1100   | ≈ 4 to 1985                  |
 | Order spacing (row)                     | ≈ 46 pixels                  |
 | Order half-width (row)                  | ≈ 16 pixels                  |
 
-A notable finding: the traced order centres from the raw 2026 H1 frames
-are offset by approximately **−70 rows** relative to the positions
-predicted by the packaged `H1_flatinfo.fits` calibration resource.  This
-confirms that per-dataset order tracing is necessary; the pre-computed
-calibration files cannot be used directly for new observations.
+**Note on missing orders**: The 2–3 undetected orders (out of 45) are near
+the detector edges where flat-lamp signal is low.  This is expected behaviour
+for a first-pass scaffold using fixed prominence and distance thresholds.
 
-The 3–4 missing orders (out of 45) are a consequence of:
-* two orders near the very top of the detector receiving low flat-lamp
-  signal, and
-* occasional peak-detection ambiguities caused by interference fringing
-  at the detector edges.
+**Observed offset from packaged calibration**: The traced order centres from
+the raw 2026 H1 frames differ by approximately **−70 rows** from the
+positions stored in the packaged ``H1_flatinfo.fits`` calibration resource.
+The cause of this offset has **not yet been resolved**.  Possible explanations
+include:
+
+* detector orientation or rotation differences between the observations used
+  to create ``H1_flatinfo.fits`` and the 2026 dataset,
+* coordinate convention differences between the IDL and Python pipelines
+  (e.g. 0-based vs. 1-based row indexing, or transposed array conventions),
+* raw-frame preprocessing differences (e.g. bias subtraction or linearity
+  correction) that shift the apparent order positions.
+
+No conclusion about the usability of the packaged calibration files should
+be drawn from this offset alone.  Further investigation is required.
 
 ---
 
@@ -192,8 +206,17 @@ print(f"OrderGeometrySet: {geom.n_orders} orders, mode={geom.mode!r}")
 
 The `FlatOrderTrace.to_order_geometry_set(mode)` method converts the
 result to an `OrderGeometrySet` using the `OrderGeometry` class defined
-in `instruments/ishell/geometry.py`.  The edge polynomials are
-approximated by offsetting the centre polynomial by ±`half_width_rows`.
+in `instruments/ishell/geometry.py`.
+
+**Important limitations of the produced geometry**:
+
+* Only **order centres** are traced from the data.  The bottom and top
+  edge polynomials are **approximated** as `centre ± half_width_rows`
+  and are not independently fitted to the flat profile.
+* Order numbers are **placeholder integers** (0, 1, 2, …).  Real echelle
+  order numbers are assigned during the wavecal step.
+* The resulting `OrderGeometrySet` is intended for development scaffolding
+  and pipeline smoke-testing, **not** for science-quality rectification.
 
 ---
 
@@ -253,6 +276,15 @@ pytest tests/test_ishell_tracing.py -v
 
 The `TestTraceOrdersH1RealData` class is automatically skipped when the
 real FITS data is not present (LFS not pulled).
+
+The real-data smoke test uses **intentionally loose acceptance criteria**
+to reflect the first-pass nature of this scaffold:
+
+* ≥ 35 orders detected (H1 mode has ~45; 2–3 edge orders may be missed
+  due to low flat-lamp signal).
+* Median polynomial RMS < 8 pixels (the scaffold routinely achieves
+  ~3–4 px, but the threshold is conservative to accommodate different
+  flat-frame conditions).
 
 ---
 

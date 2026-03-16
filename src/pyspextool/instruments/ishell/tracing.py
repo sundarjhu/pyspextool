@@ -15,6 +15,12 @@ The :class:`FlatOrderTrace` can be converted to an
 :meth:`~FlatOrderTrace.to_order_geometry_set` method, which feeds into the
 later 2DXD arc-line tracing stage.
 
+.. note::
+   This is a **first-pass tracing scaffold**, not a finalised geometry
+   calibration.  The outputs are suitable for development and smoke-testing
+   the downstream pipeline, but should not be used for science-quality
+   spectral rectification without further validation.
+
 Algorithm
 ---------
 1. **Load frames** – open each flat FITS file (PRIMARY extension, extension 0)
@@ -46,18 +52,28 @@ Algorithm
 7. **Half-width estimation** – the half-maximum half-width of each order peak
    in the seed-column profile is recorded as a proxy for order width.
 
-What is confirmed from the H1 dataset
---------------------------------------
+Observations from the H1 dataset
+----------------------------------
+The following was observed when running this scaffold against the five real
+H1-mode flat frames in ``data/testdata/ishell_h1_calibrations/raw/``.
+These are first-pass observations, not finalised calibration results.
+
 * The H2RG 2048 × 2048 detector shows clean, well-separated echelle order
   bands separated by narrow inter-order gaps (~5–15 pixels).
-* With ``distance=25`` and ``prominence=500``, all 44–45 orders expected in
-  H1 mode are detected at column 1100 from a single flat frame.
-* Each order centre traces smoothly across the detector; polynomial residuals
-  are well below 1 pixel for degree ≥ 2.
-* The traced centres from the raw H1 frames are offset by approximately
-  −70 rows relative to the packaged ``H1_flatinfo.fits`` reference positions,
-  confirming the need for per-dataset tracing rather than using the packaged
-  calibration directly.
+* With ``distance=25`` and ``prominence=500``, approximately 42–43 of the
+  ~45 orders expected in H1 mode are detected at column 1100 from the
+  median-combined flat.  The 2–3 missing orders are near the detector
+  edges where the flat-lamp signal is low.
+* Polynomial fit residuals on the real H1 data are typically 3–8 pixels
+  (median ≈ 3–4 px).  This is adequate for a first-pass scaffold but
+  may be larger than a final production pipeline would require.
+* The traced centres from the raw H1 frames differ by approximately
+  −70 rows from the positions stored in the packaged ``H1_flatinfo.fits``
+  calibration resource.  The cause of this offset has **not yet been
+  resolved**; possible explanations include detector orientation differences,
+  coordinate convention differences, or raw-frame preprocessing differences
+  between the IDL and Python pipelines.  No conclusion should be drawn from
+  this offset alone.
 
 Relationship to the 2DXD arc-line tracing stage
 -------------------------------------------------
@@ -168,10 +184,19 @@ class FlatOrderTrace:
     ) -> OrderGeometrySet:
         """Convert the tracing result to an :class:`OrderGeometrySet`.
 
-        The bottom and top edge polynomials are approximated by offsetting
-        the centre-line polynomial constant term by ``±half_width_rows``.
-        Order numbers are assigned sequentially starting from 0; they are
-        placeholders until the wavecal step assigns real echelle order numbers.
+        .. warning::
+           The returned geometry is **provisional scaffolding**, not a
+           science-quality calibration.  Specifically:
+
+           * Only **order centres are traced from data**.  The bottom and
+             top edge polynomials are **approximated** by offsetting the
+             centre-line polynomial constant term by ``±half_width_rows``;
+             they are not independently fitted to the flat profile.
+           * Order numbers are **placeholder integers** (0, 1, 2, …) assigned
+             sequentially.  Real echelle order numbers are not yet assigned;
+             that requires the wavecal step.
+           * The geometry objects are intended for development and pipeline
+             scaffolding, not for final science-quality spectral rectification.
 
         Parameters
         ----------
@@ -240,7 +265,7 @@ def trace_orders_from_flat(
         Paths to raw iSHELL FITS flat frames (PRIMARY extension is read).
         When more than one file is provided the frames are median-combined
         before tracing.
-    n_sample_cols : int, default 20
+    n_sample_cols : int, default 40
         Number of evenly-spaced detector columns at which cross-dispersion
         profiles are evaluated.
     col_half_width : int, default 10
@@ -489,7 +514,7 @@ def _extract_cross_section(
         Centre column of the band.
     half_width : int
         Half-width of the band in pixels.
-    smooth_sigma : float, default 1.5
+    smooth_sigma : float, default 1.0
         Standard deviation of the Gaussian kernel applied to the median
         profile before peak detection.  Light smoothing suppresses
         fringing features while preserving the broad order peaks.  Set
