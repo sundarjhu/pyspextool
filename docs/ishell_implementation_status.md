@@ -538,3 +538,39 @@ pipeline module**:
 | **Phase 4** | Validation, integration tests, release | 🔲 Not started |
 
 For the detailed phase plan see `docs/ishell_design_memo.md §6`.
+
+---
+
+## 9. 2DXD Calibration Scaffold — Stage Status
+
+The 2DXD wavelength calibration pipeline has a separate scaffold track.
+
+| Stage | Module | Description | Status |
+|---|---|---|---|
+| **Stage 1** | `tracing.py` | Flat-order tracing | ✅ Complete |
+| **Stage 2** | `arc_tracing.py` | Arc-line tracing | ✅ Complete |
+| **Stage 3** | `wavecal_2d.py` | Per-order provisional wavelength mapping | ✅ Complete |
+| **Stage 4** | `wavecal_2d_surface.py` | Provisional global wavelength surface | ✅ Complete |
+| **Stage 5** | `wavecal_2d_refine.py` | Coefficient-surface refinement | ✅ Complete (provisional scaffold) |
+| **Stage 6** | *(not yet created)* | 2DXD rectification-index generation | 🔲 Not started |
+
+### Stage 5 details
+
+`wavecal_2d_refine.py` implements the IDL-style two-level fit structure:
+
+1. Per-order polynomial fits: `wavelength_um(col) ≈ Σ_k a_k · col^k`
+2. Order-dependence fits: `a_k(order) ≈ Σ_j d_{k,j} · v^j`
+   where `v = order_ref / order_number`.
+
+Result is stored in `RefinedCoefficientSurface` with `eval()` and
+`eval_array()` helpers.
+
+**What Stage 5 does not do** (still needed for a full 2DXD solution):
+
+- Per-order column normalization (IDL normalizes to `[-1, +1]`).
+- Iterative sigma-clipping on per-order or smoothness fits.
+- Full IDL coefficient-index (`WDEG`/`ODEG`) compatibility.
+- Rectification-index generation.
+- Science-quality wavelength solution.
+
+See `docs/ishell_wavecal_2d_refine.md` for full developer notes.
