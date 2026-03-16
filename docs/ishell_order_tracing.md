@@ -138,7 +138,7 @@ or validated calibration.
 |------------------------------------------|------------------------------|
 | Orders detected at col 1100             | ~42–43 (45 expected)         |
 | Median polynomial fit RMS               | ~3–4 pixels                  |
-| Maximum polynomial fit RMS              | < 8 pixels                   |
+| Maximum polynomial fit RMS              | typically below 8 pixels in the current H1 run |
 | Order centre range (rows) at col 1100   | ≈ 4 to 1985                  |
 | Order spacing (row)                     | ≈ 46 pixels                  |
 | Order half-width (row)                  | ≈ 16 pixels                  |

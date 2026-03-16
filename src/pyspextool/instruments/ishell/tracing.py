@@ -60,10 +60,10 @@ These are first-pass observations, not finalised calibration results.
 
 * The H2RG 2048 × 2048 detector shows clean, well-separated echelle order
   bands separated by narrow inter-order gaps (~5–15 pixels).
-* With ``distance=25`` and ``prominence=500``, approximately 42–43 of the
-  ~45 orders expected in H1 mode are detected at column 1100 from the
-  median-combined flat.  The 2–3 missing orders are near the detector
-  edges where the flat-lamp signal is low.
+* With ``distance=25`` and ``prominence=500``, the majority of the ~45
+  orders expected in H1 mode are detected from the median-combined flat.
+  A small number of orders near the detector edges are typically missed
+  due to low flat-lamp signal.
 * Polynomial fit residuals on the real H1 data are typically 3–8 pixels
   (median ≈ 3–4 px).  This is adequate for a first-pass scaffold but
   may be larger than a final production pipeline would require.
