@@ -9,3 +9,5 @@ from . import wavecal_2d  # noqa: F401 – provisional wavelength-mapping scaffo
 from . import wavecal_2d_surface  # noqa: F401 – provisional global wavelength-surface scaffold
 from . import wavecal_2d_refine  # noqa: F401 – coefficient-surface refinement scaffold
 from . import rectification_indices  # noqa: F401 – provisional rectification-index scaffold
+from . import rectified_orders  # noqa: F401 – provisional rectified-order image scaffold
+from . import calibration_products  # noqa: F401 – provisional wavecal/spatcal calibration-product scaffold
