@@ -1,18 +1,35 @@
-# iSHELL Aperture Extraction Scaffold
+# iSHELL Aperture Extraction Scaffold (Stage 11)
 
-This document describes the **aperture-aware spectral extraction scaffold**
-implemented in `src/pyspextool/instruments/ishell/aperture_extraction.py`.
+This document describes **Stage 11** of the iSHELL 2DXD reduction scaffold:
+the aperture-aware spectral extraction implemented in
+`src/pyspextool/instruments/ishell/aperture_extraction.py`.
 
 > **Scaffold notice:** This module is intentionally simple.  It is not a
 > final science-quality implementation of iSHELL or Spextool extraction.
 > See [What remains unimplemented](#what-remains-unimplemented) for a full
 > list of limitations.
 
+## Pipeline stage table
+
+| Stage | Module                     | Purpose                              |
+|-------|----------------------------|--------------------------------------|
+| 1     | `tracing.py`               | Flat-order tracing                   |
+| 2     | `arc_tracing.py`           | Arc-line tracing                     |
+| 3     | `wavecal_2d.py`            | Per-order provisional wavelength mapping |
+| 4     | `wavecal_2d_surface.py`    | Provisional global wavelength surface |
+| 5     | `wavecal_2d_refine.py`     | Coefficient-surface refinement       |
+| 6     | `rectification_indices.py` | Rectification-index generation       |
+| 7     | `rectified_orders.py`      | Rectified order images               |
+| 8     | `calibration_products.py`  | Provisional calibration product containers |
+| 9     | `calibration_fits.py`      | FITS calibration writer              |
+| 10    | `extracted_spectra.py`     | Whole-slit provisional extraction    |
+| **11** | **`aperture_extraction.py`** | **Aperture-aware extraction (this module)** |
+
 ---
 
 ## Overview
 
-The aperture extraction module adds support for:
+Stage 11 adds support for:
 
 * **Object aperture extraction** – only spatial pixels within a user-defined
   aperture contribute to the 1-D spectrum.

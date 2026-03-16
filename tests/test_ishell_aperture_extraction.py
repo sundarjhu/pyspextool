@@ -826,7 +826,7 @@ class TestH1ApertureExtractionSmokeTest:
       4. Coefficient-surface refinement (Stage 5)
       5. Rectification indices (Stage 6)
       6. Rectified orders (Stage 7)
-      7. Aperture extraction (Stage 8 / new module)
+      7. Aperture extraction (Stage 11)
     """
 
     @pytest.fixture(scope="class")
@@ -877,7 +877,7 @@ class TestH1ApertureExtractionSmokeTest:
             detector_image = hdul[0].data.astype(float)
         rectified = build_rectified_orders(detector_image, rect_indices)
 
-        # Stage 8: aperture extraction (new module)
+        # Stage 11: aperture extraction
         ap = ApertureDefinition(
             center_frac=0.5,
             radius_frac=0.2,
