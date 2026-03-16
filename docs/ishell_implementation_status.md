@@ -552,7 +552,12 @@ The 2DXD wavelength calibration pipeline has a separate scaffold track.
 | **Stage 3** | `wavecal_2d.py` | Per-order provisional wavelength mapping | ✅ Complete |
 | **Stage 4** | `wavecal_2d_surface.py` | Provisional global wavelength surface | ✅ Complete |
 | **Stage 5** | `wavecal_2d_refine.py` | Coefficient-surface refinement | ✅ Complete (provisional scaffold) |
-| **Stage 6** | *(not yet created)* | 2DXD rectification-index generation | 🔲 Not started |
+| **Stage 6** | `rectification_indices.py` | Rectification-index generation | ✅ Complete |
+| **Stage 7** | `rectified_orders.py` | Rectified order images | ✅ Complete |
+| **Stage 8** | `calibration_products.py` | Provisional calibration product containers | ✅ Complete |
+| **Stage 9** | `calibration_fits.py` | FITS calibration writer | ✅ Complete |
+| **Stage 10** | `extracted_spectra.py` | Whole-slit provisional extraction | ✅ Complete |
+| **Stage 11** | `aperture_extraction.py` | Aperture-aware extraction | ✅ Complete |
 
 ### Stage 5 details
 
