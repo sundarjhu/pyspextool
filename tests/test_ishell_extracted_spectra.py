@@ -453,9 +453,8 @@ class TestExtractRectifiedOrdersSynthetic:
         # Set the first spectral column of the first order to all NaN.
         ros.rectified_orders[0].flux[:, 0] = np.nan
         result = extract_rectified_orders(ros, method="sum")
-        assert np.isnan(result.spectra[0].flux[0]), (
+        assert np.isnan(result.spectra[0].flux[0]), \
             "Expected NaN at the all-NaN spectral column in sum output"
-        )
         # Other columns should be finite.
         assert np.all(np.isfinite(result.spectra[0].flux[1:]))
 
@@ -464,9 +463,8 @@ class TestExtractRectifiedOrdersSynthetic:
         ros = _make_synthetic_rectified_order_set()
         ros.rectified_orders[0].flux[:, 0] = np.nan
         result = extract_rectified_orders(ros, method="mean")
-        assert np.isnan(result.spectra[0].flux[0]), (
+        assert np.isnan(result.spectra[0].flux[0]), \
             "Expected NaN at the all-NaN spectral column in mean output"
-        )
         assert np.all(np.isfinite(result.spectra[0].flux[1:]))
 
     def test_partial_nan_row_excluded_from_mean(self):
