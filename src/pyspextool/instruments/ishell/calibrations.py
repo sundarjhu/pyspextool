@@ -285,6 +285,14 @@ class WaveCalInfo:
         Per-order column ranges ``[x_start, x_end]`` parsed from the
         ``OR{n}_XR`` header keywords.  ``None`` if the header does not
         contain these keywords.
+    p2w_coeffs : numpy.ndarray, shape ((disp_degree+1)*(order_degree+1),) or None
+        Raw ``P2W_C*`` polynomial coefficients read from the FITS header.
+        These are the pre-computed IDL 2DXD wavelength-mapping coefficients.
+        ``None`` if the header does not contain ``P2W_C00``.  The exact
+        evaluation convention (coordinate normalization) has not been
+        verified against the IDL source code; see
+        :class:`~pyspextool.instruments.ishell.wavecal_2dxd.TwoDXDCoefficients`
+        for details.
     """
 
     mode: str
@@ -298,6 +306,7 @@ class WaveCalInfo:
     disp_degree: int
     order_degree: int
     xranges: Optional[np.ndarray] = None
+    p2w_coeffs: Optional[np.ndarray] = None
 
     @property
     def n_pixels(self) -> int:
@@ -460,6 +469,43 @@ def _parse_order_edge_coeffs(
             top.append(float(hdr[tkey]))
         result.append([bottom, top])
     return np.array(result, dtype=float)
+
+
+def _parse_p2w_coeffs(hdr) -> Optional[np.ndarray]:
+    """Parse IDL 2DXD polynomial coefficients from ``P2W_C*`` FITS keywords.
+
+    Parameters
+    ----------
+    hdr : astropy FITS header
+
+    Returns
+    -------
+    ndarray, shape ``((DISPDEG+1)*(ORDRDEG+1),)`` or ``None``
+        Raw P2W coefficient values in keyword order ``P2W_C00, P2W_C01, …``,
+        or ``None`` if the ``DISPDEG``, ``ORDRDEG``, or ``P2W_C00`` keywords
+        are absent.
+
+    Notes
+    -----
+    The exact evaluation convention of these coefficients (coordinate
+    normalization) has **not** been verified against the IDL source code.
+    See :class:`~pyspextool.instruments.ishell.wavecal_2dxd.TwoDXDCoefficients`
+    for documentation of the known uncertainty.
+    """
+    if "DISPDEG" not in hdr or "ORDRDEG" not in hdr:
+        return None
+    if "P2W_C00" not in hdr:
+        return None
+    n_disp = int(hdr["DISPDEG"]) + 1
+    n_ord = int(hdr["ORDRDEG"]) + 1
+    n_terms = n_disp * n_ord
+    coeffs = []
+    for k in range(n_terms):
+        key = f"P2W_C{k:02d}"
+        if key not in hdr:
+            return None
+        coeffs.append(float(hdr[key]))
+    return np.array(coeffs, dtype=float)
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +749,7 @@ def read_wavecalinfo(mode_name: str) -> WaveCalInfo:
         disp_degree=int(hdr.get("DISPDEG", 0)),
         order_degree=int(hdr.get("ORDRDEG", 0)),
         xranges=_parse_order_xranges(hdr, orders),
+        p2w_coeffs=_parse_p2w_coeffs(hdr),
     )
 
 
