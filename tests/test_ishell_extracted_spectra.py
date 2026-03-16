@@ -571,7 +571,7 @@ class TestH1ExtractedSpectraSmokeTest:
       4. Coefficient-surface refinement (Stage 5)
       5. Rectification indices (Stage 6)
       6. Rectified orders (Stage 7)
-      7. Extracted spectra (Stage 9)
+      7. Extracted spectra (Stage 10)
     """
 
     @pytest.fixture(scope="class")
@@ -623,7 +623,7 @@ class TestH1ExtractedSpectraSmokeTest:
             detector_image = hdul[0].data.astype(float)
         rectified = build_rectified_orders(detector_image, rect_indices)
 
-        # Stage 9: extracted spectra
+        # Stage 10: extracted spectra
         extracted = extract_rectified_orders(rectified, method="sum")
 
         return extracted, rectified

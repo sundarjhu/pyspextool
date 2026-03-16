@@ -1,7 +1,7 @@
 """
 Provisional spectral-extraction scaffold for iSHELL 2DXD reduction.
 
-This module implements the **ninth stage** of the iSHELL 2DXD reduction
+This module implements the **tenth stage** of the iSHELL 2DXD reduction
 scaffold: collapsing each rectified order image along the spatial axis to
 produce a provisional 1-D spectrum.
 

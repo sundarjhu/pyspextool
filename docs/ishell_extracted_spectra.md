@@ -1,11 +1,11 @@
-# iSHELL 2DXD Provisional Spectral Extraction (Stage 9)
+# iSHELL 2DXD Provisional Spectral Extraction (Stage 10)
 
 This document describes the provisional spectral-extraction scaffold
 implemented in `src/pyspextool/instruments/ishell/extracted_spectra.py`.
 
 ## Overview
 
-Stage 9 takes the rectified order images produced by Stage 7
+Stage 10 takes the rectified order images produced by Stage 7
 (`rectified_orders.py`) and collapses each image along the spatial axis
 to produce a provisional 1-D spectrum per echelle order.
 
@@ -41,7 +41,7 @@ wavelength axis defined by Stage 7.
 The final Spextool extraction (not yet implemented) will differ in the
 following ways:
 
-| Feature | Stage 9 scaffold | Final extraction |
+| Feature | Stage 10 scaffold | Final extraction |
 |---|---|---|
 | Extraction method | Simple sum or mean | Optimal (profile-weighted) |
 | Spatial profile | Not modelled | Fitted from data |
@@ -104,6 +104,6 @@ Container for all extracted spectra.
 ## Constraints
 
 See `docs/ishell_scaffold_constraints.md` for the general scaffold
-constraints that apply to all stages.  Stage 9 additionally inherits all
+constraints that apply to all stages.  Stage 10 additionally inherits all
 simplifications from Stage 7 (no tilt/curvature correction, fractional
 spatial axis).
