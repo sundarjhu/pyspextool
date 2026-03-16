@@ -5,3 +5,4 @@ from . import merge  # noqa: F401 – make merge importable as sub-module
 from . import telluric  # noqa: F401 – make telluric importable as sub-module
 from . import tracing  # noqa: F401 – order-centre tracing for 2DXD scaffold
 from . import arc_tracing  # noqa: F401 – 2-D arc-line tracing for 2DXD scaffold
+from . import wavecal_2d  # noqa: F401 – provisional wavelength-mapping scaffold
