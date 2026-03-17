@@ -513,13 +513,14 @@ def build_external_profile_template(
     definition : ProfileTemplateDefinition
         Template-builder parameters (combine method, smoothing, normalization,
         etc.).
-    mask : ndarray, shape (n_rows, n_cols) or None
-        Optional boolean bad-pixel mask for the source detector images.
+    mask : ndarray, shape (n_spatial, n_spectral) or None
+        Optional boolean bad-pixel mask for the rectified order images.
         ``True`` marks pixels to exclude (set to NaN before combining).
-        If supplied, the mask must share the ``source_image_shape`` of all
-        input sets.  Currently the mask is applied uniformly to every
-        rectified pixel (no sub-pixel interpolation of the mask boundary);
-        masked pixels become NaN in the combined image.
+        If supplied, the mask must match the shape of each per-order
+        rectified flux image ``(n_spatial, n_spectral)``.  Currently the
+        mask is applied uniformly to every rectified pixel (no
+        sub-pixel interpolation of the mask boundary); masked pixels
+        become NaN in the combined image.
 
         .. note::
             The mask is applied in *rectified* space: a ``True`` entry at
