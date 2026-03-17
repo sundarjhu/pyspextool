@@ -2689,3 +2689,729 @@ class TestH1ProfileReestimationSmokeTest:
         _, r_reest, _ = h1_reestimation_results
         for sp in r_reest.spectra:
             assert sp.n_iterations_used >= 1
+
+
+# ===========================================================================
+# 22. WeightedExtractionDefinition: profile_source validation (Stage 20)
+# ===========================================================================
+
+
+class TestProfileSourceDefinitionValidation:
+    """Tests for Stage-20 profile_source fields in WeightedExtractionDefinition."""
+
+    def test_default_profile_source_is_empirical(self):
+        """profile_source defaults to 'empirical'."""
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.2)
+        assert ed.profile_source == "empirical"
+
+    def test_smoothed_empirical_accepted(self):
+        """profile_source='smoothed_empirical' is accepted."""
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.2,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=1.5,
+        )
+        assert ed.profile_source == "smoothed_empirical"
+        assert ed.profile_smooth_sigma == 1.5
+
+    def test_external_accepted_with_profile(self):
+        """profile_source='external' with external_profile is accepted."""
+        ext = np.ones((5, 32)) / 5.0
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.2,
+            profile_source="external",
+            external_profile=ext,
+        )
+        assert ed.profile_source == "external"
+        assert ed.external_profile is ext
+
+    def test_invalid_profile_source_raises(self):
+        """ValueError if profile_source is not a recognized value."""
+        with pytest.raises(ValueError, match="profile_source"):
+            WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.2, profile_source="magic_psf"
+            )
+
+    def test_negative_profile_smooth_sigma_raises(self):
+        """ValueError if profile_smooth_sigma < 0."""
+        with pytest.raises(ValueError, match="profile_smooth_sigma"):
+            WeightedExtractionDefinition(
+                center_frac=0.5,
+                radius_frac=0.2,
+                profile_source="smoothed_empirical",
+                profile_smooth_sigma=-1.0,
+            )
+
+    def test_external_without_profile_raises(self):
+        """ValueError if profile_source='external' but external_profile is None."""
+        with pytest.raises(ValueError, match="external_profile"):
+            WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.2, profile_source="external"
+            )
+
+    def test_external_profile_with_wrong_source_raises(self):
+        """ValueError if external_profile provided but profile_source != 'external'."""
+        ext = np.ones((5, 32)) / 5.0
+        with pytest.raises(ValueError, match="profile_source"):
+            WeightedExtractionDefinition(
+                center_frac=0.5,
+                radius_frac=0.2,
+                profile_source="empirical",
+                external_profile=ext,
+            )
+
+    def test_default_profile_smooth_sigma_zero(self):
+        """profile_smooth_sigma defaults to 0.0."""
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.2)
+        assert ed.profile_smooth_sigma == 0.0
+
+    def test_default_external_profile_none(self):
+        """external_profile defaults to None."""
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.2)
+        assert ed.external_profile is None
+
+    def test_profile_smooth_sigma_zero_accepted(self):
+        """profile_smooth_sigma=0 is accepted (no smoothing)."""
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.2,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=0.0,
+        )
+        assert ed.profile_smooth_sigma == 0.0
+
+
+# ===========================================================================
+# 23. profile_source='empirical' backward compatibility (Stage 20)
+# ===========================================================================
+
+
+class TestProfileSourceEmpirical:
+    """profile_source='empirical' produces the same result as default behavior."""
+
+    def test_empirical_matches_default(self):
+        """Explicit profile_source='empirical' gives identical result to default."""
+        ros = _make_synthetic_rectified_order_set()
+        ed_default = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.3
+        )
+        ed_explicit = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.3, profile_source="empirical"
+        )
+        r_default = extract_weighted_optimal(ros, ed_default)
+        r_explicit = extract_weighted_optimal(ros, ed_explicit)
+        for sp_d, sp_e in zip(r_default.spectra, r_explicit.spectra):
+            np.testing.assert_array_equal(sp_d.flux, sp_e.flux)
+            np.testing.assert_array_equal(sp_d.variance, sp_e.variance)
+
+    def test_empirical_profile_source_used_field(self):
+        """profile_source_used is 'empirical' for default extraction."""
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.3)
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile_source_used == "empirical"
+
+    def test_empirical_profile_smoothed_false(self):
+        """profile_smoothed is False for empirical extraction."""
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.3)
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile_smoothed is False
+
+
+# ===========================================================================
+# 24. profile_source='smoothed_empirical' behavior (Stage 20)
+# ===========================================================================
+
+
+def _make_noisy_rectified_order_set(
+    n_spectral: int = _N_SPECTRAL,
+    n_spatial: int = _N_SPATIAL,
+    rng=None,
+) -> "RectifiedOrderSet":
+    """Build a RectifiedOrderSet with Gaussian-noisy flux images."""
+    if rng is None:
+        rng = np.random.default_rng(42)
+    orders = []
+    for idx, p in enumerate(_ORDER_PARAMS):
+        wav_start = 1.55 + idx * 0.05
+        wav_end = wav_start + 0.04
+        noisy_flux = 10.0 + rng.standard_normal((n_spatial, n_spectral))
+        orders.append(
+            RectifiedOrder(
+                order=p["order_number"],
+                order_index=idx,
+                wavelength_um=np.linspace(wav_start, wav_end, n_spectral),
+                spatial_frac=np.linspace(0.0, 1.0, n_spatial),
+                flux=noisy_flux,
+                source_image_shape=(_NROWS, _NCOLS),
+            )
+        )
+    return RectifiedOrderSet(
+        mode="H1_test",
+        rectified_orders=orders,
+        source_image_shape=(_NROWS, _NCOLS),
+    )
+
+
+class TestProfileSourceSmoothedEmpirical:
+    """Tests for profile_source='smoothed_empirical' behavior."""
+
+    def test_smoothed_empirical_output_shapes(self):
+        """smoothed_empirical produces correct output shapes."""
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.3,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=1.0,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        assert result.n_orders == _N_ORDERS
+        for sp in result.spectra:
+            assert sp.flux.shape == (_N_SPECTRAL,)
+            assert sp.variance.shape == (_N_SPECTRAL,)
+
+    def test_smoothed_empirical_profile_source_used(self):
+        """profile_source_used is 'smoothed_empirical'."""
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.3,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=1.0,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile_source_used == "smoothed_empirical"
+
+    def test_smoothed_empirical_profile_smoothed_flag(self):
+        """profile_smoothed is True when sigma > 0."""
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.3,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=1.0,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile_smoothed is True
+
+    def test_smoothed_empirical_sigma_zero_matches_empirical(self):
+        """smoothed_empirical with sigma=0 matches empirical exactly."""
+        ros = _make_noisy_rectified_order_set()
+        ed_emp = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.3, profile_source="empirical"
+        )
+        ed_smooth0 = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.3,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=0.0,
+        )
+        r_emp = extract_weighted_optimal(ros, ed_emp)
+        r_sm0 = extract_weighted_optimal(ros, ed_smooth0)
+        for sp_e, sp_s in zip(r_emp.spectra, r_sm0.spectra):
+            np.testing.assert_allclose(sp_e.flux, sp_s.flux)
+            np.testing.assert_allclose(sp_e.variance, sp_s.variance)
+
+    def test_smoothed_profile_differs_from_empirical_in_noisy_case(self):
+        """smoothed_empirical produces a different profile from empirical on noisy data."""
+        rng = np.random.default_rng(17)
+        ros = _make_noisy_rectified_order_set(rng=rng)
+        ed_emp = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.3, profile_source="empirical"
+        )
+        ed_sm = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.3,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=2.0,
+        )
+        r_emp = extract_weighted_optimal(ros, ed_emp)
+        r_sm = extract_weighted_optimal(ros, ed_sm)
+        for sp_e, sp_s in zip(r_emp.spectra, r_sm.spectra):
+            assert not np.allclose(sp_e.profile, sp_s.profile), \
+                "Expected smoothed and empirical profiles to differ for noisy data."
+
+    def test_smoothed_profile_reduces_single_pixel_outlier_sensitivity(self):
+        """Smoothing reduces the effect of a single-pixel profile spike."""
+        n_ap = 15
+        n_spec = 32
+        rng = np.random.default_rng(99)
+        flux = np.ones((n_ap, n_spec)) * 10.0 + rng.standard_normal((n_ap, n_spec)) * 0.1
+        spike_row = n_ap // 2
+        flux[spike_row, :] += 50.0
+
+        orders = [
+            RectifiedOrder(
+                order=311,
+                order_index=0,
+                wavelength_um=np.linspace(1.55, 1.59, n_spec),
+                spatial_frac=np.linspace(0.0, 1.0, n_ap),
+                flux=flux,
+                source_image_shape=(_NROWS, _NCOLS),
+            )
+        ]
+        ros = RectifiedOrderSet(
+            mode="H1_test",
+            rectified_orders=orders,
+            source_image_shape=(_NROWS, _NCOLS),
+        )
+        ed_emp = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49
+        )
+        ed_sm = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.49,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=1.5,
+        )
+        r_emp = extract_weighted_optimal(ros, ed_emp)
+        r_sm = extract_weighted_optimal(ros, ed_sm)
+        sp_emp = r_emp.spectra[0]
+        sp_sm = r_sm.spectra[0]
+        assert sp_sm.profile.max() < sp_emp.profile.max(), (
+            "Smoothing should reduce the spike in the profile."
+        )
+
+    def test_smoothed_empirical_no_smoothing_when_sigma_zero(self):
+        """profile_smoothed=False when profile_smooth_sigma=0."""
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.3,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=0.0,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile_smoothed is False
+
+    def test_smoothed_empirical_profile_normalized(self):
+        """Smoothed profile columns sum to 1.0 where finite."""
+        ros = _make_noisy_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.3,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=1.0,
+            normalize_profile=True,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            col_sums = np.nansum(sp.profile, axis=0)
+            finite_cols = np.isfinite(col_sums)
+            np.testing.assert_allclose(
+                col_sums[finite_cols], 1.0, atol=1e-12,
+                err_msg=f"Order {sp.order}: smoothed profile columns should sum to 1.0",
+            )
+
+    def test_smoothed_empirical_reestimate_runs_without_crash(self):
+        """smoothed_empirical + reestimate_profile + reject_outliers runs without crash."""
+        ros = _make_synthetic_rectified_order_set(fill_value=5.0)
+        ro0 = ros.rectified_orders[0]
+        flux_with_outlier = ro0.flux.copy()
+        flux_with_outlier[5, 10] = 1000.0
+        orders_mod = [
+            RectifiedOrder(
+                order=ro0.order,
+                order_index=ro0.order_index,
+                wavelength_um=ro0.wavelength_um.copy(),
+                spatial_frac=ro0.spatial_frac.copy(),
+                flux=flux_with_outlier,
+                source_image_shape=ro0.source_image_shape,
+            )
+        ] + [
+            RectifiedOrder(
+                order=ro.order,
+                order_index=ro.order_index,
+                wavelength_um=ro.wavelength_um.copy(),
+                spatial_frac=ro.spatial_frac.copy(),
+                flux=ro.flux.copy(),
+                source_image_shape=ro.source_image_shape,
+            )
+            for ro in ros.rectified_orders[1:]
+        ]
+        ros_mod = RectifiedOrderSet(
+            mode="H1_test",
+            rectified_orders=orders_mod,
+            source_image_shape=ros.source_image_shape,
+        )
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.49,
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=1.0,
+            reject_outliers=True,
+            sigma_clip=3.0,
+            max_iterations=3,
+            reestimate_profile=True,
+        )
+        result = extract_weighted_optimal(ros_mod, ed)
+        sp0 = result.spectra[0]
+        assert sp0.flux.shape == (_N_SPECTRAL,)
+        assert sp0.variance.shape == (_N_SPECTRAL,)
+        assert sp0.profile_source_used == "smoothed_empirical"
+
+
+# ===========================================================================
+# 25. profile_source='external' behavior (Stage 20)
+# ===========================================================================
+
+
+class TestProfileSourceExternal:
+    """Tests for profile_source='external' behavior."""
+
+    @staticmethod
+    def _make_ext_profile(n_ap: int, n_spectral: int) -> np.ndarray:
+        """Create a normalized Gaussian-shaped external profile."""
+        rows = np.arange(n_ap, dtype=float)
+        center = n_ap / 2.0
+        sigma = max(n_ap / 6.0, 1.0)
+        p1d = np.exp(-0.5 * ((rows - center) / sigma) ** 2)
+        p1d /= p1d.sum()
+        return np.broadcast_to(p1d[:, np.newaxis], (n_ap, n_spectral)).copy()
+
+    @staticmethod
+    def _aperture_size(n_spatial: int = _N_SPATIAL, radius: float = 0.49) -> int:
+        dist = np.abs(np.linspace(0.0, 1.0, n_spatial) - 0.5)
+        return int(np.sum(dist <= radius))
+
+    def test_external_output_shapes(self):
+        """external profile produces correct output shapes."""
+        n_ap = self._aperture_size()
+        ext = self._make_ext_profile(n_ap, _N_SPECTRAL)
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=ext,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        assert result.n_orders == _N_ORDERS
+        for sp in result.spectra:
+            assert sp.flux.shape == (_N_SPECTRAL,)
+            assert sp.variance.shape == (_N_SPECTRAL,)
+
+    def test_external_profile_source_used_field(self):
+        """profile_source_used is 'external'."""
+        n_ap = self._aperture_size()
+        ext = self._make_ext_profile(n_ap, _N_SPECTRAL)
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=ext,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile_source_used == "external"
+
+    def test_external_profile_smoothed_false(self):
+        """profile_smoothed is False for external extraction."""
+        n_ap = self._aperture_size()
+        ext = self._make_ext_profile(n_ap, _N_SPECTRAL)
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=ext,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile_smoothed is False
+
+    def test_external_profile_used_exactly(self):
+        """The supplied external profile (already normalized) is stored unchanged."""
+        n_ap = self._aperture_size()
+        ext = self._make_ext_profile(n_ap, _N_SPECTRAL)  # already normalized
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=ext,
+            normalize_profile=True,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            np.testing.assert_allclose(sp.profile, ext, atol=1e-12)
+
+    def test_external_1d_profile_broadcast(self):
+        """External profile supplied as 1-D (n_ap,) is broadcast correctly."""
+        n_ap = self._aperture_size()
+        profile_1d = np.ones(n_ap) / n_ap
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=profile_1d,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile.shape == (n_ap, _N_SPECTRAL)
+
+    def test_external_2d_one_col_profile_broadcast(self):
+        """External profile supplied as (n_ap, 1) is broadcast correctly."""
+        n_ap = self._aperture_size()
+        profile_col = np.ones((n_ap, 1)) / n_ap
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=profile_col,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile.shape == (n_ap, _N_SPECTRAL)
+
+    def test_external_incompatible_n_ap_raises(self):
+        """ValueError if external_profile first dim != aperture size."""
+        n_ap = self._aperture_size()
+        wrong_profile = np.ones((n_ap + 5, _N_SPECTRAL)) / (n_ap + 5)
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=wrong_profile,
+        )
+        with pytest.raises(ValueError, match="n_ap"):
+            extract_weighted_optimal(ros, ed)
+
+    def test_external_incompatible_n_spectral_raises(self):
+        """ValueError if external_profile second dim != n_spectral and != 1."""
+        n_ap = self._aperture_size()
+        wrong_profile = np.ones((n_ap, _N_SPECTRAL + 3)) / n_ap
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=wrong_profile,
+        )
+        with pytest.raises(ValueError, match="n_spectral"):
+            extract_weighted_optimal(ros, ed)
+
+    def test_external_with_rejection_keeps_profile_fixed(self):
+        """External profile is not re-estimated during iterative rejection."""
+        n_ap = self._aperture_size()
+        ext = self._make_ext_profile(n_ap, _N_SPECTRAL)
+        ros = _make_synthetic_rectified_order_set(fill_value=5.0)
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=ext,
+            reject_outliers=True,
+            reestimate_profile=True,  # Ignored for external.
+            sigma_clip=3.0,
+            max_iterations=3,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.profile_reestimated is False
+            assert sp.initial_profile is None
+
+    def test_external_profile_stored_normalized(self):
+        """Unnormalized external profile is normalized before storage."""
+        n_ap = self._aperture_size()
+        ext_unnorm = np.full((n_ap, _N_SPECTRAL), 2.0)
+        ros = _make_synthetic_rectified_order_set()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.49,
+            profile_source="external", external_profile=ext_unnorm,
+            normalize_profile=True,
+        )
+        result = extract_weighted_optimal(ros, ed)
+        for sp in result.spectra:
+            col_sums = np.nansum(sp.profile, axis=0)
+            finite_cols = np.isfinite(col_sums)
+            np.testing.assert_allclose(
+                col_sums[finite_cols], 1.0, atol=1e-12,
+                err_msg="Normalized external profile should sum to 1.0 per column.",
+            )
+
+
+# ===========================================================================
+# 26. Bookkeeping fields: profile_source_used and profile_smoothed (Stage 20)
+# ===========================================================================
+
+
+class TestProfileSourceBookkeeping:
+    """Tests for profile_source_used and profile_smoothed bookkeeping fields."""
+
+    def test_all_sources_populate_bookkeeping(self):
+        """profile_source_used and profile_smoothed are set for all profile sources."""
+        dist = np.abs(np.linspace(0.0, 1.0, _N_SPATIAL) - 0.5)
+        n_ap = int(np.sum(dist <= 0.49))
+        ext = np.ones((n_ap, _N_SPECTRAL)) / n_ap
+        ros = _make_synthetic_rectified_order_set()
+
+        cases = [
+            ("empirical", {}, False),
+            ("smoothed_empirical", {"profile_smooth_sigma": 1.5}, True),
+            ("smoothed_empirical", {"profile_smooth_sigma": 0.0}, False),
+            ("external", {"external_profile": ext}, False),
+        ]
+        for source, kwargs, expected_smoothed in cases:
+            ed = WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.49,
+                profile_source=source, **kwargs,
+            )
+            result = extract_weighted_optimal(ros, ed)
+            for sp in result.spectra:
+                assert sp.profile_source_used == source, (
+                    f"Expected profile_source_used={source!r}, "
+                    f"got {sp.profile_source_used!r}"
+                )
+                assert sp.profile_smoothed is expected_smoothed, (
+                    f"source={source!r}: expected profile_smoothed="
+                    f"{expected_smoothed}, got {sp.profile_smoothed}"
+                )
+
+    def test_weighted_extraction_shapes_all_sources(self):
+        """All profile sources produce well-formed flux and variance arrays."""
+        dist = np.abs(np.linspace(0.0, 1.0, _N_SPATIAL) - 0.5)
+        n_ap = int(np.sum(dist <= 0.49))
+        ext = np.ones((n_ap, _N_SPECTRAL)) / n_ap
+        ros = _make_synthetic_rectified_order_set()
+
+        for source, kwargs in [
+            ("empirical", {}),
+            ("smoothed_empirical", {"profile_smooth_sigma": 1.0}),
+            ("external", {"external_profile": ext}),
+        ]:
+            ed = WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.49,
+                profile_source=source, **kwargs,
+            )
+            result = extract_weighted_optimal(ros, ed)
+            for sp in result.spectra:
+                assert sp.flux.shape == (_N_SPECTRAL,), (
+                    f"source={source!r}: wrong flux shape"
+                )
+                assert sp.variance.shape == (_N_SPECTRAL,), (
+                    f"source={source!r}: wrong variance shape"
+                )
+                fin_var = sp.variance[np.isfinite(sp.variance)]
+                assert np.all(fin_var >= 0.0), (
+                    f"source={source!r}: negative variance"
+                )
+
+
+# ===========================================================================
+# 27. H1 smoke test: smoothed_empirical and empirical (Stage 20)
+# ===========================================================================
+
+_h1_profile_source_skip = pytest.mark.skipif(
+    not _HAVE_H1_DATA,
+    reason="Real H1 FITS data not available (LFS pointer files only).",
+)
+
+
+@_h1_profile_source_skip
+class TestH1ProfileSourceSmokeTest:
+    """Smoke tests for Stage 20 profile sources on real H1 calibration data."""
+
+    @pytest.fixture(scope="class")
+    def h1_profile_source_results(self):
+        """Run H1 extraction with empirical and smoothed_empirical."""
+        import astropy.io.fits as fits
+
+        from pyspextool.instruments.ishell.arc_tracing import trace_arc_lines
+        from pyspextool.instruments.ishell.calibrations import (
+            read_line_list,
+            read_wavecalinfo,
+        )
+        from pyspextool.instruments.ishell.rectification_indices import (
+            build_rectification_indices,
+        )
+        from pyspextool.instruments.ishell.rectified_orders import (
+            build_rectified_orders,
+        )
+        from pyspextool.instruments.ishell.tracing import trace_orders_from_flat
+        from pyspextool.instruments.ishell.wavecal_2d import (
+            fit_provisional_wavelength_map,
+        )
+        from pyspextool.instruments.ishell.wavecal_2d_refine import (
+            fit_refined_coefficient_surface,
+        )
+
+        flat_trace = trace_orders_from_flat(_H1_FLAT_FILES, col_range=(650, 1550))
+        geom = flat_trace.to_order_geometry_set("H1", col_range=(650, 1550))
+        arc_result = trace_arc_lines(_H1_ARC_FILES, geom)
+        wci = read_wavecalinfo("H1")
+        ll = read_line_list("H1")
+        wav_map = fit_provisional_wavelength_map(
+            arc_result, wci, ll, dispersion_degree=3
+        )
+        surface = fit_refined_coefficient_surface(wav_map, disp_degree=3)
+        rect_indices = build_rectification_indices(geom, surface, wav_map=wav_map)
+        with fits.open(_H1_FLAT_FILES[0]) as hdul:
+            detector_image = hdul[0].data.astype(float)
+        rectified = build_rectified_orders(detector_image, rect_indices)
+
+        var_model = VarianceModelDefinition(
+            read_noise_electron=11.0, gain_e_per_adu=1.8
+        )
+        ed_emp = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.2,
+            background_inner=0.3,
+            background_outer=0.45,
+            profile_mode="global_median",
+            profile_source="empirical",
+        )
+        ed_sm = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.2,
+            background_inner=0.3,
+            background_outer=0.45,
+            profile_mode="global_median",
+            profile_source="smoothed_empirical",
+            profile_smooth_sigma=1.0,
+        )
+        r_emp = extract_weighted_optimal(
+            rectified, ed_emp,
+            variance_model=var_model, subtract_background=True,
+        )
+        r_sm = extract_weighted_optimal(
+            rectified, ed_sm,
+            variance_model=var_model, subtract_background=True,
+        )
+        return r_emp, r_sm, rectified
+
+    def test_no_crashes(self, h1_profile_source_results):
+        """Empirical and smoothed_empirical both complete without error."""
+        r_emp, r_sm, _ = h1_profile_source_results
+        assert r_emp is not None
+        assert r_sm is not None
+
+    def test_output_shapes_identical(self, h1_profile_source_results):
+        """Output array shapes are identical for both profile sources."""
+        r_emp, r_sm, _ = h1_profile_source_results
+        for sp_e, sp_s in zip(r_emp.spectra, r_sm.spectra):
+            assert sp_e.flux.shape == sp_s.flux.shape
+            assert sp_e.variance.shape == sp_s.variance.shape
+            assert sp_e.profile.shape == sp_s.profile.shape
+
+    def test_spectra_well_formed(self, h1_profile_source_results):
+        """Spectra and variance arrays are well-formed for both profile sources."""
+        r_emp, r_sm, _ = h1_profile_source_results
+        for result in (r_emp, r_sm):
+            for sp in result.spectra:
+                finite_frac = np.mean(np.isfinite(sp.flux))
+                assert finite_frac > 0.5, (
+                    f"Order {sp.order}: fewer than 50% of flux values are finite "
+                    f"(profile_source={sp.profile_source_used!r})."
+                )
+                fin_var = sp.variance[np.isfinite(sp.variance)]
+                if len(fin_var) > 0:
+                    assert np.all(fin_var >= 0.0), (
+                        f"Order {sp.order}: negative variance "
+                        f"(profile_source={sp.profile_source_used!r})."
+                    )
+
+    def test_bookkeeping_consistent(self, h1_profile_source_results):
+        """profile_source_used and profile_smoothed are correctly populated."""
+        r_emp, r_sm, _ = h1_profile_source_results
+        for sp in r_emp.spectra:
+            assert sp.profile_source_used == "empirical"
+            assert sp.profile_smoothed is False
+        for sp in r_sm.spectra:
+            assert sp.profile_source_used == "smoothed_empirical"
+            assert sp.profile_smoothed is True

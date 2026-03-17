@@ -1,11 +1,13 @@
 """
 Proto-Horne variance-weighted optimal-extraction scaffold for iSHELL 2DXD reduction.
 
-This module implements **Stages 17, 18, and 19** of the iSHELL 2DXD reduction
-scaffold.  Stage 17 introduced proto-Horne inverse-variance weighted extraction
-using the existing profile estimate and a per-pixel variance image.  Stage 18
-adds an optional iterative sigma-clipping outlier-rejection loop.  Stage 19
-adds an optional profile re-estimation step inside the rejection loop.
+This module implements **Stages 17, 18, 19, and 20** of the iSHELL 2DXD
+reduction scaffold.  Stage 17 introduced proto-Horne inverse-variance weighted
+extraction using the existing profile estimate and a per-pixel variance image.
+Stage 18 adds an optional iterative sigma-clipping outlier-rejection loop.
+Stage 19 adds an optional profile re-estimation step inside the rejection loop.
+Stage 20 adds support for smoothed-empirical and externally supplied spatial
+profiles as alternative profile sources for the weighted extraction.
 
 .. note::
     This is a **scaffold implementation**.  It is intentionally simple and
@@ -70,6 +72,9 @@ Pipeline stage summary
    * - **19**
      - **``weighted_optimal_extraction.py``**
      - **Profile re-estimation after iterative rejection (this module)**
+   * - **20**
+     - **``weighted_optimal_extraction.py``**
+     - **Smoothed / external profile sources (this module)**
 
 What this module does
 ---------------------
@@ -87,13 +92,23 @@ What this module does
 
   3. Resolves a variance image (see **Variance source priority** below).
 
-  4. Estimates a provisional spatial profile using one of two modes:
+  4. Estimates a provisional spatial profile using one of three **profile
+     source** modes (controlled by ``profile_source`` in
+     :class:`WeightedExtractionDefinition`):
 
-     - ``"global_median"``: per-row median of the aperture sub-image
-       across all spectral columns (robust to spectral features).
+     - ``"empirical"`` (default): estimate the profile from the aperture
+       sub-image using *profile_mode* (``"global_median"`` or
+       ``"columnwise"``).
 
-     - ``"columnwise"``: estimated independently per spectral column
-       (tracks wavelength-dependent profile variation, noisier).
+     - ``"smoothed_empirical"``: estimate the empirical profile then apply
+       a Gaussian smoothing kernel along the **spatial axis** with standard
+       deviation *profile_smooth_sigma* pixels.  Smoothing reduces
+       sensitivity to single-pixel outliers in the profile.
+
+     - ``"external"``: use the caller-supplied *external_profile* array
+       instead of estimating from the data.  The profile is normalized
+       (when *normalize_profile* is ``True``) but never re-estimated during
+       iterative rejection.
 
   5. Normalizes the profile so its spatial sum equals 1.0 per column
      (when *normalize_profile* is ``True``).
@@ -145,8 +160,10 @@ What this module does NOT do (by design)
   re-estimation after each rejection step (when *reestimate_profile* is
   ``True``), but does not iterate to full convergence of the joint
   (profile, rejection mask) pair as in Horne (1986).
-* **No PSF fitting beyond the empirical profile estimate** – profile is
-  estimated directly from the data as in Stage 12.
+* **No PSF fitting beyond the empirical/smoothed profile estimate** –
+  ``"empirical"`` and ``"smoothed_empirical"`` profiles are still estimated
+  directly from the data being extracted.  ``"external"`` is the first
+  scaffold step toward a truly independent profile source.
 * **No automatic aperture centroiding** – center and radius are explicit.
 * **No sophisticated sky modelling** – simple per-column median subtraction.
 * **No correlated noise propagation** – only diagonal (per-pixel) variance.
@@ -189,6 +206,7 @@ from typing import Optional
 
 import numpy as np
 import numpy.typing as npt
+from scipy.ndimage import gaussian_filter1d
 
 from .rectified_orders import RectifiedOrderSet
 from .variance_model import (
@@ -206,6 +224,9 @@ __all__ = [
 
 # Supported profile estimation modes.
 _VALID_PROFILE_MODES = {"global_median", "columnwise"}
+
+# Supported profile source identifiers (Stage 20).
+_VALID_PROFILE_SOURCES = {"empirical", "smoothed_empirical", "external"}
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +263,9 @@ class WeightedExtractionDefinition:
         ``background_outer > background_inner`` when provided.  Must be
         ``None`` if *background_inner* is ``None``.
     profile_mode : str, optional
-        How to estimate the spatial profile inside the aperture.  One of:
+        How to estimate the spatial profile inside the aperture when
+        *profile_source* is ``"empirical"`` or ``"smoothed_empirical"``.
+        One of:
 
         ``"global_median"`` (default)
             The profile is the per-row median of the aperture sub-image
@@ -252,9 +275,12 @@ class WeightedExtractionDefinition:
         ``"columnwise"``
             The profile is estimated independently for each spectral
             column.  Tracks profile variation with wavelength but is noisier.
+
+        Ignored when *profile_source* is ``"external"``.
     normalize_profile : bool, optional
         If ``True`` (default), normalize the profile so that its spatial
         sum equals 1.0 per column before computing the weighted extraction.
+        Applied to all profile sources, including ``"external"``.
     use_variance_model : bool, optional
         If ``True``, the *variance_model* embedded in this definition will
         be used as a fallback variance source when no *variance_image* or
@@ -294,6 +320,54 @@ class WeightedExtractionDefinition:
         the Horne (1986) iterative scheme but is still a scaffold
         simplification (no full convergence criterion).
 
+        When *profile_source* is ``"external"``, this flag is **ignored**:
+        the external profile is always kept fixed regardless of rejections.
+        When *profile_source* is ``"smoothed_empirical"``, re-estimation
+        re-estimates the empirical profile and re-applies smoothing.
+    profile_source : str, optional
+        Controls where the spatial profile comes from.  One of:
+
+        ``"empirical"`` (default)
+            Estimate the profile from the current aperture data using
+            *profile_mode*.  This is the original Stage 17–19 behavior.
+
+        ``"smoothed_empirical"``
+            Estimate the empirical profile then apply a Gaussian smoothing
+            kernel along the **spatial axis** with standard deviation
+            *profile_smooth_sigma* pixels.  Smoothing reduces sensitivity
+            to single-pixel outliers in the profile.  If
+            *profile_smooth_sigma* is 0, the result is identical to
+            ``"empirical"``.
+
+        ``"external"``
+            Use the caller-supplied *external_profile* array instead of
+            estimating from the data.  The profile must have shape
+            ``(n_ap_spatial, n_spectral)``, ``(n_ap_spatial, 1)``, or
+            ``(n_ap_spatial,)``; the latter two are broadcast across all
+            spectral columns.  *profile_mode* is ignored.  The profile is
+            normalized when *normalize_profile* is ``True`` but is never
+            re-estimated inside the iterative rejection loop.
+    external_profile : ndarray or None, optional
+        Caller-supplied spatial profile array.  **Required** when
+        *profile_source* is ``"external"``; must be ``None`` for all other
+        profile sources.  Accepted shapes:
+
+        - ``(n_ap_spatial, n_spectral)`` — full 2-D profile.
+        - ``(n_ap_spatial, 1)`` — same profile for all columns (broadcast).
+        - ``(n_ap_spatial,)`` — 1-D profile, same for all columns.
+
+        Here *n_ap_spatial* is the number of spatial pixels selected by
+        the aperture mask (determined at extraction time).  Shape is
+        validated when :func:`extract_weighted_optimal` is called, not
+        here, because the aperture size is unknown at definition time.
+    profile_smooth_sigma : float, optional
+        Standard deviation of the Gaussian smoothing kernel applied along
+        the **spatial axis** when *profile_source* is
+        ``"smoothed_empirical"``.  Must be >= 0.  Defaults to 0.0 (no
+        smoothing, identical to ``"empirical"``).  Smoothing is performed
+        with ``scipy.ndimage.gaussian_filter1d(..., axis=0,
+        mode='reflect')``.  Ignored for other profile sources.
+
     Notes
     -----
     The aperture region is symmetric about *center_frac*.  The background
@@ -318,6 +392,9 @@ class WeightedExtractionDefinition:
     sigma_clip: float = 5.0
     min_valid_pixels: int = 2
     reestimate_profile: bool = False
+    profile_source: str = "empirical"
+    external_profile: Optional[npt.NDArray] = None
+    profile_smooth_sigma: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate extraction-definition parameters."""
@@ -373,6 +450,29 @@ class WeightedExtractionDefinition:
         if self.min_valid_pixels < 1:
             raise ValueError(
                 f"min_valid_pixels must be >= 1; got {self.min_valid_pixels!r}."
+            )
+        # Stage 20: validate profile source fields.
+        if self.profile_source not in _VALID_PROFILE_SOURCES:
+            raise ValueError(
+                f"profile_source must be one of "
+                f"{sorted(_VALID_PROFILE_SOURCES)!r}; "
+                f"got {self.profile_source!r}."
+            )
+        if self.profile_smooth_sigma < 0.0:
+            raise ValueError(
+                f"profile_smooth_sigma must be >= 0; "
+                f"got {self.profile_smooth_sigma!r}."
+            )
+        if self.profile_source == "external" and self.external_profile is None:
+            raise ValueError(
+                "profile_source='external' requires external_profile to be "
+                "provided; got None."
+            )
+        if self.profile_source != "external" and self.external_profile is not None:
+            raise ValueError(
+                "external_profile is provided but profile_source is "
+                f"{self.profile_source!r}; set profile_source='external' "
+                "to use the supplied profile, or set external_profile=None."
             )
 
     @property
@@ -442,13 +542,25 @@ class WeightedExtractedOrderSpectrum:
         surviving pixels during at least one rejection iteration.  Always
         ``False`` when *reject_outliers* is ``False`` or *reestimate_profile*
         is ``False``, and also ``False`` if no pixels were rejected (so
-        re-estimation never triggered).
+        re-estimation never triggered).  Always ``False`` when
+        *profile_source* is ``"external"`` (the external profile is kept
+        fixed regardless of rejections).
     initial_profile : ndarray or None, shape (n_ap_spatial, n_spectral)
         The spatial profile computed from the original data before any
         rejection-driven re-estimation.  Only populated (non-``None``) when
         *profile_reestimated* is ``True``.  ``None`` otherwise.  Provided so
         callers can compare the initial and final profiles when re-estimation
         is active.
+    profile_source_used : str
+        The value of *profile_source* that was actually used for this order's
+        extraction.  One of ``"empirical"``, ``"smoothed_empirical"``, or
+        ``"external"``.  Useful when inspecting results from a batch of
+        extractions with different definitions.
+    profile_smoothed : bool
+        ``True`` if Gaussian smoothing was applied to the profile
+        (i.e. *profile_source* was ``"smoothed_empirical"`` and
+        *profile_smooth_sigma* > 0).  ``False`` for all other profile
+        sources or when *profile_smooth_sigma* == 0.
 
     Notes
     -----
@@ -472,6 +584,8 @@ class WeightedExtractedOrderSpectrum:
     n_iterations_used: int = 0
     profile_reestimated: bool = False
     initial_profile: Optional[npt.NDArray] = None  # shape (n_ap_spatial, n_spectral)
+    profile_source_used: str = "empirical"
+    profile_smoothed: bool = False
 
     @property
     def n_spectral(self) -> int:
@@ -625,6 +739,147 @@ def _estimate_profile(
     return profile
 
 
+def _smooth_profile(
+    profile: npt.NDArray,
+    sigma: float,
+    normalize_profile: bool,
+) -> npt.NDArray:
+    """Smooth the spatial profile with a Gaussian kernel along the spatial axis.
+
+    Smoothing is applied along **axis 0** (the spatial axis) using
+    ``scipy.ndimage.gaussian_filter1d`` with ``mode='reflect'``.  NaN values
+    are filled with zero before filtering and restored afterward; this means
+    that fully-NaN spectral columns remain NaN after smoothing.
+
+    Parameters
+    ----------
+    profile : ndarray, shape (n_ap_spatial, n_spectral)
+        Estimated (possibly unnormalized) profile to smooth.  May contain
+        NaN where the aperture is empty.
+    sigma : float
+        Gaussian kernel standard deviation in spatial pixels.  When <= 0,
+        smoothing is skipped (only normalization is applied).
+    normalize_profile : bool
+        If ``True``, renormalize the smoothed profile so that each column
+        sums to 1.0.  Columns with zero or NaN sum are set to NaN.
+
+    Returns
+    -------
+    ndarray, shape (n_ap_spatial, n_spectral)
+        Smoothed (and optionally renormalized) profile.  Negative values
+        introduced by the Gaussian kernel are clipped to zero.
+
+    Notes
+    -----
+    Smoothing is performed along the **spatial axis only** (axis 0).  This
+    choice preserves spectral information: each wavelength column is smoothed
+    independently, so spectral features are not mixed across columns.
+    """
+    nan_mask = ~np.isfinite(profile)
+    if sigma > 0.0:
+        # Replace NaN with 0 before filtering to avoid NaN propagation.
+        filled = np.where(nan_mask, 0.0, profile)
+        smoothed = gaussian_filter1d(filled, sigma=sigma, axis=0, mode="reflect")
+        # Restore NaN where the original was NaN.
+        smoothed[nan_mask] = np.nan
+    else:
+        smoothed = profile.copy()
+
+    # Clip any negatives introduced by the Gaussian kernel at boundaries.
+    smoothed = np.where(np.isfinite(smoothed), np.maximum(smoothed, 0.0), np.nan)
+
+    if normalize_profile:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            col_sums = np.nansum(smoothed, axis=0)  # (n_spectral,)
+        zero_or_nan = (col_sums == 0.0) | (~np.isfinite(col_sums))
+        safe_sums = np.where(zero_or_nan, 1.0, col_sums)
+        smoothed = smoothed / safe_sums[np.newaxis, :]
+        smoothed[:, zero_or_nan] = np.nan
+
+    return smoothed
+
+
+def _prepare_external_profile(
+    ext_profile: npt.NDArray,
+    n_ap: int,
+    n_spectral: int,
+    normalize_profile: bool,
+) -> npt.NDArray:
+    """Validate, broadcast, and normalize a caller-supplied external profile.
+
+    Parameters
+    ----------
+    ext_profile : ndarray
+        Caller-supplied profile.  Accepted shapes:
+
+        - ``(n_ap, n_spectral)`` — full 2-D profile.
+        - ``(n_ap, 1)`` — same profile for all columns (broadcast).
+        - ``(n_ap,)`` — 1-D profile, same for all columns.
+    n_ap : int
+        Expected number of aperture spatial pixels (first dimension).
+    n_spectral : int
+        Number of spectral columns (second dimension after broadcast).
+    normalize_profile : bool
+        If ``True``, normalize each column to sum to 1.0.  Columns with
+        zero or NaN sum are set to NaN.
+
+    Returns
+    -------
+    ndarray, shape (n_ap, n_spectral)
+        Validated, broadcast, and optionally normalized profile.  Negative
+        values are clipped to zero.
+
+    Raises
+    ------
+    ValueError
+        If *ext_profile* has an incompatible shape.
+    """
+    p = np.asarray(ext_profile, dtype=float)
+
+    # Handle 1-D input: (n_ap,) → (n_ap, 1) for broadcasting.
+    if p.ndim == 1:
+        if p.shape[0] != n_ap:
+            raise ValueError(
+                f"external_profile 1-D shape {p.shape} is incompatible with "
+                f"aperture size n_ap={n_ap}; expected ({n_ap},)."
+            )
+        p = p[:, np.newaxis]  # (n_ap, 1)
+
+    if p.ndim != 2:
+        raise ValueError(
+            f"external_profile must be 1-D or 2-D; got shape {p.shape}."
+        )
+    if p.shape[0] != n_ap:
+        raise ValueError(
+            f"external_profile first dimension {p.shape[0]} does not match "
+            f"aperture size n_ap={n_ap}."
+        )
+    if p.shape[1] not in (1, n_spectral):
+        raise ValueError(
+            f"external_profile second dimension {p.shape[1]} is incompatible "
+            f"with n_spectral={n_spectral}; expected 1 or {n_spectral}."
+        )
+
+    # Broadcast to full (n_ap, n_spectral) shape and take a writable copy.
+    profile = np.broadcast_to(p, (n_ap, n_spectral)).copy()
+
+    # Clip negatives to zero; preserve NaN.
+    finite_mask = np.isfinite(profile)
+    profile = np.where(finite_mask, np.maximum(profile, 0.0), np.nan)
+
+    if normalize_profile:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            col_sums = np.nansum(profile, axis=0)  # (n_spectral,)
+        zero_or_nan = (col_sums == 0.0) | (~np.isfinite(col_sums))
+        safe_sums = np.where(zero_or_nan, 1.0, col_sums)
+        profile = profile / safe_sums[np.newaxis, :]
+        profile[:, zero_or_nan] = np.nan
+
+    return profile
+
+
 def _horne_weighted_extract(
     profile: npt.NDArray,
     flux_ap: npt.NDArray,
@@ -716,6 +971,8 @@ def _iterative_outlier_rejection(
     reestimate_profile: bool = False,
     profile_mode: str = "global_median",
     normalize_profile: bool = True,
+    profile_source: str = "empirical",
+    profile_smooth_sigma: float = 0.0,
 ) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray, int, int, npt.NDArray, bool]:
     """Apply iterative sigma-clipping outlier rejection within the aperture.
 
@@ -733,10 +990,13 @@ def _iterative_outlier_rejection(
        - Per-column: if rejecting all candidates would leave fewer than
          *min_valid_pixels* valid pixels, skip the entire column.
 
-    6. If *reestimate_profile* is ``True``, re-estimate the spatial profile
-       from the currently surviving (non-rejected) pixels after committing
-       rejections.  The updated profile is used in subsequent iterations and
-       for the final extraction.
+    6. If *reestimate_profile* is ``True`` **and** *profile_source* is not
+       ``"external"``, re-estimate the spatial profile from the currently
+       surviving (non-rejected) pixels after committing rejections.  For
+       ``"smoothed_empirical"``, the re-estimated profile is additionally
+       smoothed with the same *profile_smooth_sigma*.  When *profile_source*
+       is ``"external"``, the profile is **always kept fixed** regardless of
+       *reestimate_profile*.
 
     7. Stop early if no new pixels were rejected in the last iteration.
 
@@ -745,7 +1005,8 @@ def _iterative_outlier_rejection(
     profile : ndarray, shape (n_ap, n_spectral)
         Spatial profile array (optionally normalized).  Used as the initial
         profile for the first iteration.  Updated after each rejection step
-        when *reestimate_profile* is ``True``.
+        when *reestimate_profile* is ``True`` and *profile_source* is not
+        ``"external"``.
     flux_ap : ndarray, shape (n_ap, n_spectral)
         Aperture flux sub-image.  Pixels already bad (NaN) are treated as
         initially masked and are never re-introduced.
@@ -759,14 +1020,27 @@ def _iterative_outlier_rejection(
         Minimum valid pixels that must remain per column after rejection.
     reestimate_profile : bool, optional
         If ``True``, re-estimate the spatial profile from the surviving pixels
-        after each rejection step.  The re-estimation uses *profile_mode* and
-        *normalize_profile*.  Defaults to ``False`` (Stage 18 behavior).
+        after each rejection step.  Ignored when *profile_source* is
+        ``"external"`` (the external profile is always kept fixed).  Defaults
+        to ``False`` (Stage 18 behavior).
     profile_mode : str, optional
         Profile estimation mode (``"global_median"`` or ``"columnwise"``).
-        Only used when *reestimate_profile* is ``True``.
+        Only used when *reestimate_profile* is ``True`` and *profile_source*
+        is not ``"external"``.
     normalize_profile : bool, optional
         Whether to normalize the re-estimated profile.  Only used when
-        *reestimate_profile* is ``True``.
+        *reestimate_profile* is ``True`` and *profile_source* is not
+        ``"external"``.
+    profile_source : str, optional
+        Profile source identifier (``"empirical"``, ``"smoothed_empirical"``,
+        or ``"external"``).  When ``"external"``, *reestimate_profile* is
+        ignored and the profile is never updated.  When
+        ``"smoothed_empirical"``, re-estimation additionally applies Gaussian
+        smoothing with *profile_smooth_sigma*.  Defaults to ``"empirical"``.
+    profile_smooth_sigma : float, optional
+        Gaussian smoothing sigma (in spatial pixels) applied during
+        re-estimation when *profile_source* is ``"smoothed_empirical"``.
+        Defaults to 0.0 (no smoothing).
 
     Returns
     -------
@@ -783,12 +1057,14 @@ def _iterative_outlier_rejection(
         Number of iterations performed (1 even if no rejections occurred).
     final_profile : ndarray, shape (n_ap, n_spectral)
         The spatial profile used at the end of the rejection loop.  Equal to
-        the input *profile* if *reestimate_profile* is ``False`` or if no
-        rejections occurred.  Otherwise the re-estimated profile.
+        the input *profile* if *reestimate_profile* is ``False``, if
+        *profile_source* is ``"external"``, or if no rejections occurred.
+        Otherwise the re-estimated (and optionally smoothed) profile.
     profile_was_reestimated : bool
         ``True`` if the profile was actually re-estimated at least once
-        (i.e. *reestimate_profile* was ``True`` and at least one rejection
-        was committed).
+        (i.e. *reestimate_profile* was ``True``, *profile_source* is not
+        ``"external"``, and at least one rejection was committed).  Always
+        ``False`` when *profile_source* is ``"external"``.
 
     Notes
     -----
@@ -796,6 +1072,11 @@ def _iterative_outlier_rejection(
     re-estimated after each rejection.  This is the Stage 18 scaffold
     behavior.  Setting *reestimate_profile* to ``True`` moves the scaffold
     one step closer to the Horne (1986) iterative scheme.
+
+    When *profile_source* is ``"external"``, the caller-supplied profile is
+    treated as fixed ground truth and is never updated inside the loop.
+    This is the intended behavior: the external profile is assumed to come
+    from a higher-S/N independent source.
     """
     n_ap, n_spectral = flux_ap.shape
 
@@ -810,7 +1091,8 @@ def _iterative_outlier_rejection(
     flux_work = np.where(initially_bad, np.nan, flux_ap)
     var_work = np.where(initially_bad, np.nan, var_ap)
 
-    # Working profile — may be updated when reestimate_profile=True.
+    # Working profile — may be updated when reestimate_profile=True and
+    # profile_source != "external".
     profile_work = profile.copy()
     profile_was_reestimated = False
 
@@ -870,11 +1152,17 @@ def _iterative_outlier_rejection(
         var_work = np.where(new_bad, np.nan, var_work)
         n_rejected += int(np.sum(new_bad))
 
-        # Re-estimate profile from surviving pixels (Stage 19, optional).
-        if reestimate_profile:
+        # Re-estimate profile from surviving pixels (Stage 19 / Stage 20).
+        # When profile_source="external", the caller-supplied profile is
+        # kept fixed regardless of reestimate_profile.
+        if reestimate_profile and profile_source != "external":
             profile_work = _estimate_profile(
                 flux_work, profile_mode, normalize_profile
             )
+            if profile_source == "smoothed_empirical":
+                profile_work = _smooth_profile(
+                    profile_work, profile_smooth_sigma, normalize_profile
+                )
             profile_was_reestimated = True
 
     return (
@@ -1114,14 +1402,40 @@ def extract_weighted_optimal(
         if var_bg_col is not None:
             var_ap = var_ap + var_bg_col[np.newaxis, :]
 
-        # -- Profile estimation --
-        profile = _estimate_profile(
-            flux_ap,
-            profile_mode=extraction_def.profile_mode,
-            normalize_profile=extraction_def.normalize_profile,
-        )
+        # -- Profile estimation (Stage 20: dispatch on profile_source) --
+        p_source = extraction_def.profile_source
+        p_sigma = extraction_def.profile_smooth_sigma
+        profile_smoothed_flag = False
 
-        # -- Iterative outlier rejection (Stage 18, optional) --
+        if p_source == "external":
+            # Use caller-supplied external profile; normalize if requested.
+            profile = _prepare_external_profile(
+                extraction_def.external_profile,
+                n_ap,
+                n_spectral,
+                extraction_def.normalize_profile,
+            )
+        elif p_source == "smoothed_empirical":
+            # Estimate empirical profile (without normalization), then smooth
+            # (which also handles normalization).
+            raw_profile = _estimate_profile(
+                flux_ap,
+                profile_mode=extraction_def.profile_mode,
+                normalize_profile=False,
+            )
+            profile = _smooth_profile(
+                raw_profile, p_sigma, extraction_def.normalize_profile
+            )
+            profile_smoothed_flag = p_sigma > 0.0
+        else:
+            # "empirical" (default): existing behavior.
+            profile = _estimate_profile(
+                flux_ap,
+                profile_mode=extraction_def.profile_mode,
+                normalize_profile=extraction_def.normalize_profile,
+            )
+
+        # -- Iterative outlier rejection (Stage 18/19/20, optional) --
         n_rejected = 0
         n_iter_used = 0
         final_mask_ap: Optional[npt.NDArray] = None
@@ -1148,6 +1462,8 @@ def extract_weighted_optimal(
                 reestimate_profile=extraction_def.reestimate_profile,
                 profile_mode=extraction_def.profile_mode,
                 normalize_profile=extraction_def.normalize_profile,
+                profile_source=p_source,
+                profile_smooth_sigma=p_sigma,
             )
             final_mask_ap = rejection_mask
             # Only keep initial_profile when re-estimation actually happened.
@@ -1176,6 +1492,8 @@ def extract_weighted_optimal(
                 n_iterations_used=n_iter_used,
                 profile_reestimated=profile_reestimated,
                 initial_profile=initial_profile_ap,
+                profile_source_used=p_source,
+                profile_smoothed=profile_smoothed_flag,
             )
         )
 
