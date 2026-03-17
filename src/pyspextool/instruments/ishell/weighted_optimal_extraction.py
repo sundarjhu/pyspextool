@@ -1,9 +1,10 @@
 """
 Proto-Horne variance-weighted optimal-extraction scaffold for iSHELL 2DXD reduction.
 
-This module implements the **seventeenth stage** of the iSHELL 2DXD reduction
-scaffold: a first proto-Horne inverse-variance weighted extraction pass using
-the existing profile estimate and a per-pixel variance image.
+This module implements **Stages 17 and 18** of the iSHELL 2DXD reduction
+scaffold.  Stage 17 introduced proto-Horne inverse-variance weighted extraction
+using the existing profile estimate and a per-pixel variance image.  Stage 18
+adds an optional iterative sigma-clipping outlier-rejection loop.
 
 .. note::
     This is a **scaffold implementation**.  It is intentionally simple and
@@ -62,6 +63,9 @@ Pipeline stage summary
    * - **17**
      - **``weighted_optimal_extraction.py``**
      - **Proto-Horne variance-weighted extraction (this module)**
+   * - **18**
+     - **``weighted_optimal_extraction.py``**
+     - **Iterative sigma-clipping outlier rejection (this module)**
 
 What this module does
 ---------------------
@@ -133,7 +137,9 @@ Stage-12 unweighted estimator for the flux, but the variance formula differs:
 
 What this module does NOT do (by design)
 -----------------------------------------
-* **No iterative cosmic-ray / bad-pixel rejection** – a single pass only.
+* **No full Horne iterative profile re-estimation** – the spatial profile is
+  estimated once from the initial data and held fixed; it is not updated after
+  each rejection iteration.
 * **No PSF fitting beyond the empirical profile estimate** – profile is
   estimated directly from the data as in Stage 12.
 * **No automatic aperture centroiding** – center and radius are explicit.
@@ -253,6 +259,26 @@ class WeightedExtractionDefinition:
     variance_model : :class:`~pyspextool.instruments.ishell.variance_model.VarianceModelDefinition` or None, optional
         Embedded noise-model definition used when *use_variance_model* is
         ``True``.  Must be ``None`` when *use_variance_model* is ``False``.
+    reject_outliers : bool, optional
+        If ``True``, apply an iterative sigma-clipping outlier-rejection
+        loop after the initial profile estimation.  Defaults to ``False``.
+        When ``False``, behavior is identical to Stage 17 (single extraction
+        pass, no rejection).
+    max_iterations : int, optional
+        Maximum number of sigma-clipping iterations.  Must be >= 1.
+        Defaults to 3.  The loop may stop earlier if no new pixels are
+        rejected.
+    sigma_clip : float, optional
+        Rejection threshold in units of normalized residuals
+        (``|residual| / sqrt(variance)``).  Must be > 0.  Defaults to 5.0.
+        Pixels with normalized residuals exceeding *sigma_clip* are marked
+        as bad and excluded from subsequent iterations.
+    min_valid_pixels : int, optional
+        Minimum number of valid (unmasked) aperture pixels that must remain
+        in a spectral column after rejection.  Must be >= 1.  Defaults to
+        2.  If rejecting all outlier candidates in a column would leave
+        fewer than *min_valid_pixels* valid pixels, no pixels are rejected
+        in that column for that iteration.
 
     Notes
     -----
@@ -273,6 +299,10 @@ class WeightedExtractionDefinition:
     normalize_profile: bool = True
     use_variance_model: bool = False
     variance_model: Optional[VarianceModelDefinition] = None
+    reject_outliers: bool = False
+    max_iterations: int = 3
+    sigma_clip: float = 5.0
+    min_valid_pixels: int = 2
 
     def __post_init__(self) -> None:
         """Validate extraction-definition parameters."""
@@ -316,6 +346,18 @@ class WeightedExtractionDefinition:
                 "variance_model is provided but use_variance_model=False; "
                 "set use_variance_model=True to use the embedded model, "
                 "or set variance_model=None."
+            )
+        if self.max_iterations < 1:
+            raise ValueError(
+                f"max_iterations must be >= 1; got {self.max_iterations!r}."
+            )
+        if self.sigma_clip <= 0.0:
+            raise ValueError(
+                f"sigma_clip must be > 0; got {self.sigma_clip!r}."
+            )
+        if self.min_valid_pixels < 1:
+            raise ValueError(
+                f"min_valid_pixels must be >= 1; got {self.min_valid_pixels!r}."
             )
 
     @property
@@ -366,6 +408,20 @@ class WeightedExtractedOrderSpectrum:
         The 2-D weight array ``P^2 / V`` used in the extraction, or ``None``
         if weights were not stored.  Pixels excluded by the bad-pixel mask
         have weight zero.
+    n_rejected_pixels : int
+        Number of aperture pixels rejected by the iterative outlier-rejection
+        loop.  Zero if *reject_outliers* was ``False`` in the extraction
+        definition or no rejections occurred.
+    final_mask : ndarray of bool or None, shape (n_ap_spatial, n_spectral)
+        Boolean array marking pixels rejected by the iterative rejection loop
+        (``True`` = rejected).  ``None`` when *reject_outliers* is ``False``
+        or the aperture is empty.  Does not include pixels that were already
+        invalid before the rejection loop (non-finite data / variance, user
+        mask).
+    n_iterations_used : int
+        Number of rejection iterations actually performed.  Zero if
+        *reject_outliers* was ``False``.  May be less than *max_iterations*
+        if the loop stopped early due to no new rejections.
 
     Notes
     -----
@@ -384,6 +440,9 @@ class WeightedExtractedOrderSpectrum:
     method: str
     n_pixels_used: int
     weights: Optional[npt.NDArray] = None  # shape (n_ap_spatial, n_spectral)
+    n_rejected_pixels: int = 0
+    final_mask: Optional[npt.NDArray] = None  # shape (n_ap_spatial, n_spectral)
+    n_iterations_used: int = 0
 
     @property
     def n_spectral(self) -> int:
@@ -615,6 +674,142 @@ def _horne_weighted_extract(
     var_1d[valid_cols] = 1.0 / sum_weights[valid_cols]
 
     return flux_1d, var_1d, weights
+
+
+def _iterative_outlier_rejection(
+    profile: npt.NDArray,
+    flux_ap: npt.NDArray,
+    var_ap: npt.NDArray,
+    *,
+    sigma_clip: float,
+    max_iterations: int,
+    min_valid_pixels: int,
+) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray, int, int]:
+    """Apply iterative sigma-clipping outlier rejection within the aperture.
+
+    For each iteration:
+
+    1. Compute the weighted extracted flux for each spectral column using the
+       current pixel mask.
+    2. Build a model image: ``model = profile * flux_1d``.
+    3. Compute residuals: ``resid = data - model``.
+    4. Normalize residuals: ``norm_resid = resid / sqrt(variance)``.
+    5. Mark pixels with ``|norm_resid| > sigma_clip`` as bad, subject to:
+
+       - Only within aperture pixels that are not already bad.
+       - Only where variance is finite and > 0.
+       - Per-column: if rejecting all candidates would leave fewer than
+         *min_valid_pixels* valid pixels, skip the entire column.
+
+    6. Stop early if no new pixels were rejected in the last iteration.
+
+    Parameters
+    ----------
+    profile : ndarray, shape (n_ap, n_spectral)
+        Spatial profile array (optionally normalized).  Held fixed throughout
+        the iteration; the profile is not re-estimated after rejection.
+    flux_ap : ndarray, shape (n_ap, n_spectral)
+        Aperture flux sub-image.  Pixels already bad (NaN) are treated as
+        initially masked and are never re-introduced.
+    var_ap : ndarray, shape (n_ap, n_spectral)
+        Per-pixel variance within the aperture.  Must be positive where valid.
+    sigma_clip : float
+        Rejection threshold in units of normalized residuals.
+    max_iterations : int
+        Maximum number of iterations.  The loop may stop earlier.
+    min_valid_pixels : int
+        Minimum valid pixels that must remain per column after rejection.
+
+    Returns
+    -------
+    flux_ap_out : ndarray, shape (n_ap, n_spectral)
+        Updated aperture flux with newly rejected pixels replaced by NaN.
+    var_ap_out : ndarray, shape (n_ap, n_spectral)
+        Updated aperture variance with newly rejected pixels replaced by NaN.
+    reject_mask : ndarray of bool, shape (n_ap, n_spectral)
+        Boolean array where ``True`` indicates a pixel was rejected by this
+        function.  Does not include pixels that were already NaN on input.
+    n_rejected : int
+        Total number of pixels rejected across all iterations.
+    n_iterations_used : int
+        Number of iterations performed (1 even if no rejections occurred).
+
+    Notes
+    -----
+    The spatial profile is **not** re-estimated after each rejection.  This is
+    a scaffold simplification; a full Horne (1986) implementation would
+    iterate the profile estimate as well.
+    """
+    n_ap, n_spectral = flux_ap.shape
+
+    # Track which pixels were already invalid on entry (NaN/non-positive var).
+    # These are never counted as new rejections.
+    initially_bad = ~np.isfinite(flux_ap) | ~np.isfinite(var_ap) | (var_ap <= 0.0)
+
+    # reject_mask accumulates pixels rejected by this function only.
+    reject_mask = np.zeros((n_ap, n_spectral), dtype=bool)
+
+    # Working copies — we NaN-out newly rejected pixels here.
+    flux_work = np.where(initially_bad, np.nan, flux_ap)
+    var_work = np.where(initially_bad, np.nan, var_ap)
+
+    n_rejected = 0
+    n_iterations_used = 0
+
+    for iteration in range(max_iterations):
+        n_iterations_used += 1
+
+        # Extract current best-estimate 1-D spectrum.
+        flux_1d, _, _ = _horne_weighted_extract(profile, flux_work, var_work)
+
+        # Build model image: profile[i,col] * flux_1d[col].
+        model = profile * flux_1d[np.newaxis, :]  # (n_ap, n_spectral)
+
+        # Residuals (NaN where flux_work is NaN or flux_1d is NaN).
+        resid = flux_work - model  # (n_ap, n_spectral)
+
+        # Normalized residuals: only where variance is finite and positive.
+        valid_var = np.isfinite(var_work) & (var_work > 0.0)
+        safe_var = np.where(valid_var, var_work, 1.0)  # avoid divide-by-zero
+        norm_resid = np.where(
+            valid_var & np.isfinite(resid),
+            resid / np.sqrt(safe_var),
+            np.nan,
+        )
+
+        # Candidate new bad pixels: not already bad, finite norm_resid, exceeds threshold.
+        currently_bad = initially_bad | reject_mask
+        new_bad_candidate = (
+            ~currently_bad
+            & np.isfinite(norm_resid)
+            & (np.abs(norm_resid) > sigma_clip)
+        )
+
+        if not np.any(new_bad_candidate):
+            break  # Early stop: nothing to reject.
+
+        # Apply min_valid_pixels constraint column by column.
+        new_bad = np.zeros((n_ap, n_spectral), dtype=bool)
+        for col in range(n_spectral):
+            if not np.any(new_bad_candidate[:, col]):
+                continue
+            n_valid_before = int(np.sum(~currently_bad[:, col]))
+            n_new = int(np.sum(new_bad_candidate[:, col]))
+            if n_valid_before - n_new >= min_valid_pixels:
+                new_bad[:, col] = new_bad_candidate[:, col]
+            # else: no pixels rejected in this column this iteration
+            # to preserve the min_valid_pixels requirement.
+
+        if not np.any(new_bad):
+            break  # All rejections blocked by min_valid_pixels.
+
+        # Commit the new rejections.
+        reject_mask |= new_bad
+        flux_work = np.where(new_bad, np.nan, flux_work)
+        var_work = np.where(new_bad, np.nan, var_work)
+        n_rejected += int(np.sum(new_bad))
+
+    return flux_work, var_work, reject_mask, n_rejected, n_iterations_used
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +1045,23 @@ def extract_weighted_optimal(
             normalize_profile=extraction_def.normalize_profile,
         )
 
+        # -- Iterative outlier rejection (Stage 18, optional) --
+        n_rejected = 0
+        n_iter_used = 0
+        final_mask_ap: Optional[npt.NDArray] = None
+        if extraction_def.reject_outliers:
+            flux_ap, var_ap, rejection_mask, n_rejected, n_iter_used = (
+                _iterative_outlier_rejection(
+                    profile,
+                    flux_ap,
+                    var_ap,
+                    sigma_clip=extraction_def.sigma_clip,
+                    max_iterations=extraction_def.max_iterations,
+                    min_valid_pixels=extraction_def.min_valid_pixels,
+                )
+            )
+            final_mask_ap = rejection_mask
+
         # -- Proto-Horne weighted extraction --
         n_pixels_used = _count_aperture_pixels(flux_ap)
         flux_1d, var_1d, weights_2d = _horne_weighted_extract(
@@ -867,6 +1079,9 @@ def extract_weighted_optimal(
                 method="horne_weighted",
                 n_pixels_used=n_pixels_used,
                 weights=weights_2d,
+                n_rejected_pixels=n_rejected,
+                final_mask=final_mask_ap,
+                n_iterations_used=n_iter_used,
             )
         )
 
