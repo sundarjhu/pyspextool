@@ -1409,8 +1409,20 @@ def extract_weighted_optimal(
 
         if p_source == "external":
             # Use caller-supplied external profile; normalize if requested.
+            # If the profile covers the full order spatial extent (n_spatial),
+            # slice it to the aperture using ap_mask so that callers can
+            # supply a full-order template (e.g. from profile_templates.py)
+            # without pre-slicing.
+            ext_p = np.asarray(extraction_def.external_profile)
+            n_spatial_full = flux_2d.shape[0]
+            if (
+                ext_p.ndim >= 1
+                and ext_p.shape[0] == n_spatial_full
+                and n_spatial_full != n_ap
+            ):
+                ext_p = ext_p[ap_mask]
             profile = _prepare_external_profile(
-                extraction_def.external_profile,
+                ext_p,
                 n_ap,
                 n_spectral,
                 extraction_def.normalize_profile,
