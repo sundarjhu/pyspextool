@@ -806,9 +806,106 @@ class TestExtractWithApertureErrors:
         with pytest.raises(ValueError, match="method"):
             extract_with_aperture(ros, ap, method="")
 
+    def test_raises_on_variance_shape_mismatch(self):
+        """ValueError if variance_image shape does not match flux shape."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ap = _make_center_aperture()
+        bad_variance = np.ones((_N_SPATIAL + 1, _N_SPECTRAL))
+        with pytest.raises(ValueError, match="variance_image shape"):
+            extract_with_aperture(ros, ap, variance_image=bad_variance)
+
 
 # ===========================================================================
-# 10. Smoke test: real H1 calibration data
+# 10. Variance propagation
+# ===========================================================================
+
+
+class TestExtractWithApertureVariancePropagation:
+    """Tests for variance propagation in extract_with_aperture."""
+
+    def test_variance_none_when_no_variance_image(self):
+        """variance is None when variance_image is not provided."""
+        ros = _make_synthetic_rectified_order_set()
+        ap = _make_center_aperture()
+        result = extract_with_aperture(ros, ap)
+        for sp in result.spectra:
+            assert sp.variance is None
+
+    def test_variance_shape_matches_flux(self):
+        """variance has the same shape as flux when variance_image is provided."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ap = _make_center_aperture()
+        var_image = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        result = extract_with_aperture(ros, ap, variance_image=var_image)
+        for sp in result.spectra:
+            assert sp.variance is not None
+            assert sp.variance.shape == sp.flux.shape
+
+    def test_variance_nonnegative(self):
+        """Propagated variance is non-negative everywhere it is finite."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ap = _make_center_aperture()
+        var_image = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        result = extract_with_aperture(ros, ap, variance_image=var_image)
+        for sp in result.spectra:
+            finite_mask = np.isfinite(sp.variance)
+            assert np.all(sp.variance[finite_mask] >= 0.0)
+
+    def test_variance_with_background_subtraction(self):
+        """Variance is propagated correctly when background subtraction is active."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ap = _make_center_aperture_with_bg()
+        var_image = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        result = extract_with_aperture(
+            ros, ap, subtract_background=True, variance_image=var_image
+        )
+        for sp in result.spectra:
+            assert sp.variance is not None
+            assert sp.variance.shape == sp.flux.shape
+            finite_mask = np.isfinite(sp.variance)
+            assert np.all(sp.variance[finite_mask] >= 0.0)
+
+    def test_variance_unit_image_no_background(self):
+        """Unit variance image gives deterministic variance values.
+
+        For unit variance, n_ap aperture pixels, and method='sum':
+          variance_1d = nansum(1 * n_ap) = n_ap for each column.
+        """
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=1.0
+        )
+        ap = _make_center_aperture(radius=0.2)
+        var_image = np.ones((n_spatial, n_spectral))
+        result = extract_with_aperture(
+            ros, ap,
+            method="sum",
+            subtract_background=False,
+            variance_image=var_image,
+        )
+        for sp in result.spectra:
+            # variance = sum of n_ap unit variances = n_ap for each column.
+            ro = next(
+                r for r in ros.rectified_orders if r.order == sp.order
+            )
+            dist = np.abs(ro.spatial_frac - ap.center_frac)
+            n_ap = int(np.sum(dist <= ap.radius_frac))
+            np.testing.assert_allclose(
+                sp.variance, float(n_ap), rtol=1e-12
+            )
+
+
+# ===========================================================================
+# 11. Smoke test: real H1 calibration data
 # ===========================================================================
 
 

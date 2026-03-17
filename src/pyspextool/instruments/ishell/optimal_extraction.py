@@ -99,6 +99,20 @@ What this module does
 
      Columns where the profile denominator is zero or NaN are set to NaN.
 
+  6. *(Optional)* If a *variance_image* is provided, propagates variance
+     through background subtraction and profile-weighted extraction::
+
+         var_flux[col] = sum(P[:, col]**2 * (var_pixel + var_bg))
+
+     where *var_bg* is the per-column background variance approximated as
+     the median of the variance image within the background annulus.
+
+     .. note::
+         Background variance is approximated using the median of the
+         variance image within the background annulus.  This is a
+         first-order approximation and does not account for correlated
+         noise or detailed detector characteristics.
+
 * Returns an :class:`OptimalExtractedSpectrumSet` collecting one
   :class:`OptimalExtractedOrderSpectrum` per echelle order.
 
@@ -129,9 +143,6 @@ What this module does NOT do (by design)
 
 * **No profile fitting with a PSF model** – the profile is a simple
   empirical estimate from the data itself.
-
-* **No science-quality uncertainty propagation** – the variance field is
-  a ``None`` placeholder.
 
 * **No aperture finding / centroiding** – the aperture center and radius
   must be supplied explicitly via :class:`OptimalExtractionDefinition`.
@@ -325,14 +336,18 @@ class OptimalExtractedOrderSpectrum:
     n_pixels_used : int
         Number of spatial pixels inside the aperture that have at least one
         finite value across spectral columns.
-    variance : ndarray or None
-        Placeholder for future variance propagation; always ``None`` in
-        this scaffold.
+    variance : ndarray or None, shape (n_spectral,)
+        Propagated variance of *flux*, or ``None`` if no *variance_image*
+        was supplied to :func:`extract_optimal`.  When provided, this is
+        computed as ``nansum(weights**2 * variance, axis=0)`` over the
+        aperture pixels (after adding the per-column background variance
+        contribution when background subtraction is active).
 
     Notes
     -----
-    No variance or uncertainty is computed; that belongs to a later stage
-    once a reliable noise model is available.
+    Background variance is approximated using the median of the variance
+    image within the background annulus; this is a first-order
+    approximation.
     """
 
     order: int
@@ -342,7 +357,7 @@ class OptimalExtractedOrderSpectrum:
     aperture: OptimalExtractionDefinition
     method: str
     n_pixels_used: int
-    variance: Optional[npt.NDArray] = None  # placeholder
+    variance: Optional[npt.NDArray] = None  # None when no variance_image supplied
 
     @property
     def n_spectral(self) -> int:
@@ -564,6 +579,7 @@ def extract_optimal(
     extraction_def: OptimalExtractionDefinition,
     *,
     subtract_background: bool = True,
+    variance_image: Optional[npt.NDArray] = None,
 ) -> OptimalExtractedSpectrumSet:
     """Extract 1-D spectra from rectified orders using profile-weighted extraction.
 
@@ -584,12 +600,22 @@ def extract_optimal(
         from each aperture pixel before profile estimation and extraction.  If
         ``False``, or if *extraction_def* has no background region, no
         subtraction is performed.
+    variance_image : ndarray or None, optional
+        Per-pixel variance image with the same shape as each order's
+        ``flux`` array (``n_spatial × n_spectral``).  If ``None``
+        (default), no variance propagation is performed and the returned
+        ``variance`` field will be ``None``.  If provided, variance is
+        propagated through background subtraction and profile-weighted
+        extraction; the result is stored in
+        :attr:`OptimalExtractedOrderSpectrum.variance`.
 
     Returns
     -------
     :class:`OptimalExtractedSpectrumSet`
         One :class:`OptimalExtractedOrderSpectrum` per order in
-        *rectified_orders*.
+        *rectified_orders*.  Each spectrum's ``variance`` field contains
+        the propagated variance when *variance_image* is provided, or
+        ``None`` otherwise.
 
     Raises
     ------
@@ -597,6 +623,9 @@ def extract_optimal(
         If *rectified_orders* is empty (``n_orders == 0``).
     ValueError
         If any order's ``flux`` field is not a 2-D array.
+    ValueError
+        If *variance_image* is provided but its shape does not match the
+        order's flux shape.
 
     Notes
     -----
@@ -620,6 +649,19 @@ def extract_optimal(
     7. Set columns with no valid aperture pixels or no valid profile
        support to NaN.
 
+    **Variance propagation**
+
+    When *variance_image* is provided:
+
+    - Background variance per column is approximated as
+      ``nanmedian(variance_image[bg_mask], axis=0)``.  This is a
+      first-order approximation (median ≠ mean for skewed distributions).
+    - The total per-pixel variance including background is
+      ``variance_image[ap_mask] + var_bg_col``.
+    - The propagated flux variance is
+      ``nansum(weights**2 * variance_total, axis=0)`` where *weights*
+      are the profile values used for extraction.
+
     **Scaffold simplifications**
 
     - Background is a simple per-column median of annulus pixels; no
@@ -627,7 +669,6 @@ def extract_optimal(
     - No per-pixel variance weighting; all aperture pixels are treated
       equally by the profile.
     - No iterative bad-pixel rejection.
-    - Variance is not computed (``None`` placeholder).
     - The aperture must be supplied explicitly; no centroiding or automatic
       aperture finding is performed.
     """
@@ -658,6 +699,18 @@ def extract_optimal(
             )
 
         n_spectral = flux_2d.shape[1]
+
+        # -- Variance image handling --
+        if variance_image is not None:
+            var_2d = np.asarray(variance_image, dtype=float)
+            if var_2d.shape != flux_2d.shape:
+                raise ValueError(
+                    f"Order {ro.order}: variance_image shape {var_2d.shape} "
+                    f"does not match flux shape {flux_2d.shape}."
+                )
+        else:
+            var_2d = None
+
         spatial_frac = np.asarray(ro.spatial_frac, dtype=float)
         # shape (n_spatial,)
         dist = np.abs(spatial_frac - extraction_def.center_frac)
@@ -686,6 +739,7 @@ def extract_optimal(
             continue
 
         # -- Background estimation --
+        var_bg_col: Optional[npt.NDArray] = None
         if do_background:
             bg_mask = (dist > extraction_def.background_inner) & (
                 dist <= extraction_def.background_outer
@@ -703,6 +757,19 @@ def extract_optimal(
             # Subtract per-column background from each aperture row.
             flux_ap = flux_ap - bg_1d[np.newaxis, :]  # broadcast
 
+            # Background variance: approximate as median of variance within
+            # the background annulus (first-order approximation).
+            if var_2d is not None:
+                var_bg_pixels = var_2d[bg_mask, :]  # (n_bg, n_spectral)
+                if var_bg_pixels.shape[0] == 0:
+                    var_bg_col = np.zeros(n_spectral)
+                else:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        var_bg_col = np.nanmedian(
+                            var_bg_pixels, axis=0
+                        )  # (n_spectral,)
+
         # -- Profile estimation --
         profile = _estimate_profile(
             flux_ap,
@@ -714,6 +781,23 @@ def extract_optimal(
         n_pixels_used = _count_aperture_pixels(flux_ap)
         flux_1d = _weighted_extract(profile, flux_ap)
 
+        # -- Variance propagation --
+        variance_1d: Optional[npt.NDArray] = None
+        if var_2d is not None:
+            var_ap = var_2d[ap_mask, :]  # (n_ap, n_spectral)
+            if var_bg_col is not None:
+                var_total = var_ap + var_bg_col[np.newaxis, :]
+            else:
+                var_total = var_ap
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                variance_1d = np.nansum(
+                    profile**2 * var_total, axis=0
+                )  # (n_spectral,)
+            # Columns where all aperture pixels are NaN → NaN variance.
+            all_nan_cols = np.all(~np.isfinite(flux_ap), axis=0)
+            variance_1d[all_nan_cols] = np.nan
+
         spectra.append(
             OptimalExtractedOrderSpectrum(
                 order=ro.order,
@@ -723,7 +807,7 @@ def extract_optimal(
                 aperture=extraction_def,
                 method="optimal_weighted",
                 n_pixels_used=n_pixels_used,
-                variance=None,
+                variance=variance_1d,
             )
         )
 
