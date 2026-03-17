@@ -939,7 +939,7 @@ class TestIntegrationWithWeightedExtraction:
             profile_source="external",
             external_profile=first_template.profile,
         )
-        result = extract_weighted_optical = extract_weighted_optimal(ros, ext_def)
+        result = extract_weighted_optimal(ros, ext_def)
         for sp in result.spectra:
             assert sp.profile_source_used == "external"
 
