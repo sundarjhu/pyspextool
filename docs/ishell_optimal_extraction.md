@@ -125,21 +125,23 @@ Real Spextool implements Horne (1986) optimal extraction, which requires:
 4. **A reliable PSF / profile model**, potentially fitted to the data rather
    than taken directly from it.
 
-This scaffold does not implement Horne-style variance-weighted extraction,
-iterative rejection, or a noise model.  A first-pass variance propagation
-is available (see below); it gives equal weight to all aperture pixels and
-does not model Poisson or read-noise contributions.
+This scaffold does not implement full Horne (1986) variance-weighted
+optimal extraction or iterative outlier rejection.
+
+A first-pass noise model is available via the Stage 14 variance model,
+and variance can be propagated through the extraction.  However, the
+extraction weights are not derived from an inverse-variance model of
+the data, and no iterative refinement or bad-pixel rejection is applied.
 
 ---
 
 ## What remains intentionally unimplemented
 
 - Horne (1986) variance-weighted optimal extraction
-- Per-pixel noise model (read noise + Poisson)
 - Iterative outlier rejection
 - Sophisticated PSF / profile fitting
 - Science-quality uncertainty propagation (current variance support is a
-  first-pass approximation; no Poisson or read-noise modelling)
+  first-pass approximation)
 - Automatic aperture centroiding
 - Sky modelling beyond simple median subtraction
 - Telluric correction
