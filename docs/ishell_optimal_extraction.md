@@ -125,9 +125,10 @@ Real Spextool implements Horne (1986) optimal extraction, which requires:
 4. **A reliable PSF / profile model**, potentially fitted to the data rather
    than taken directly from it.
 
-None of these are implemented in this scaffold.  The provisional formula
-gives equal weight to all aperture pixels and does not propagate noise
-through the extraction.
+This scaffold does not implement Horne-style variance-weighted extraction,
+iterative rejection, or a noise model.  A first-pass variance propagation
+is available (see below); it gives equal weight to all aperture pixels and
+does not model Poisson or read-noise contributions.
 
 ---
 
@@ -137,12 +138,39 @@ through the extraction.
 - Per-pixel noise model (read noise + Poisson)
 - Iterative outlier rejection
 - Sophisticated PSF / profile fitting
-- Uncertainty / variance propagation (``variance`` field is always ``None``)
+- Science-quality uncertainty propagation (current variance support is a
+  first-pass approximation; no Poisson or read-noise modelling)
 - Automatic aperture centroiding
 - Sky modelling beyond simple median subtraction
 - Telluric correction
 - Order merging / stitching
 - Science-quality validation
+
+---
+
+## First-pass variance propagation
+
+An optional `variance_image` argument may be passed to `extract_optimal`.
+When provided, variance is propagated through background subtraction and
+profile-weighted extraction:
+
+```
+var_flux[col] = sum(P[:, col]**2 * (var_pixel + var_bg))
+```
+
+where:
+- `P` is the spatial-profile array (same as used for flux extraction)
+- `var_pixel` is the per-pixel variance from `variance_image`
+- `var_bg` is the per-column background variance, approximated as the
+  median of `variance_image` within the background annulus
+
+> **Note:** Background variance is approximated using the median of the
+> variance image within the background annulus.  This is a first-order
+> approximation and does not account for correlated noise or detailed
+> detector characteristics.
+
+When `variance_image=None` (default), no variance is computed and the
+`variance` field is `None`.
 
 ---
 
@@ -166,7 +194,7 @@ Per-order 1-D spectrum.  Fields:
 | ``aperture`` | The ``OptimalExtractionDefinition`` used |
 | ``method`` | Always ``"optimal_weighted"`` |
 | ``n_pixels_used`` | Aperture pixels with at least one finite value |
-| ``variance`` | Always ``None`` (placeholder) |
+| ``variance`` | Propagated variance of ``flux``, or ``None`` if no ``variance_image`` was supplied |
 
 ### ``OptimalExtractedSpectrumSet``
 

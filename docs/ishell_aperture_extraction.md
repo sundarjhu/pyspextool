@@ -123,7 +123,30 @@ For each order in the `RectifiedOrderSet`:
    * `"sum"` – `np.nansum(flux_ap, axis=0)`; all-NaN columns → NaN.
    * `"mean"` – `np.nanmean(flux_ap, axis=0)`; all-NaN columns → NaN.
 
-4. **Store the result.**
+4. **Propagate variance** *(optional — only when `variance_image` is provided).*
+
+   Compute per-column background variance as the median of the variance
+   image in the background annulus:
+
+   ```python
+   var_bg = np.nanmedian(variance_image[bg_mask], axis=0)
+   ```
+
+   Sum per-pixel variance (plus background contribution) over aperture rows:
+
+   ```python
+   var_flux = np.nansum(variance_image[ap_mask] + var_bg, axis=0)
+   ```
+
+   > **Note:** Background variance is approximated using the median of the
+   > variance image within the background annulus.  This is a first-order
+   > approximation and does not account for correlated noise or detailed
+   > detector characteristics.
+
+   If `variance_image=None`, no variance is computed and the `variance`
+   field is `None`.
+
+5. **Store the result.**
 
    One `ExtractedApertureSpectrum` per order, containing:
 
@@ -136,6 +159,7 @@ For each order in the `RectifiedOrderSet`:
    | `aperture` | The `ApertureDefinition` used |
    | `method` | `"sum"` or `"mean"` |
    | `n_pixels_used` | Number of valid aperture rows used |
+   | `variance` | Propagated variance of `flux`, or `None` if no `variance_image` was supplied |
 
 ---
 
@@ -161,7 +185,7 @@ The following simplifications are made intentionally in this scaffold:
 | Background estimation | Per-column `np.nanmedian` of symmetric annulus | Polynomial fit to the background region; independent apertures on each side |
 | Sky subtraction | Simple subtraction of median background | Separate sky frame or fitted sky model |
 | Extraction method | Sum or mean | Optimal (profile-weighted) extraction |
-| Uncertainty propagation | Not implemented | Poisson + read-noise error propagation per pixel |
+| Uncertainty propagation | First-pass: `sum(var_pixel + var_bg)` over aperture (optional; requires `variance_image`) | Poisson + read-noise error propagation per pixel |
 | Spatial units | Fractional slit `[0, 1]` | Physical arcseconds |
 
 ---
@@ -172,7 +196,9 @@ The following features are explicitly **deferred** to later stages:
 
 * **Optimal extraction** – profile-weighted extraction (Horne 1986).
 * **PSF fitting** – the spatial profile is not modelled.
-* **Uncertainty propagation** – no variance arrays are computed.
+* **Science-quality uncertainty propagation** – current variance support
+  is a first-pass approximation (median-based background variance, no
+  Poisson or read-noise modelling).
 * **Aperture finding / centroiding** – the aperture center and radius must
   be supplied explicitly.
 * **Sky modelling** – only a simple per-column median background is
@@ -192,6 +218,7 @@ from pyspextool.instruments.ishell.aperture_extraction import (
     ApertureDefinition,
     extract_with_aperture,
 )
+import numpy as np
 
 # Define the aperture: center at 50% of the slit, half-width 20%,
 # background from 30%–45% distance on each side.
@@ -203,16 +230,20 @@ aperture = ApertureDefinition(
 )
 
 # rectified is a RectifiedOrderSet produced by build_rectified_orders().
+# variance_image is optional; pass np.ones_like(flux_image) for unit variance.
 result = extract_with_aperture(
     rectified,
     aperture,
     method="sum",
     subtract_background=True,
+    variance_image=variance_image,  # or None to skip variance propagation
 )
 
 for sp in result.spectra:
     print(f"Order {sp.order}: {sp.n_spectral} spectral pixels, "
           f"aperture pixels used = {sp.n_pixels_used}")
+    if sp.variance is not None:
+        print(f"  variance shape: {sp.variance.shape}")
 ```
 
 ---

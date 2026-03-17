@@ -887,7 +887,9 @@ class TestExtractWithApertureVariancePropagation:
         ap = _make_center_aperture(radius=0.2)
         var_image = np.ones((n_spatial, n_spectral))
         result = extract_with_aperture(
-            ros, ap, method="sum", subtract_background=False,
+            ros, ap,
+            method="sum",
+            subtract_background=False,
             variance_image=var_image,
         )
         for sp in result.spectra:

@@ -99,6 +99,20 @@ What this module does
 
      Columns where the profile denominator is zero or NaN are set to NaN.
 
+  6. *(Optional)* If a *variance_image* is provided, propagates variance
+     through background subtraction and profile-weighted extraction::
+
+         var_flux[col] = sum(P[:, col]**2 * (var_pixel + var_bg))
+
+     where *var_bg* is the per-column background variance approximated as
+     the median of the variance image within the background annulus.
+
+     .. note::
+         Background variance is approximated using the median of the
+         variance image within the background annulus.  This is a
+         first-order approximation and does not account for correlated
+         noise or detailed detector characteristics.
+
 * Returns an :class:`OptimalExtractedSpectrumSet` collecting one
   :class:`OptimalExtractedOrderSpectrum` per echelle order.
 
@@ -129,13 +143,6 @@ What this module does NOT do (by design)
 
 * **No profile fitting with a PSF model** – the profile is a simple
   empirical estimate from the data itself.
-
-* **First-pass variance propagation** – an optional *variance_image* may
-  be supplied to :func:`extract_optimal`; if provided, variance is
-  propagated through background subtraction and profile-weighted
-  extraction.  Background variance is approximated as the median of the
-  variance image within the background annulus (a first-order
-  approximation).
 
 * **No aperture finding / centroiding** – the aperture center and radius
   must be supplied explicitly via :class:`OptimalExtractionDefinition`.
@@ -350,7 +357,7 @@ class OptimalExtractedOrderSpectrum:
     aperture: OptimalExtractionDefinition
     method: str
     n_pixels_used: int
-    variance: Optional[npt.NDArray] = None  # placeholder
+    variance: Optional[npt.NDArray] = None  # None when no variance_image supplied
 
     @property
     def n_spectral(self) -> int:

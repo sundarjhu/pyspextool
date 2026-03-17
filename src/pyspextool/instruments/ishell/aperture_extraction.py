@@ -70,6 +70,18 @@ What this module does
 * Collapses the aperture pixels along the spatial axis using either a sum
   or a mean.
 
+* Optionally propagates variance through background subtraction and
+  aperture extraction when a *variance_image* is supplied.  Background
+  variance is approximated as the median of the variance image within the
+  background annulus (first-order approximation); the propagated flux
+  variance is ``sum(var_pixel + var_bg)`` over the aperture rows.
+
+  .. note::
+      Background variance is approximated using the median of the
+      variance image within the background annulus.  This is a
+      first-order approximation and does not account for correlated
+      noise or detailed detector characteristics.
+
 * Returns an :class:`ExtractedApertureSpectrumSet` collecting one
   :class:`ExtractedApertureSpectrum` per echelle order.
 
@@ -79,12 +91,6 @@ What this module does NOT do (by design)
   later stage.
 
 * **No profile fitting** – the spatial profile is not modelled here.
-
-* **First-pass variance propagation** – an optional *variance_image* may
-  be supplied; if provided, variance is propagated through background
-  subtraction and aperture extraction.  Background variance is
-  approximated as the median of the variance image within the background
-  annulus (a first-order approximation).
 
 * **No aperture finding / centroiding** – the aperture center and radius
   must be supplied explicitly.
