@@ -943,10 +943,165 @@ class TestExtractOptimalErrors:
                 profile_mode="not_a_mode",
             )
 
+    def test_raises_on_variance_shape_mismatch(self):
+        """ValueError if variance_image shape does not match flux shape."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ed = _make_center_extraction_def()
+        bad_variance = np.ones((_N_SPATIAL + 1, _N_SPECTRAL))
+        with pytest.raises(ValueError, match="variance_image shape"):
+            extract_optimal(ros, ed, variance_image=bad_variance)
+
 
 # ===========================================================================
-# 11. Smoke test: real H1 calibration data
+# 11. Variance propagation
 # ===========================================================================
+
+
+class TestExtractOptimalVariancePropagation:
+    """Tests for variance propagation in extract_optimal."""
+
+    def test_variance_none_when_no_variance_image(self):
+        """variance is None when variance_image is not provided."""
+        ros = _make_synthetic_rectified_order_set()
+        ed = _make_center_extraction_def()
+        result = extract_optimal(ros, ed)
+        for sp in result.spectra:
+            assert sp.variance is None
+
+    def test_variance_shape_matches_flux(self):
+        """variance has the same shape as flux when variance_image is provided."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ed = _make_center_extraction_def()
+        var_image = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        result = extract_optimal(ros, ed, variance_image=var_image)
+        for sp in result.spectra:
+            assert sp.variance is not None
+            assert sp.variance.shape == sp.flux.shape
+
+    def test_variance_nonnegative(self):
+        """Propagated variance is non-negative everywhere it is finite."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ed = _make_center_extraction_def()
+        var_image = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        result = extract_optimal(ros, ed, variance_image=var_image)
+        for sp in result.spectra:
+            finite_mask = np.isfinite(sp.variance)
+            assert np.all(sp.variance[finite_mask] >= 0.0)
+
+    def test_variance_with_background_subtraction(self):
+        """Variance is propagated correctly when background subtraction is active."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ed = _make_center_extraction_def_with_bg()
+        var_image = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        result = extract_optimal(
+            ros, ed, subtract_background=True, variance_image=var_image
+        )
+        for sp in result.spectra:
+            assert sp.variance is not None
+            assert sp.variance.shape == sp.flux.shape
+            finite_mask = np.isfinite(sp.variance)
+            assert np.all(sp.variance[finite_mask] >= 0.0)
+
+    def test_variance_larger_with_background_than_without(self):
+        """Background variance contribution increases total variance.
+
+        When background variance is added, the propagated variance
+        ``sum(P^2 * (var_ap + var_bg))`` is >= ``sum(P^2 * var_ap)``
+        provided the profile is non-zero.
+
+        Build a dataset where aperture pixels differ from background
+        pixels so the profile remains non-zero after subtraction.
+        """
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        center = 0.5
+        radius = 0.2
+        bg_inner = 0.3
+        bg_outer = 0.45
+
+        spatial_frac = np.linspace(0.0, 1.0, n_spatial)
+        dist = np.abs(spatial_frac - center)
+
+        # Aperture: high flux; background: low flux.
+        object_fill = 10.0
+        bg_fill = 2.0
+        flux_2d = np.full((n_spatial, n_spectral), bg_fill)
+        ap_mask = dist <= radius
+        flux_2d[ap_mask, :] = object_fill
+
+        from pyspextool.instruments.ishell.rectified_orders import (
+            RectifiedOrder,
+            RectifiedOrderSet,
+        )
+
+        ro = RectifiedOrder(
+            order=311,
+            order_index=0,
+            wavelength_um=np.linspace(1.55, 1.59, n_spectral),
+            spatial_frac=spatial_frac,
+            flux=flux_2d,
+            source_image_shape=(_NROWS, _NCOLS),
+        )
+        ros = RectifiedOrderSet(
+            mode="H1_test",
+            rectified_orders=[ro],
+            source_image_shape=(_NROWS, _NCOLS),
+        )
+
+        ed_no_bg = OptimalExtractionDefinition(
+            center_frac=center, radius_frac=radius
+        )
+        ed_with_bg = OptimalExtractionDefinition(
+            center_frac=center,
+            radius_frac=radius,
+            background_inner=bg_inner,
+            background_outer=bg_outer,
+        )
+        var_image = np.ones((n_spatial, n_spectral))
+
+        result_no_bg = extract_optimal(
+            ros, ed_no_bg, subtract_background=False, variance_image=var_image
+        )
+        result_with_bg = extract_optimal(
+            ros, ed_with_bg, subtract_background=True, variance_image=var_image
+        )
+        sp_no_bg = result_no_bg.spectra[0]
+        sp_with_bg = result_with_bg.spectra[0]
+
+        finite = np.isfinite(sp_no_bg.variance) & np.isfinite(
+            sp_with_bg.variance
+        )
+        assert np.all(sp_with_bg.variance[finite] >= sp_no_bg.variance[finite])
+
+    def test_unit_variance_no_background(self):
+        """Unit variance image gives deterministic variance values.
+
+        For unit variance, profile P, and n_ap aperture pixels (no background):
+          variance_1d = nansum(P**2 * 1, axis=0)
+        """
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=1.0
+        )
+        ed = _make_center_extraction_def(radius=0.2, normalize_profile=True)
+        var_image = np.ones((n_spatial, n_spectral))
+        result = extract_optimal(
+            ros, ed, subtract_background=False, variance_image=var_image
+        )
+        for sp in result.spectra:
+            # variance = nansum(P**2, axis=0) for unit variance.
+            expected = np.nansum(sp.profile**2, axis=0)
+            np.testing.assert_allclose(sp.variance, expected, rtol=1e-12)
+
 
 
 @pytest.mark.skipif(

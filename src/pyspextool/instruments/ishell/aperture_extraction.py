@@ -80,8 +80,11 @@ What this module does NOT do (by design)
 
 * **No profile fitting** – the spatial profile is not modelled here.
 
-* **No science-quality uncertainty propagation** – no variance arrays
-  are computed; error propagation is deferred.
+* **First-pass variance propagation** – an optional *variance_image* may
+  be supplied; if provided, variance is propagated through background
+  subtraction and aperture extraction.  Background variance is
+  approximated as the median of the variance image within the background
+  annulus (a first-order approximation).
 
 * **No aperture finding / centroiding** – the aperture center and radius
   must be supplied explicitly.
@@ -259,13 +262,21 @@ class ExtractedApertureSpectrum:
         the extraction (i.e. aperture pixels that were not entirely NaN
         across all spectral columns).
 
+    variance : ndarray or None, shape (n_spectral,)
+        Propagated variance of *flux*, or ``None`` if no *variance_image*
+        was supplied to :func:`extract_with_aperture`.  When provided,
+        this is the sum of per-pixel variances (including a per-column
+        background variance contribution) over the aperture pixels.
+
     Notes
     -----
     ``background_flux`` contains the per-column median *before* it is
     subtracted from (and propagated through) the aperture extraction.
     If ``subtract_background=False``, ``background_flux`` is ``None``.
 
-    No variance or uncertainty is computed; that belongs to a later stage.
+    Background variance is approximated using the median of the variance
+    image within the background annulus; this is a first-order
+    approximation.
     """
 
     order: int
@@ -275,6 +286,7 @@ class ExtractedApertureSpectrum:
     aperture: ApertureDefinition
     method: str
     n_pixels_used: int
+    variance: Optional[npt.NDArray] = None  # shape (n_spectral,) or None
 
     @property
     def n_spectral(self) -> int:
@@ -409,6 +421,7 @@ def extract_with_aperture(
     *,
     method: str = "sum",
     subtract_background: bool = True,
+    variance_image: Optional[npt.NDArray] = None,
 ) -> ExtractedApertureSpectrumSet:
     """Extract 1-D spectra from rectified orders using a spatial aperture.
 
@@ -432,12 +445,22 @@ def extract_with_aperture(
         it from each aperture pixel before collapsing.  If ``False``, or
         if *aperture* has no background region, no subtraction is
         performed.
+    variance_image : ndarray or None, optional
+        Per-pixel variance image with the same shape as each order's
+        ``flux`` array (``n_spatial × n_spectral``).  If ``None``
+        (default), no variance propagation is performed and the returned
+        ``variance`` field will be ``None``.  If provided, variance is
+        propagated through background subtraction and aperture
+        extraction; the result is stored in
+        :attr:`ExtractedApertureSpectrum.variance`.
 
     Returns
     -------
     :class:`ExtractedApertureSpectrumSet`
         One :class:`ExtractedApertureSpectrum` per order in
-        *rectified_orders*.
+        *rectified_orders*.  Each spectrum's ``variance`` field contains
+        the propagated variance when *variance_image* is provided, or
+        ``None`` otherwise.
 
     Raises
     ------
@@ -447,6 +470,9 @@ def extract_with_aperture(
         If *method* is not one of ``"sum"`` or ``"mean"``.
     ValueError
         If any order's ``flux`` field is not a 2-D array.
+    ValueError
+        If *variance_image* is provided but its shape does not match the
+        order's flux shape.
 
     Notes
     -----
@@ -467,11 +493,23 @@ def extract_with_aperture(
        spatial axis using *method*.
     5. Set spectral columns with no valid aperture pixels to NaN.
 
+    **Variance propagation**
+
+    When *variance_image* is provided:
+
+    - Background variance per column is approximated as
+      ``nanmedian(variance_image[bg_mask], axis=0)``.  This is a
+      first-order approximation (median ≠ mean for skewed distributions).
+    - Per-aperture-pixel variance including the background contribution
+      is ``var_pixel + var_bg_col``.
+    - The propagated flux variance is
+      ``nansum(var_pixel + var_bg_col, axis=0)`` over the aperture rows.
+
     **Scaffold simplifications**
 
     - Background is estimated as a simple median of annulus pixels; no
       polynomial fitting or interpolation across the annulus is performed.
-    - No optimal extraction, no PSF fitting, no per-pixel variance.
+    - No optimal extraction, no PSF fitting.
     - The aperture must be supplied explicitly; no centroiding or
       automatic aperture finding is performed.
     """
@@ -506,6 +544,17 @@ def extract_with_aperture(
                 f"got shape {flux_2d.shape}."
             )
 
+        # -- Variance image handling --
+        if variance_image is not None:
+            var_2d = np.asarray(variance_image, dtype=float)
+            if var_2d.shape != flux_2d.shape:
+                raise ValueError(
+                    f"Order {ro.order}: variance_image shape {var_2d.shape} "
+                    f"does not match flux shape {flux_2d.shape}."
+                )
+        else:
+            var_2d = None
+
         spatial_frac = np.asarray(ro.spatial_frac, dtype=float)
         # shape (n_spatial,)
         dist = np.abs(spatial_frac - aperture.center_frac)
@@ -532,12 +581,14 @@ def extract_with_aperture(
                     aperture=aperture,
                     method=method,
                     n_pixels_used=0,
+                    variance=None,
                 )
             )
             continue
 
         # -- Background estimation --
         bg_1d = None
+        var_bg_col: Optional[npt.NDArray] = None
         if do_background:
             bg_mask = (dist > aperture.background_inner) & (
                 dist <= aperture.background_outer
@@ -555,9 +606,37 @@ def extract_with_aperture(
             # Subtract per-column background from each aperture row.
             flux_ap = flux_ap - bg_1d[np.newaxis, :]  # broadcast
 
+            # Background variance: approximate as median of variance within
+            # the background annulus (first-order approximation).
+            if var_2d is not None:
+                var_bg_pixels = var_2d[bg_mask, :]  # (n_bg, n_spectral)
+                if var_bg_pixels.shape[0] == 0:
+                    var_bg_col = np.zeros(flux_2d.shape[1])
+                else:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        var_bg_col = np.nanmedian(
+                            var_bg_pixels, axis=0
+                        )  # (n_spectral,)
+
         # -- Collapse --
         n_pixels_used = _count_aperture_pixels(flux_ap)
         flux_1d = _extract_1d(flux_ap, method)
+
+        # -- Variance propagation --
+        variance_1d: Optional[npt.NDArray] = None
+        if var_2d is not None:
+            var_ap = var_2d[ap_mask, :]  # (n_ap, n_spectral)
+            if var_bg_col is not None:
+                var_total = var_ap + var_bg_col[np.newaxis, :]
+            else:
+                var_total = var_ap
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                variance_1d = np.nansum(var_total, axis=0)  # (n_spectral,)
+            # Columns where all aperture pixels are NaN → NaN variance.
+            all_nan_cols = np.all(~np.isfinite(flux_ap), axis=0)
+            variance_1d[all_nan_cols] = np.nan
 
         spectra.append(
             ExtractedApertureSpectrum(
@@ -568,6 +647,7 @@ def extract_with_aperture(
                 aperture=aperture,
                 method=method,
                 n_pixels_used=n_pixels_used,
+                variance=variance_1d,
             )
         )
 
