@@ -1103,6 +1103,83 @@ class TestExtractOptimalVariancePropagation:
             np.testing.assert_allclose(sp.variance, expected, rtol=1e-12)
 
 
+# ===========================================================================
+# 13. variance_model integration tests
+# ===========================================================================
+
+
+class TestExtractOptimalVarianceModel:
+    """Tests for variance_model integration in extract_optimal."""
+
+    def _make_variance_model(self):
+        from pyspextool.instruments.ishell.variance_model import VarianceModelDefinition
+        return VarianceModelDefinition(read_noise_electron=10.0, gain_e_per_adu=2.0)
+
+    def test_variance_model_only_produces_variance(self):
+        """variance_model alone produces non-None variance output."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ed = _make_center_extraction_def()
+        vmodel = self._make_variance_model()
+        result = extract_optimal(ros, ed, variance_model=vmodel)
+        for sp in result.spectra:
+            assert sp.variance is not None
+
+    def test_variance_model_shape_correct(self):
+        """variance produced from variance_model has same shape as flux."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ed = _make_center_extraction_def()
+        vmodel = self._make_variance_model()
+        result = extract_optimal(ros, ed, variance_model=vmodel)
+        for sp in result.spectra:
+            assert sp.variance.shape == sp.flux.shape
+
+    def test_variance_model_nonnegative(self):
+        """Variance from variance_model is non-negative everywhere it is finite."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ed = _make_center_extraction_def()
+        vmodel = self._make_variance_model()
+        result = extract_optimal(ros, ed, variance_model=vmodel)
+        for sp in result.spectra:
+            finite_mask = np.isfinite(sp.variance)
+            assert np.all(sp.variance[finite_mask] >= 0.0)
+
+    def test_variance_image_overrides_variance_model(self):
+        """explicit variance_image takes priority over variance_model."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL, fill_value=1.0
+        )
+        ed = _make_center_extraction_def(normalize_profile=True)
+        vmodel = self._make_variance_model()
+        # Use a distinctive all-5 variance image.
+        var_image = np.full((_N_SPATIAL, _N_SPECTRAL), 5.0)
+        result_model = extract_optimal(ros, ed, variance_model=vmodel)
+        result_image = extract_optimal(
+            ros, ed, variance_image=var_image, variance_model=vmodel
+        )
+        result_image_only = extract_optimal(ros, ed, variance_image=var_image)
+        # variance_image+model should equal variance_image only (model ignored)
+        for sp_img, sp_both in zip(
+            result_image_only.spectra, result_image.spectra
+        ):
+            np.testing.assert_allclose(sp_both.variance, sp_img.variance, rtol=1e-12)
+
+    def test_variance_model_shape_matches_flux(self):
+        """variance length matches the wavelength axis length (n_spectral)."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ed = _make_center_extraction_def()
+        vmodel = self._make_variance_model()
+        result = extract_optimal(ros, ed, variance_model=vmodel)
+        for sp in result.spectra:
+            assert sp.variance.shape == sp.wavelength_um.shape
+
 
 @pytest.mark.skipif(
     not _HAVE_H1_DATA,

@@ -150,9 +150,18 @@ does not model Poisson or read-noise contributions.
 
 ## First-pass variance propagation
 
+The extraction functions can optionally generate a variance image internally
+using the Stage 14 variance model.  Pass either:
+
+* `variance_image` – an explicit per-pixel variance array (takes priority), **or**
+* `variance_model` – a `VarianceModelDefinition` that is used to build the
+  variance image internally via `build_variance_image()`.
+
+Priority: `variance_image > variance_model > None`.
+
 An optional `variance_image` argument may be passed to `extract_optimal`.
-When provided, variance is propagated through background subtraction and
-profile-weighted extraction:
+When provided (directly or built from `variance_model`), variance is propagated
+through background subtraction and profile-weighted extraction:
 
 ```
 var_flux[col] = sum(P[:, col]**2 * (var_pixel + var_bg))
@@ -160,17 +169,17 @@ var_flux[col] = sum(P[:, col]**2 * (var_pixel + var_bg))
 
 where:
 - `P` is the spatial-profile array (same as used for flux extraction)
-- `var_pixel` is the per-pixel variance from `variance_image`
+- `var_pixel` is the per-pixel variance from the variance image
 - `var_bg` is the per-column background variance, approximated as the
-  median of `variance_image` within the background annulus
+  median of the variance image within the background annulus
 
 > **Note:** Background variance is approximated using the median of the
 > variance image within the background annulus.  This is a first-order
 > approximation and does not account for correlated noise or detailed
 > detector characteristics.
 
-When `variance_image=None` (default), no variance is computed and the
-`variance` field is `None`.
+When neither `variance_image` nor `variance_model` is supplied (default),
+no variance is computed and the `variance` field is `None`.
 
 ---
 
@@ -194,7 +203,7 @@ Per-order 1-D spectrum.  Fields:
 | ``aperture`` | The ``OptimalExtractionDefinition`` used |
 | ``method`` | Always ``"optimal_weighted"`` |
 | ``n_pixels_used`` | Aperture pixels with at least one finite value |
-| ``variance`` | Propagated variance of ``flux``, or ``None`` if no ``variance_image`` was supplied |
+| ``variance`` | Propagated variance of ``flux``, or ``None`` if no variance source was supplied |
 
 ### ``OptimalExtractedSpectrumSet``
 

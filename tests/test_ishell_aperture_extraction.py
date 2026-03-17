@@ -905,7 +905,86 @@ class TestExtractWithApertureVariancePropagation:
 
 
 # ===========================================================================
-# 11. Smoke test: real H1 calibration data
+# 11. variance_model integration tests
+# ===========================================================================
+
+
+class TestExtractWithApertureVarianceModel:
+    """Tests for variance_model integration in extract_with_aperture."""
+
+    def _make_variance_model(self):
+        from pyspextool.instruments.ishell.variance_model import VarianceModelDefinition
+        return VarianceModelDefinition(read_noise_electron=10.0, gain_e_per_adu=2.0)
+
+    def test_variance_model_only_produces_variance(self):
+        """variance_model alone produces non-None variance output."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ap = _make_center_aperture()
+        vmodel = self._make_variance_model()
+        result = extract_with_aperture(ros, ap, variance_model=vmodel)
+        for sp in result.spectra:
+            assert sp.variance is not None
+
+    def test_variance_model_shape_correct(self):
+        """variance produced from variance_model has same shape as flux."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ap = _make_center_aperture()
+        vmodel = self._make_variance_model()
+        result = extract_with_aperture(ros, ap, variance_model=vmodel)
+        for sp in result.spectra:
+            assert sp.variance.shape == sp.flux.shape
+
+    def test_variance_model_nonnegative(self):
+        """Variance from variance_model is non-negative everywhere it is finite."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ap = _make_center_aperture()
+        vmodel = self._make_variance_model()
+        result = extract_with_aperture(ros, ap, variance_model=vmodel)
+        for sp in result.spectra:
+            finite_mask = np.isfinite(sp.variance)
+            assert np.all(sp.variance[finite_mask] >= 0.0)
+
+    def test_variance_image_overrides_variance_model(self):
+        """explicit variance_image takes priority over variance_model."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ap = _make_center_aperture()
+        vmodel = self._make_variance_model()
+        # Use a distinctive all-5 variance image so we can detect which was used.
+        var_image = np.full((_N_SPATIAL, _N_SPECTRAL), 5.0)
+        result = extract_with_aperture(
+            ros, ap, variance_image=var_image, variance_model=vmodel
+        )
+        # With unit-valued aperture rows, variance from var_image should equal
+        # n_ap * 5; that is unambiguously different from the model prediction.
+        ro = ros.rectified_orders[0]
+        dist = np.abs(ro.spatial_frac - ap.center_frac)
+        n_ap = int(np.sum(dist <= ap.radius_frac))
+        expected = float(n_ap) * 5.0
+        sp = result.spectra[0]
+        np.testing.assert_allclose(sp.variance, expected, rtol=1e-12)
+
+    def test_variance_model_shape_matches_flux(self):
+        """variance length matches the wavelength axis length (n_spectral)."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ap = _make_center_aperture()
+        vmodel = self._make_variance_model()
+        result = extract_with_aperture(ros, ap, variance_model=vmodel)
+        for sp in result.spectra:
+            assert sp.variance.shape == sp.wavelength_um.shape
+
+
+# ===========================================================================
+# 12. Smoke test: real H1 calibration data
 # ===========================================================================
 
 
