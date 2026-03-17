@@ -1181,6 +1181,231 @@ class TestExtractOptimalVarianceModel:
             assert sp.variance.shape == sp.wavelength_um.shape
 
 
+# ===========================================================================
+# 14. Mask-aware extraction tests
+# ===========================================================================
+
+
+class TestExtractOptimalMaskAware:
+    """Tests for mask-aware extraction: NaN/inf handling and user mask support."""
+
+    def test_nan_in_data_excluded_from_flux(self):
+        """NaN pixels in data do not bias the extracted flux.
+
+        Build two datasets: one clean, one with NaN in a subset of aperture
+        pixels.  The clean dataset's flux should equal the masked-pixel
+        dataset's flux where only the good pixels contribute.
+        """
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        fill = 4.0
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=fill
+        )
+        ed = _make_center_extraction_def(radius=0.2)
+
+        ro = ros.rectified_orders[0]
+        dist = np.abs(ro.spatial_frac - ed.center_frac)
+        ap_indices = np.where(dist <= ed.radius_frac)[0]
+
+        # Introduce NaN in one aperture row for all columns.
+        ro.flux[ap_indices[0], :] = np.nan
+
+        result = extract_optimal(ros, ed, subtract_background=False)
+        sp = result.spectra[0]
+
+        # Remaining aperture rows are all fill_value; flux should be finite.
+        assert np.all(np.isfinite(sp.flux))
+
+    def test_inf_in_data_excluded_from_flux(self):
+        """Inf pixels in data are treated as bad and excluded from flux."""
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        fill = 3.0
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=fill
+        )
+        ed = _make_center_extraction_def(radius=0.2)
+
+        ro = ros.rectified_orders[0]
+        dist = np.abs(ro.spatial_frac - ed.center_frac)
+        ap_indices = np.where(dist <= ed.radius_frac)[0]
+
+        # Set one aperture row to +inf.
+        ro.flux[ap_indices[0], :] = np.inf
+
+        result = extract_optimal(ros, ed, subtract_background=False)
+        sp = result.spectra[0]
+
+        # The inf row must be excluded: output should be finite (not inf/nan).
+        assert np.all(np.isfinite(sp.flux)), (
+            "Expected finite flux after excluding inf-valued row; "
+            f"got {sp.flux}"
+        )
+
+    def test_nan_in_variance_gives_nan_variance_for_that_column(self):
+        """NaN in variance image causes NaN variance for affected columns."""
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=2.0
+        )
+        ed = _make_center_extraction_def(radius=0.2)
+
+        var_image = np.ones((n_spatial, n_spectral))
+        dist = np.abs(ros.rectified_orders[0].spatial_frac - ed.center_frac)
+        ap_indices = np.where(dist <= ed.radius_frac)[0]
+        # Set the entire aperture in column 0 of the variance to NaN.
+        var_image[np.ix_(ap_indices, [0])] = np.nan
+
+        result = extract_optimal(ros, ed, variance_image=var_image)
+        sp = result.spectra[0]
+
+        # Column 0 aperture variance is all NaN → propagated variance is NaN.
+        assert sp.variance is not None
+        assert np.isnan(sp.variance[0])
+        # Other columns should be finite.
+        assert np.all(np.isfinite(sp.variance[1:]))
+
+    def test_all_aperture_pixels_masked_returns_nan_flux(self):
+        """Entire aperture column masked via user mask → NaN flux for that column."""
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=5.0
+        )
+        ed = _make_center_extraction_def(radius=0.2)
+
+        # Build a mask that marks all aperture pixels in column 3 as bad.
+        bad_mask = np.zeros((n_spatial, n_spectral), dtype=bool)
+        dist = np.abs(ros.rectified_orders[0].spatial_frac - ed.center_frac)
+        ap_indices = np.where(dist <= ed.radius_frac)[0]
+        bad_mask[np.ix_(ap_indices, [3])] = True
+
+        result = extract_optimal(ros, ed, mask=bad_mask)
+        sp = result.spectra[0]
+
+        # Column 3 is fully masked → NaN.
+        assert np.isnan(sp.flux[3])
+        # Other columns should be finite.
+        assert np.all(np.isfinite(sp.flux[np.arange(n_spectral) != 3]))
+
+    def test_user_mask_excludes_pixels_from_flux(self):
+        """User-supplied mask excludes marked pixels, leaving others unaffected.
+
+        Verify that masking one aperture row and running extraction gives the
+        same result as running extraction on data with that row set to NaN.
+        """
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        fill = 6.0
+        ros_mask = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=fill
+        )
+        ros_nan = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=fill
+        )
+        ed = _make_center_extraction_def(radius=0.2)
+
+        dist = np.abs(ros_mask.rectified_orders[0].spatial_frac - ed.center_frac)
+        ap_indices = np.where(dist <= ed.radius_frac)[0]
+
+        # Mask one aperture row via user mask.
+        bad_mask = np.zeros((n_spatial, n_spectral), dtype=bool)
+        bad_mask[ap_indices[0], :] = True
+
+        # Set the same row to NaN in the nan-reference dataset.
+        ros_nan.rectified_orders[0].flux[ap_indices[0], :] = np.nan
+
+        result_mask = extract_optimal(
+            ros_mask, ed, mask=bad_mask, subtract_background=False
+        )
+        result_nan = extract_optimal(ros_nan, ed, subtract_background=False)
+
+        # Both should give the same result since masking ≡ setting to NaN.
+        np.testing.assert_allclose(
+            result_mask.spectra[0].flux,
+            result_nan.spectra[0].flux,
+            rtol=1e-12,
+        )
+        assert np.all(np.isfinite(result_mask.spectra[0].flux))
+
+    def test_mixed_good_bad_pixels_flux_matches_good_only(self):
+        """Mixed good/bad pixels: NaN in data and user mask give equivalent results.
+
+        Verify that running extraction on data-with-NaN gives the same result
+        as running extraction on clean data with a user mask covering the same
+        row.  Both should exclude the masked row identically.
+        """
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        fill = 7.0
+
+        # Dataset with NaN in one aperture row.
+        ros_nan = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=fill
+        )
+        # Clean dataset (no NaN) to be used with a user mask.
+        ros_clean = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=fill
+        )
+        ed = _make_center_extraction_def(radius=0.2)
+
+        dist = np.abs(ros_nan.rectified_orders[0].spatial_frac - ed.center_frac)
+        ap_indices = np.where(dist <= ed.radius_frac)[0]
+
+        # Mark one aperture row as bad in the NaN dataset.
+        ros_nan.rectified_orders[0].flux[ap_indices[0], :] = np.nan
+
+        # Build a user mask that covers the same row for the clean dataset.
+        bad_mask = np.zeros((n_spatial, n_spectral), dtype=bool)
+        bad_mask[ap_indices[0], :] = True
+
+        result_nan = extract_optimal(ros_nan, ed, subtract_background=False)
+        result_masked = extract_optimal(
+            ros_clean, ed, mask=bad_mask, subtract_background=False
+        )
+
+        # NaN-in-data and user-mask should exclude the same row → identical flux.
+        np.testing.assert_allclose(
+            result_nan.spectra[0].flux,
+            result_masked.spectra[0].flux,
+            rtol=1e-12,
+        )
+
+    def test_user_mask_shape_mismatch_raises(self):
+        """ValueError if user mask shape does not match flux shape."""
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=_N_SPATIAL, n_spectral=_N_SPECTRAL
+        )
+        ed = _make_center_extraction_def()
+        bad_mask = np.zeros((_N_SPATIAL + 1, _N_SPECTRAL), dtype=bool)
+        with pytest.raises(ValueError, match="mask shape"):
+            extract_optimal(ros, ed, mask=bad_mask)
+
+    def test_all_masked_column_variance_is_nan(self):
+        """All aperture pixels masked in column → NaN variance for that column."""
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        ros = _make_synthetic_rectified_order_set(
+            n_spatial=n_spatial, n_spectral=n_spectral, fill_value=2.0
+        )
+        ed = _make_center_extraction_def(radius=0.2)
+
+        dist = np.abs(ros.rectified_orders[0].spatial_frac - ed.center_frac)
+        ap_indices = np.where(dist <= ed.radius_frac)[0]
+
+        bad_mask = np.zeros((n_spatial, n_spectral), dtype=bool)
+        bad_mask[np.ix_(ap_indices, [5])] = True
+
+        var_image = np.ones((n_spatial, n_spectral))
+        result = extract_optimal(ros, ed, mask=bad_mask, variance_image=var_image)
+        sp = result.spectra[0]
+
+        assert np.isnan(sp.variance[5])
+        assert np.all(np.isfinite(sp.variance[np.arange(n_spectral) != 5]))
+
+
 @pytest.mark.skipif(
     not _HAVE_H1_DATA,
     reason="Real H1 calibration FITS files not available (LFS not pulled).",

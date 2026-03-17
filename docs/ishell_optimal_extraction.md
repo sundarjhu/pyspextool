@@ -221,5 +221,8 @@ Collection of per-order spectra.  Methods: ``get_order(order)``,
 - The wavelength axis is copied from the rectified order (not a reference).
 - NaN values from the rectification step are propagated silently.
 
+The extraction ignores non-finite pixels (NaN/inf) and any user-provided mask.
+Masked pixels do not contribute to the extracted flux or variance.
+
 See ``docs/ishell_scaffold_constraints.md`` for the full list of scaffold
 constraints.
