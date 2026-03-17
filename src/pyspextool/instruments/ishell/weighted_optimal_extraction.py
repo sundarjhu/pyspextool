@@ -1,10 +1,11 @@
 """
 Proto-Horne variance-weighted optimal-extraction scaffold for iSHELL 2DXD reduction.
 
-This module implements **Stages 17 and 18** of the iSHELL 2DXD reduction
+This module implements **Stages 17, 18, and 19** of the iSHELL 2DXD reduction
 scaffold.  Stage 17 introduced proto-Horne inverse-variance weighted extraction
 using the existing profile estimate and a per-pixel variance image.  Stage 18
-adds an optional iterative sigma-clipping outlier-rejection loop.
+adds an optional iterative sigma-clipping outlier-rejection loop.  Stage 19
+adds an optional profile re-estimation step inside the rejection loop.
 
 .. note::
     This is a **scaffold implementation**.  It is intentionally simple and
@@ -66,6 +67,9 @@ Pipeline stage summary
    * - **18**
      - **``weighted_optimal_extraction.py``**
      - **Iterative sigma-clipping outlier rejection (this module)**
+   * - **19**
+     - **``weighted_optimal_extraction.py``**
+     - **Profile re-estimation after iterative rejection (this module)**
 
 What this module does
 ---------------------
@@ -137,9 +141,10 @@ Stage-12 unweighted estimator for the flux, but the variance formula differs:
 
 What this module does NOT do (by design)
 -----------------------------------------
-* **No full Horne iterative profile re-estimation** – the spatial profile is
-  estimated once from the initial data and held fixed; it is not updated after
-  each rejection iteration.
+* **No full Horne iterative convergence** – Stage 19 adds profile
+  re-estimation after each rejection step (when *reestimate_profile* is
+  ``True``), but does not iterate to full convergence of the joint
+  (profile, rejection mask) pair as in Horne (1986).
 * **No PSF fitting beyond the empirical profile estimate** – profile is
   estimated directly from the data as in Stage 12.
 * **No automatic aperture centroiding** – center and radius are explicit.
@@ -279,6 +284,15 @@ class WeightedExtractionDefinition:
         2.  If rejecting all outlier candidates in a column would leave
         fewer than *min_valid_pixels* valid pixels, no pixels are rejected
         in that column for that iteration.
+    reestimate_profile : bool, optional
+        If ``True``, re-estimate the spatial profile from the surviving
+        good pixels after each rejection iteration.  Defaults to ``False``.
+        Has no effect when *reject_outliers* is ``False``.  When ``True``,
+        the profile used for the next iteration's model and for the final
+        extraction is updated using the same *profile_mode* and
+        *normalize_profile* settings.  This moves the scaffold closer to
+        the Horne (1986) iterative scheme but is still a scaffold
+        simplification (no full convergence criterion).
 
     Notes
     -----
@@ -303,6 +317,7 @@ class WeightedExtractionDefinition:
     max_iterations: int = 3
     sigma_clip: float = 5.0
     min_valid_pixels: int = 2
+    reestimate_profile: bool = False
 
     def __post_init__(self) -> None:
         """Validate extraction-definition parameters."""
@@ -422,6 +437,18 @@ class WeightedExtractedOrderSpectrum:
         Number of rejection iterations actually performed.  Zero if
         *reject_outliers* was ``False``.  May be less than *max_iterations*
         if the loop stopped early due to no new rejections.
+    profile_reestimated : bool
+        ``True`` if the spatial profile was actually re-estimated from the
+        surviving pixels during at least one rejection iteration.  Always
+        ``False`` when *reject_outliers* is ``False`` or *reestimate_profile*
+        is ``False``, and also ``False`` if no pixels were rejected (so
+        re-estimation never triggered).
+    initial_profile : ndarray or None, shape (n_ap_spatial, n_spectral)
+        The spatial profile computed from the original data before any
+        rejection-driven re-estimation.  Only populated (non-``None``) when
+        *profile_reestimated* is ``True``.  ``None`` otherwise.  Provided so
+        callers can compare the initial and final profiles when re-estimation
+        is active.
 
     Notes
     -----
@@ -443,6 +470,8 @@ class WeightedExtractedOrderSpectrum:
     n_rejected_pixels: int = 0
     final_mask: Optional[npt.NDArray] = None  # shape (n_ap_spatial, n_spectral)
     n_iterations_used: int = 0
+    profile_reestimated: bool = False
+    initial_profile: Optional[npt.NDArray] = None  # shape (n_ap_spatial, n_spectral)
 
     @property
     def n_spectral(self) -> int:
@@ -684,7 +713,10 @@ def _iterative_outlier_rejection(
     sigma_clip: float,
     max_iterations: int,
     min_valid_pixels: int,
-) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray, int, int]:
+    reestimate_profile: bool = False,
+    profile_mode: str = "global_median",
+    normalize_profile: bool = True,
+) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray, int, int, npt.NDArray, bool]:
     """Apply iterative sigma-clipping outlier rejection within the aperture.
 
     For each iteration:
@@ -701,13 +733,19 @@ def _iterative_outlier_rejection(
        - Per-column: if rejecting all candidates would leave fewer than
          *min_valid_pixels* valid pixels, skip the entire column.
 
-    6. Stop early if no new pixels were rejected in the last iteration.
+    6. If *reestimate_profile* is ``True``, re-estimate the spatial profile
+       from the currently surviving (non-rejected) pixels after committing
+       rejections.  The updated profile is used in subsequent iterations and
+       for the final extraction.
+
+    7. Stop early if no new pixels were rejected in the last iteration.
 
     Parameters
     ----------
     profile : ndarray, shape (n_ap, n_spectral)
-        Spatial profile array (optionally normalized).  Held fixed throughout
-        the iteration; the profile is not re-estimated after rejection.
+        Spatial profile array (optionally normalized).  Used as the initial
+        profile for the first iteration.  Updated after each rejection step
+        when *reestimate_profile* is ``True``.
     flux_ap : ndarray, shape (n_ap, n_spectral)
         Aperture flux sub-image.  Pixels already bad (NaN) are treated as
         initially masked and are never re-introduced.
@@ -719,6 +757,16 @@ def _iterative_outlier_rejection(
         Maximum number of iterations.  The loop may stop earlier.
     min_valid_pixels : int
         Minimum valid pixels that must remain per column after rejection.
+    reestimate_profile : bool, optional
+        If ``True``, re-estimate the spatial profile from the surviving pixels
+        after each rejection step.  The re-estimation uses *profile_mode* and
+        *normalize_profile*.  Defaults to ``False`` (Stage 18 behavior).
+    profile_mode : str, optional
+        Profile estimation mode (``"global_median"`` or ``"columnwise"``).
+        Only used when *reestimate_profile* is ``True``.
+    normalize_profile : bool, optional
+        Whether to normalize the re-estimated profile.  Only used when
+        *reestimate_profile* is ``True``.
 
     Returns
     -------
@@ -733,12 +781,21 @@ def _iterative_outlier_rejection(
         Total number of pixels rejected across all iterations.
     n_iterations_used : int
         Number of iterations performed (1 even if no rejections occurred).
+    final_profile : ndarray, shape (n_ap, n_spectral)
+        The spatial profile used at the end of the rejection loop.  Equal to
+        the input *profile* if *reestimate_profile* is ``False`` or if no
+        rejections occurred.  Otherwise the re-estimated profile.
+    profile_was_reestimated : bool
+        ``True`` if the profile was actually re-estimated at least once
+        (i.e. *reestimate_profile* was ``True`` and at least one rejection
+        was committed).
 
     Notes
     -----
-    The spatial profile is **not** re-estimated after each rejection.  This is
-    a scaffold simplification; a full Horne (1986) implementation would
-    iterate the profile estimate as well.
+    When *reestimate_profile* is ``False``, the spatial profile is **not**
+    re-estimated after each rejection.  This is the Stage 18 scaffold
+    behavior.  Setting *reestimate_profile* to ``True`` moves the scaffold
+    one step closer to the Horne (1986) iterative scheme.
     """
     n_ap, n_spectral = flux_ap.shape
 
@@ -753,6 +810,10 @@ def _iterative_outlier_rejection(
     flux_work = np.where(initially_bad, np.nan, flux_ap)
     var_work = np.where(initially_bad, np.nan, var_ap)
 
+    # Working profile — may be updated when reestimate_profile=True.
+    profile_work = profile.copy()
+    profile_was_reestimated = False
+
     n_rejected = 0
     n_iterations_used = 0
 
@@ -760,10 +821,10 @@ def _iterative_outlier_rejection(
         n_iterations_used += 1
 
         # Extract current best-estimate 1-D spectrum.
-        flux_1d, _, _ = _horne_weighted_extract(profile, flux_work, var_work)
+        flux_1d, _, _ = _horne_weighted_extract(profile_work, flux_work, var_work)
 
         # Build model image: profile[i,col] * flux_1d[col].
-        model = profile * flux_1d[np.newaxis, :]  # (n_ap, n_spectral)
+        model = profile_work * flux_1d[np.newaxis, :]  # (n_ap, n_spectral)
 
         # Residuals (NaN where flux_work is NaN or flux_1d is NaN).
         resid = flux_work - model  # (n_ap, n_spectral)
@@ -809,7 +870,22 @@ def _iterative_outlier_rejection(
         var_work = np.where(new_bad, np.nan, var_work)
         n_rejected += int(np.sum(new_bad))
 
-    return flux_work, var_work, reject_mask, n_rejected, n_iterations_used
+        # Re-estimate profile from surviving pixels (Stage 19, optional).
+        if reestimate_profile:
+            profile_work = _estimate_profile(
+                flux_work, profile_mode, normalize_profile
+            )
+            profile_was_reestimated = True
+
+    return (
+        flux_work,
+        var_work,
+        reject_mask,
+        n_rejected,
+        n_iterations_used,
+        profile_work,
+        profile_was_reestimated,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1049,18 +1125,34 @@ def extract_weighted_optimal(
         n_rejected = 0
         n_iter_used = 0
         final_mask_ap: Optional[npt.NDArray] = None
+        profile_reestimated = False
+        initial_profile_ap: Optional[npt.NDArray] = None
         if extraction_def.reject_outliers:
-            flux_ap, var_ap, rejection_mask, n_rejected, n_iter_used = (
-                _iterative_outlier_rejection(
-                    profile,
-                    flux_ap,
-                    var_ap,
-                    sigma_clip=extraction_def.sigma_clip,
-                    max_iterations=extraction_def.max_iterations,
-                    min_valid_pixels=extraction_def.min_valid_pixels,
-                )
+            if extraction_def.reestimate_profile:
+                initial_profile_ap = profile.copy()
+            (
+                flux_ap,
+                var_ap,
+                rejection_mask,
+                n_rejected,
+                n_iter_used,
+                profile,
+                profile_reestimated,
+            ) = _iterative_outlier_rejection(
+                profile,
+                flux_ap,
+                var_ap,
+                sigma_clip=extraction_def.sigma_clip,
+                max_iterations=extraction_def.max_iterations,
+                min_valid_pixels=extraction_def.min_valid_pixels,
+                reestimate_profile=extraction_def.reestimate_profile,
+                profile_mode=extraction_def.profile_mode,
+                normalize_profile=extraction_def.normalize_profile,
             )
             final_mask_ap = rejection_mask
+            # Only keep initial_profile when re-estimation actually happened.
+            if not profile_reestimated:
+                initial_profile_ap = None
 
         # -- Proto-Horne weighted extraction --
         n_pixels_used = _count_aperture_pixels(flux_ap)
@@ -1082,6 +1174,8 @@ def extract_weighted_optimal(
                 n_rejected_pixels=n_rejected,
                 final_mask=final_mask_ap,
                 n_iterations_used=n_iter_used,
+                profile_reestimated=profile_reestimated,
+                initial_profile=initial_profile_ap,
             )
         )
 

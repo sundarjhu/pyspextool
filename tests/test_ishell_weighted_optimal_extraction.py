@@ -2048,3 +2048,644 @@ class TestH1IterativeRejectionSmokeTest:
         for sp in r_yes.spectra:
             assert sp.final_mask is not None
             assert sp.n_rejected_pixels == int(np.sum(sp.final_mask))
+
+
+# ===========================================================================
+
+
+# ===========================================================================
+# 17. Stage 19: Profile re-estimation — definition-level tests
+# ===========================================================================
+
+
+class TestReestimateProfileDefinition:
+    """Tests for the reestimate_profile field on WeightedExtractionDefinition."""
+
+    def test_reestimate_profile_default_false(self):
+        """reestimate_profile defaults to False."""
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.1)
+        assert ed.reestimate_profile is False
+
+    def test_reestimate_profile_can_be_set_true(self):
+        """reestimate_profile=True is accepted."""
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.1,
+            reject_outliers=True, reestimate_profile=True,
+        )
+        assert ed.reestimate_profile is True
+
+    def test_reestimate_profile_true_without_reject_outliers_accepted(self):
+        """reestimate_profile=True with reject_outliers=False is silently accepted.
+
+        The flag is simply ignored when reject_outliers=False.
+        """
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.1,
+            reject_outliers=False, reestimate_profile=True,
+        )
+        assert ed.reestimate_profile is True
+
+
+# ===========================================================================
+# 18. Stage 19: Profile re-estimation — bookkeeping field tests
+# ===========================================================================
+
+
+class TestReestimateProfileBookkeeping:
+    """Tests for profile_reestimated / initial_profile on WeightedExtractedOrderSpectrum."""
+
+    def test_profile_reestimated_false_no_rejection(self):
+        """profile_reestimated is False when reject_outliers=False."""
+        ros, variance = _make_outlier_ros()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5, reject_outliers=False,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        for sp in result.spectra:
+            assert sp.profile_reestimated is False
+
+    def test_initial_profile_none_no_rejection(self):
+        """initial_profile is None when reject_outliers=False."""
+        ros, variance = _make_outlier_ros()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5, reject_outliers=False,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        for sp in result.spectra:
+            assert sp.initial_profile is None
+
+    def test_profile_reestimated_false_when_reestimate_false(self):
+        """profile_reestimated is False when reestimate_profile=False."""
+        ros, variance = _make_outlier_ros()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=False,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        for sp in result.spectra:
+            assert sp.profile_reestimated is False
+
+    def test_initial_profile_none_when_reestimate_false(self):
+        """initial_profile is None when reestimate_profile=False."""
+        ros, variance = _make_outlier_ros()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=False,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        for sp in result.spectra:
+            assert sp.initial_profile is None
+
+    def test_profile_reestimated_true_when_outlier_rejected(self):
+        """profile_reestimated is True after an outlier is actually rejected.
+
+        Uses the default _make_outlier_ros() outlier amplitude (50.0) which
+        produces a single-pixel outlier detectable by sigma_clip=3.0 with a
+        global_median profile (the outlier doesn't dominate the row median,
+        so the profile is unbiased, and the residual at the outlier pixel is
+        large).
+        """
+        ros, variance = _make_outlier_ros()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True, sigma_clip=3.0,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        sp = result.spectra[0]
+        # The large outlier must be rejected for re-estimation to happen.
+        assert sp.n_rejected_pixels > 0, "Expected outlier to be rejected."
+        assert sp.profile_reestimated is True
+
+    def test_initial_profile_stored_when_reestimated(self):
+        """initial_profile is a 2-D array when profile_reestimated is True."""
+        ros, variance = _make_outlier_ros()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True, sigma_clip=3.0,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        sp = result.spectra[0]
+        assert sp.n_rejected_pixels > 0, "Expected outlier to be rejected."
+        assert sp.initial_profile is not None
+        assert sp.initial_profile.ndim == 2
+        assert sp.initial_profile.shape == sp.profile.shape
+
+    def test_initial_profile_is_independent_copy(self):
+        """initial_profile is a separate array, not aliased to profile."""
+        ros, variance = _make_outlier_ros()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True, sigma_clip=3.0,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        sp = result.spectra[0]
+        assert sp.n_rejected_pixels > 0, "Expected outlier to be rejected."
+        assert sp.initial_profile is not None
+        # Must be distinct Python objects (not aliases of each other).
+        assert sp.initial_profile is not sp.profile
+
+    def test_initial_profile_and_profile_identical_for_robust_global_median(self):
+        """With global_median mode and a single-pixel outlier, initial and final
+        profile values are numerically identical.
+
+        global_median estimates the profile via per-row nanmedian.  A single
+        outlier pixel (one column out of n_spectral) does not affect the
+        row median, so re-estimation after rejection produces the same values.
+        This is expected and correct scaffold behavior: re-estimation is
+        conservative and does no harm.
+        """
+        ros, variance = _make_outlier_ros()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True, sigma_clip=3.0,
+            profile_mode="global_median",
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        sp = result.spectra[0]
+        assert sp.n_rejected_pixels > 0, "Expected outlier to be rejected."
+        assert sp.initial_profile is not None
+        # Values should be numerically identical (global_median is robust
+        # to a single-pixel outlier out of n_spectral columns).
+        np.testing.assert_allclose(
+            sp.initial_profile, sp.profile, rtol=1e-12, equal_nan=True
+        )
+
+    def test_profile_reestimated_false_when_no_pixels_rejected(self):
+        """profile_reestimated is False when no outlier pixels are rejected (clean data)."""
+        ros = _make_synthetic_rectified_order_set()
+        variance = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.2,
+            reject_outliers=True, reestimate_profile=True,
+            sigma_clip=100.0,  # very loose: nothing will be rejected
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        for sp in result.spectra:
+            assert sp.n_rejected_pixels == 0
+            assert sp.profile_reestimated is False
+            assert sp.initial_profile is None
+
+
+# ===========================================================================
+# 19. Stage 19: Profile re-estimation — behavioral correctness tests
+# ===========================================================================
+
+
+class TestReestimateProfileBehavior:
+    """Behavioral tests for profile re-estimation in the rejection loop."""
+
+    def test_reestimate_false_preserves_stage18_behavior(self):
+        """reestimate_profile=False gives identical results to Stage 18."""
+        ros, variance = _make_outlier_ros()
+
+        ed_stage18 = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=False,
+        )
+        ed_stage19 = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=False,
+        )
+        r18 = extract_weighted_optimal(ros, ed_stage18, variance_image=variance)
+        r19 = extract_weighted_optimal(ros, ed_stage19, variance_image=variance)
+
+        sp18 = r18.spectra[0]
+        sp19 = r19.spectra[0]
+        np.testing.assert_array_equal(sp18.flux, sp19.flux)
+        np.testing.assert_array_equal(sp18.variance, sp19.variance)
+        assert sp18.n_rejected_pixels == sp19.n_rejected_pixels
+
+    def test_clean_data_identical_with_and_without_reestimation(self):
+        """Clean data gives identical flux/variance whether or not re-estimation is active."""
+        ros = _make_synthetic_rectified_order_set()
+        variance = np.ones((_N_SPATIAL, _N_SPECTRAL))
+
+        ed_no_re = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.2,
+            reject_outliers=True, reestimate_profile=False, sigma_clip=5.0,
+        )
+        ed_with_re = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.2,
+            reject_outliers=True, reestimate_profile=True, sigma_clip=5.0,
+        )
+        r_no = extract_weighted_optimal(ros, ed_no_re, variance_image=variance)
+        r_with = extract_weighted_optimal(ros, ed_with_re, variance_image=variance)
+
+        for sp_no, sp_with in zip(r_no.spectra, r_with.spectra):
+            np.testing.assert_allclose(
+                sp_no.flux, sp_with.flux, rtol=1e-10, equal_nan=True
+            )
+            np.testing.assert_allclose(
+                sp_no.variance, sp_with.variance, rtol=1e-10, equal_nan=True
+            )
+
+    def test_reestimation_produces_valid_output_with_contaminated_data(self):
+        """Profile re-estimation runs without error and produces finite output
+        in the presence of a single-pixel outlier.
+
+        With global_median profile mode, a single-pixel outlier is detected
+        (not absorbed by the robust median), rejected, and then the profile is
+        re-estimated.  The re-estimated profile equals the initial profile
+        numerically (global_median is robust), but the outlier pixel is
+        correctly excluded from the final extraction.
+        """
+        ros, variance = _make_outlier_ros()
+
+        ed_reest = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True,
+            sigma_clip=3.0,
+        )
+        result = extract_weighted_optimal(ros, ed_reest, variance_image=variance)
+        sp = result.spectra[0]
+
+        # Must have rejected the outlier pixel.
+        assert sp.n_rejected_pixels > 0
+
+        # Flux at clean columns must be finite.
+        clean_cols = [c for c in range(_N_SPEC_OUTLIER) if c != _OUTLIER_COL]
+        for c in clean_cols:
+            assert np.isfinite(sp.flux[c]), f"Flux at clean column {c} should be finite."
+
+        # Flux at the outlier column should be finite and close to the true value
+        # (outlier pixel was rejected so it no longer inflates the result).
+        assert np.isfinite(sp.flux[_OUTLIER_COL])
+        assert abs(sp.flux[_OUTLIER_COL] - _TRUE_FLUX) < 5.0, (
+            f"Outlier-column flux {sp.flux[_OUTLIER_COL]:.2f} should be close to "
+            f"true flux {_TRUE_FLUX} after rejection."
+        )
+
+    def test_reestimation_corrects_outlier_column_flux(self):
+        """After rejection with re-estimation, the outlier-column flux improves
+        compared to the no-rejection baseline.
+
+        When reject_outliers=False, the extracted flux at the outlier column is
+        biased upward by the outlier pixel.  When reject_outliers=True (with or
+        without re-estimation), the outlier is removed and the flux recovers.
+        """
+        ros, variance = _make_outlier_ros()
+
+        ed_no_rej = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5, reject_outliers=False,
+        )
+        ed_with_reest = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True, sigma_clip=3.0,
+        )
+        r_no_rej = extract_weighted_optimal(ros, ed_no_rej, variance_image=variance)
+        r_with_reest = extract_weighted_optimal(ros, ed_with_reest, variance_image=variance)
+
+        sp_no = r_no_rej.spectra[0]
+        sp_re = r_with_reest.spectra[0]
+
+        # Without rejection, outlier column flux is inflated.
+        assert sp_no.flux[_OUTLIER_COL] > _TRUE_FLUX + 10.0, (
+            "Expected inflated flux at outlier column without rejection."
+        )
+
+        # With rejection+re-estimation, flux is closer to the true value.
+        assert abs(sp_re.flux[_OUTLIER_COL] - _TRUE_FLUX) < 5.0, (
+            f"Flux at outlier column should recover after rejection. "
+            f"Got {sp_re.flux[_OUTLIER_COL]:.2f}, expected ~{_TRUE_FLUX}."
+        )
+
+    def test_profile_normalization_holds_after_reestimation(self):
+        """Profile columns sum to 1.0 (approximately) after re-estimation."""
+        ros, variance = _make_outlier_ros()
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True,
+            sigma_clip=3.0, normalize_profile=True,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        sp = result.spectra[0]
+
+        # For each finite column of the final profile, sum should be ≈ 1.
+        profile = sp.profile
+        for col in range(profile.shape[1]):
+            col_vals = profile[:, col]
+            finite_vals = col_vals[np.isfinite(col_vals)]
+            if len(finite_vals) > 0:
+                col_sum = float(np.sum(finite_vals))
+                assert abs(col_sum - 1.0) < 1e-9, (
+                    f"Profile column {col} sum = {col_sum:.6f} != 1.0 "
+                    f"after re-estimation."
+                )
+
+    def test_output_shapes_unchanged_with_reestimation(self):
+        """Output shapes are identical with and without re-estimation."""
+        ros, variance = _make_outlier_ros()
+        ed_no = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=False, sigma_clip=3.0,
+        )
+        ed_yes = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True, sigma_clip=3.0,
+        )
+        r_no = extract_weighted_optimal(ros, ed_no, variance_image=variance)
+        r_yes = extract_weighted_optimal(ros, ed_yes, variance_image=variance)
+
+        sp_no = r_no.spectra[0]
+        sp_yes = r_yes.spectra[0]
+        assert sp_no.flux.shape == sp_yes.flux.shape
+        assert sp_no.variance.shape == sp_yes.variance.shape
+        assert sp_no.profile.shape == sp_yes.profile.shape
+
+
+# ===========================================================================
+# 20. Stage 19: Profile re-estimation — stability / edge-case tests
+# ===========================================================================
+
+
+class TestReestimateProfileStability:
+    """Stability and edge-case tests for profile re-estimation."""
+
+    def test_nearly_empty_aperture_no_crash(self):
+        """Re-estimation with a nearly empty aperture does not crash.
+
+        When the aperture contains only 1 or 2 spatial pixels (radius very
+        small), re-estimation should not raise.
+        """
+        n_spatial = 20
+        n_spectral = 16
+        spatial_frac = np.linspace(0.0, 1.0, n_spatial)
+        flux_2d = np.full((n_spatial, n_spectral), 2.0)
+        # Inject a mild outlier near the center.
+        center_idx = n_spatial // 2
+        flux_2d[center_idx, 3] += 50.0
+        variance = np.ones((n_spatial, n_spectral))
+
+        order = RectifiedOrder(
+            order=311, order_index=0,
+            wavelength_um=np.linspace(1.55, 1.60, n_spectral),
+            spatial_frac=spatial_frac,
+            flux=flux_2d,
+            source_image_shape=(200, 800),
+        )
+        ros = RectifiedOrderSet(
+            mode="H1_test", rectified_orders=[order],
+            source_image_shape=(200, 800),
+        )
+
+        # radius_frac=0.01 means only ~1 spatial pixel is in the aperture.
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.01,
+            reject_outliers=True, reestimate_profile=True, sigma_clip=3.0,
+        )
+        # Must not raise.
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        sp = result.spectra[0]
+        assert sp.flux.shape == (n_spectral,)
+
+    def test_min_valid_pixels_guard_with_reestimation(self):
+        """min_valid_pixels guard still works when re-estimation is active.
+
+        With min_valid_pixels equal to the aperture size, no pixels can
+        ever be rejected (it would leave too few valid pixels).
+        """
+        n_spatial = 5  # small aperture for control
+        n_spectral = 16
+        spatial_frac = np.linspace(0.0, 1.0, n_spatial)
+        flux_2d = np.full((n_spatial, n_spectral), 2.0)
+        # Inject a large outlier.
+        flux_2d[2, 4] += 1000.0
+        variance = np.ones((n_spatial, n_spectral))
+
+        order = RectifiedOrder(
+            order=311, order_index=0,
+            wavelength_um=np.linspace(1.55, 1.60, n_spectral),
+            spatial_frac=spatial_frac,
+            flux=flux_2d,
+            source_image_shape=(200, 800),
+        )
+        ros = RectifiedOrderSet(
+            mode="H1_test", rectified_orders=[order],
+            source_image_shape=(200, 800),
+        )
+
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True,
+            sigma_clip=1.0,  # very aggressive threshold
+            min_valid_pixels=n_spatial,  # can't reject any pixel
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        sp = result.spectra[0]
+        # Nothing should have been rejected (min_valid_pixels guard).
+        assert sp.n_rejected_pixels == 0
+        assert sp.profile_reestimated is False
+
+    def test_early_stopping_still_works_with_reestimation(self):
+        """Early stopping halts when no new pixels are rejected, even with re-estimation."""
+        # Clean data: no pixels should be rejected.
+        ros = _make_synthetic_rectified_order_set()
+        variance = np.ones((_N_SPATIAL, _N_SPECTRAL))
+
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.2,
+            reject_outliers=True, reestimate_profile=True,
+            sigma_clip=100.0,  # nothing will be rejected
+            max_iterations=5,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        for sp in result.spectra:
+            # Should stop after 1 iteration (nothing to reject in iteration 1).
+            assert sp.n_iterations_used == 1
+            assert sp.n_rejected_pixels == 0
+
+    def test_max_iterations_bound_with_reestimation(self):
+        """n_iterations_used does not exceed max_iterations with re-estimation active."""
+        ros, variance = _make_outlier_ros()
+        max_iter = 2
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True,
+            sigma_clip=3.0, max_iterations=max_iter,
+        )
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        for sp in result.spectra:
+            assert sp.n_iterations_used <= max_iter
+
+    def test_mask_handling_with_reestimation(self):
+        """User mask is still respected when re-estimation is active."""
+        ros, variance = _make_outlier_ros()
+        n_spatial = _N_AP_OUTLIER
+        n_spectral = _N_SPEC_OUTLIER
+
+        # Mask entire column 0 in the aperture.
+        mask = np.zeros((n_spatial, n_spectral), dtype=bool)
+        mask[:, 0] = True
+
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.5,
+            reject_outliers=True, reestimate_profile=True, sigma_clip=5.0,
+        )
+        result = extract_weighted_optimal(
+            ros, ed, variance_image=variance, mask=mask
+        )
+        sp = result.spectra[0]
+        # Column 0 should have NaN flux (all pixels masked).
+        assert np.isnan(sp.flux[0]), "Masked column should produce NaN flux."
+        # Other columns should be finite.
+        assert np.isfinite(sp.flux[1])
+
+    def test_reestimation_no_crash_with_single_pixel_aperture(self):
+        """Re-estimation does not crash when only 1 spatial pixel is in the aperture."""
+        n_spatial = 10
+        n_spectral = 8
+        spatial_frac = np.linspace(0.0, 1.0, n_spatial)
+        flux_2d = np.full((n_spatial, n_spectral), 5.0)
+        variance = np.ones((n_spatial, n_spectral))
+
+        order = RectifiedOrder(
+            order=311, order_index=0,
+            wavelength_um=np.linspace(1.55, 1.60, n_spectral),
+            spatial_frac=spatial_frac,
+            flux=flux_2d,
+            source_image_shape=(200, 800),
+        )
+        ros = RectifiedOrderSet(
+            mode="H1_test", rectified_orders=[order],
+            source_image_shape=(200, 800),
+        )
+
+        # Very small radius: only 1 spatial pixel in the aperture.
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=1.0 / (2 * n_spatial),
+            reject_outliers=True, reestimate_profile=True,
+            sigma_clip=3.0, min_valid_pixels=1,
+        )
+        # Must not raise.
+        result = extract_weighted_optimal(ros, ed, variance_image=variance)
+        assert result is not None
+
+
+# ===========================================================================
+# 21. Stage 19: Profile re-estimation — H1 smoke tests
+# ===========================================================================
+
+
+@pytest.mark.skipif(not _HAVE_H1_DATA, reason="Real H1 LFS data not available")
+class TestH1ProfileReestimationSmokeTest:
+    """Smoke tests for reject_outliers=True with reestimate_profile True/False."""
+
+    @pytest.fixture(scope="class")
+    def h1_reestimation_results(self):
+        """Run weighted extraction with fixed profile and re-estimated profile."""
+        import astropy.io.fits as fits
+
+        from pyspextool.instruments.ishell.arc_tracing import trace_arc_lines
+        from pyspextool.instruments.ishell.calibrations import (
+            read_line_list,
+            read_wavecalinfo,
+        )
+        from pyspextool.instruments.ishell.rectification_indices import (
+            build_rectification_indices,
+        )
+        from pyspextool.instruments.ishell.rectified_orders import (
+            build_rectified_orders,
+        )
+        from pyspextool.instruments.ishell.tracing import trace_orders_from_flat
+        from pyspextool.instruments.ishell.wavecal_2d import (
+            fit_provisional_wavelength_map,
+        )
+        from pyspextool.instruments.ishell.wavecal_2d_refine import (
+            fit_refined_coefficient_surface,
+        )
+
+        flat_trace = trace_orders_from_flat(
+            _H1_FLAT_FILES, col_range=(650, 1550)
+        )
+        geom = flat_trace.to_order_geometry_set("H1", col_range=(650, 1550))
+        arc_result = trace_arc_lines(_H1_ARC_FILES, geom)
+        wci = read_wavecalinfo("H1")
+        ll = read_line_list("H1")
+        wav_map = fit_provisional_wavelength_map(
+            arc_result, wci, ll, dispersion_degree=3
+        )
+        surface = fit_refined_coefficient_surface(wav_map, disp_degree=3)
+        rect_indices = build_rectification_indices(geom, surface, wav_map=wav_map)
+        with fits.open(_H1_FLAT_FILES[0]) as hdul:
+            detector_image = hdul[0].data.astype(float)
+        rectified = build_rectified_orders(detector_image, rect_indices)
+
+        var_model = VarianceModelDefinition(
+            read_noise_electron=11.0,
+            gain_e_per_adu=1.8,
+        )
+        base = dict(
+            center_frac=0.5,
+            radius_frac=0.2,
+            background_inner=0.3,
+            background_outer=0.45,
+            profile_mode="global_median",
+            reject_outliers=True,
+            sigma_clip=5.0,
+            max_iterations=3,
+        )
+        ed_fixed = WeightedExtractionDefinition(**base, reestimate_profile=False)
+        ed_reest = WeightedExtractionDefinition(**base, reestimate_profile=True)
+
+        r_fixed = extract_weighted_optimal(
+            rectified, ed_fixed, variance_model=var_model, subtract_background=True
+        )
+        r_reest = extract_weighted_optimal(
+            rectified, ed_reest, variance_model=var_model, subtract_background=True
+        )
+        return r_fixed, r_reest, rectified
+
+    def test_no_crashes(self, h1_reestimation_results):
+        """Both reestimate_profile=False and True complete without error."""
+        r_fixed, r_reest, _ = h1_reestimation_results
+        assert r_fixed is not None
+        assert r_reest is not None
+
+    def test_output_shapes_identical(self, h1_reestimation_results):
+        """Output array shapes are unchanged by reestimate_profile=True."""
+        r_fixed, r_reest, _ = h1_reestimation_results
+        for sp_f, sp_r in zip(r_fixed.spectra, r_reest.spectra):
+            assert sp_f.flux.shape == sp_r.flux.shape
+            assert sp_f.variance.shape == sp_r.variance.shape
+            assert sp_f.profile.shape == sp_r.profile.shape
+
+    def test_spectra_well_formed(self, h1_reestimation_results):
+        """Spectra and variance arrays are well-formed with re-estimation."""
+        _, r_reest, _ = h1_reestimation_results
+        for sp in r_reest.spectra:
+            finite_frac = np.mean(np.isfinite(sp.flux))
+            assert finite_frac > 0.5, (
+                f"Order {sp.order}: fewer than 50% of flux values are finite "
+                f"with reestimate_profile=True ({finite_frac:.1%})."
+            )
+            # Variance non-negative where finite.
+            fin_var = sp.variance[np.isfinite(sp.variance)]
+            if len(fin_var) > 0:
+                assert np.all(fin_var >= 0.0), (
+                    f"Order {sp.order}: negative variance with reestimate_profile=True."
+                )
+
+    def test_bookkeeping_consistent(self, h1_reestimation_results):
+        """profile_reestimated and initial_profile are consistently populated."""
+        r_fixed, r_reest, _ = h1_reestimation_results
+        for sp in r_fixed.spectra:
+            # Fixed profile: no re-estimation.
+            assert sp.profile_reestimated is False
+            assert sp.initial_profile is None
+        for sp in r_reest.spectra:
+            # Re-estimation enabled.  If any pixels were rejected,
+            # re-estimation should have happened.
+            if sp.n_rejected_pixels > 0:
+                assert sp.profile_reestimated is True
+                assert sp.initial_profile is not None
+                assert sp.initial_profile.shape == sp.profile.shape
+            else:
+                # No rejections → no re-estimation.
+                assert sp.profile_reestimated is False
+                assert sp.initial_profile is None
+
+    def test_n_iterations_consistent(self, h1_reestimation_results):
+        """n_iterations_used >= 1 for every order when reject_outliers=True."""
+        _, r_reest, _ = h1_reestimation_results
+        for sp in r_reest.spectra:
+            assert sp.n_iterations_used >= 1

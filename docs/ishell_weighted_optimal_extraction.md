@@ -1,4 +1,4 @@
-# iSHELL Weighted Optimal Extraction (Stages 17 & 18) — Scaffold Documentation
+# iSHELL Weighted Optimal Extraction (Stages 17, 18 & 19) — Scaffold Documentation
 
 > **Scaffold status.** This module is a provisional scaffold for the
 > iSHELL 2DXD reduction pipeline.  It is intentionally simplified and
@@ -8,7 +8,7 @@
 
 ## Overview
 
-`weighted_optimal_extraction.py` implements **Stages 17 and 18** of the
+`weighted_optimal_extraction.py` implements **Stages 17, 18, and 19** of the
 iSHELL 2DXD scaffold.
 
 - **Stage 17** introduced proto-Horne inverse-variance weighted spectral
@@ -21,7 +21,13 @@ iSHELL 2DXD scaffold.
   outlier-rejection loop** that identifies and removes discrepant
   (e.g. cosmic-ray-like) pixels before the final extraction pass.
 
-Both stages are scaffold implementations and are **not** complete
+- **Stage 19** extends Stage 18 with an optional **profile re-estimation
+  step** inside the rejection loop.  After each iteration that rejects new
+  pixels, the spatial profile is re-estimated from the surviving good pixels
+  before proceeding to the next iteration.  This moves the scaffold one step
+  closer to the iterative Horne (1986) scheme.
+
+All stages are scaffold implementations and are **not** complete
 Spextool-equivalent implementations.
 
 ---
@@ -88,6 +94,7 @@ The combination makes this module the first scaffold stage to implement
 | Weights | profile-squared only | profile-squared / variance |
 | Closer to Horne? | No | Yes |
 | Iterative rejection | No | Optional (Stage 18) |
+| Profile re-estimation | No | Optional (Stage 19) |
 
 When `V = 1` (unit variance, the fallback), the extracted **flux** is
 identical to the Stage-12 formula:
@@ -218,7 +225,9 @@ For each iteration (up to `max_iterations`):
      would leave fewer than `min_valid_pixels` valid pixels, the entire
      column is skipped for that iteration.
 
-6. **Stop early** if no new pixels were rejected in the last iteration.
+6. **Optionally re-estimate the profile** (Stage 19; see below).
+
+7. **Stop early** if no new pixels were rejected in the last iteration.
 
 ### Parameters
 
@@ -228,20 +237,25 @@ For each iteration (up to `max_iterations`):
 | `sigma_clip` | `5.0` | Rejection threshold in units of `resid / sqrt(V)` |
 | `max_iterations` | `3` | Maximum number of rejection iterations |
 | `min_valid_pixels` | `2` | Minimum valid pixels that must remain per column |
+| `reestimate_profile` | `False` | Re-estimate profile after each rejection iteration (Stage 19) |
 
 ### Output bookkeeping
 
-The returned `WeightedExtractedOrderSpectrum` includes three additional
-fields when rejection is enabled:
+The returned `WeightedExtractedOrderSpectrum` includes additional fields
+when rejection is enabled:
 
 | Field | Type | Description |
 |---|---|---|
 | `n_rejected_pixels` | `int` | Total pixels rejected across all iterations |
 | `final_mask` | `ndarray[bool]` or `None` | `True` where iteratively rejected (shape: `n_ap × n_spectral`) |
 | `n_iterations_used` | `int` | Number of iterations performed |
+| `profile_reestimated` | `bool` | `True` if profile was re-estimated at least once (Stage 19) |
+| `initial_profile` | `ndarray` or `None` | Profile before any re-estimation; `None` if not re-estimated |
 
 When `reject_outliers=False`, `n_rejected_pixels=0`, `final_mask=None`,
-and `n_iterations_used=0`.
+and `n_iterations_used=0`.  `profile_reestimated` is always `False` and
+`initial_profile` is always `None` when `reject_outliers=False` or
+`reestimate_profile=False` or no pixels were rejected.
 
 ### Relationship to Horne (1986)
 
@@ -255,18 +269,14 @@ Horne (1986) describes an iterative rejection scheme that:
 
 This scaffold differs in important ways:
 
-- The spatial profile is **held fixed** after the initial estimate.  It is
-  not re-estimated after rejection.  This means that if an outlier
-  significantly biases the profile estimate (e.g. in `columnwise` mode),
-  the residuals in the first iteration may not perfectly isolate the
-  outlier.  The `global_median` profile mode is more robust in this regard.
-- Only a finite number of iterations (`max_iterations`) are performed.
 - The `min_valid_pixels` guard is a conservative scaffold simplification
   that prevents over-rejection in columns with few valid pixels.
+- Only a finite number of iterations (`max_iterations`) are performed.
+- Profile re-estimation (Stage 19) is optional via `reestimate_profile=True`.
+  When disabled (default), the profile is held fixed after the initial estimate.
 
 ### Limitations of this scaffold
 
-- **No profile re-estimation after rejection.**
 - **Cascade rejection risk**: if one large outlier inflates the extracted
   flux substantially, the model at other aperture pixels may also be
   inflated, causing their residuals to exceed `sigma_clip`.  The
@@ -276,15 +286,106 @@ This scaffold differs in important ways:
 
 ---
 
+## Profile re-estimation after rejection (Stage 19)
+
+Stage 19 adds an optional profile re-estimation step inside the rejection
+loop.  Enable it by setting `reestimate_profile=True` in the
+`WeightedExtractionDefinition`.
+
+### Where in the loop the profile is recomputed
+
+The re-estimation happens **after committing new rejections** in each
+iteration, and **before** starting the next iteration:
+
+```
+for each iteration:
+    1. Extract current 1-D spectrum using profile_work
+    2. Build model: model[i, col] = profile_work[i, col] * flux_1d[col]
+    3. Compute normalized residuals
+    4. Identify outlier candidates (|norm_resid| > sigma_clip)
+    5. Apply min_valid_pixels guard per column
+    6. Commit new rejections (set rejected pixels to NaN)
+    7. [Stage 19] If reestimate_profile=True: recompute profile_work
+       from flux_work (current good pixels only), using same profile_mode
+       and normalize_profile settings
+    8. Check for early stop (no new rejections)
+
+Final extraction uses profile_work (possibly re-estimated)
+```
+
+### Profile estimation modes
+
+The re-estimated profile uses the **same** `profile_mode` and
+`normalize_profile` settings as the initial profile:
+
+- **`"global_median"`** (default): re-estimated as `nanmedian(flux_work,
+  axis=1)`, giving a per-row profile averaged across surviving spectral
+  columns.  This mode is robust: a single rejected pixel has little effect
+  on the row median if other columns are unaffected.
+
+- **`"columnwise"`**: re-estimated independently per spectral column from
+  `flux_work[:, col]`.  This tracks column-to-column variation but can be
+  noisy and tends to absorb outliers into the profile (making them harder
+  to detect in the first place).
+
+### Backward compatibility
+
+- If `reestimate_profile=False` (default): behavior is identical to Stage 18.
+- If `reject_outliers=False`: the `reestimate_profile` flag is ignored.
+- If `reject_outliers=True` and `reestimate_profile=True` but no pixels are
+  rejected: `profile_reestimated=False` and `initial_profile=None`.
+
+### How this moves the scaffold closer to Horne-style extraction
+
+In full Horne (1986) extraction, the profile is estimated from a high-S/N
+source (e.g. many co-added exposures) and is NOT estimated from the data
+being extracted.  Stage 19 makes a conservative step toward this ideal:
+
+- After each rejection, the profile is re-estimated from the **surviving
+  uncontaminated pixels** rather than from the original (possibly outlier-
+  contaminated) data.
+- This ensures that if an outlier significantly biased the initial profile
+  estimate, subsequent iterations use an improved profile that excludes the
+  rejected pixels.
+
+### What is still missing for a real implementation
+
+The following differences from Horne (1986) remain in Stage 19:
+
+1. **Profile and variance are not independent.**  The profile is still
+   estimated from the SAME data being extracted.  A proper implementation
+   uses an independent high-S/N profile (e.g. from many co-added spectra).
+
+2. **No convergence criterion.**  The loop runs for at most `max_iterations`
+   iterations or until no new rejections occur.  Horne (1986) iterates until
+   the profile and rejection mask converge jointly.
+
+3. **`global_median` re-estimation is conservative.**  With the default
+   `global_median` profile mode, re-estimation has little effect when only
+   a small fraction of columns at any given row are contaminated (the row
+   median is robust).  The profile values before and after re-estimation
+   are often numerically identical for single-pixel outliers.  This is
+   expected scaffold behavior, not a bug.
+
+4. **`columnwise` profile absorbs outliers.**  With `columnwise` mode the
+   model is always an exact fit to the data (for valid pixels), so normalized
+   residuals are zero and outliers are never detected.  Re-estimation in this
+   mode has no effect in practice.
+
+5. **No PSF model.**  A full implementation would parameterize the spatial
+   PSF (e.g. Gaussian or Moffat) rather than using the noisy empirical
+   per-column or per-row estimate.
+
+---
+
 ## What remains unimplemented
 
 The following are **intentionally absent** in this scaffold stage.  They
 would be required for a production-quality Horne/Spextool implementation:
 
-1. **Full Horne iterative profile re-estimation.**  A complete Horne (1986)
-   implementation iterates both the pixel rejection and the spatial profile
-   estimate jointly.  The Stage-18 scaffold fixes the profile after the
-   initial estimate and does not update it after rejection.
+1. **Full Horne iterative profile re-estimation with convergence.**  Stage 19
+   implements a first re-estimation step but does not iterate to full
+   convergence of the (profile, rejection mask) pair.
 
 2. **PSF fitting beyond the empirical profile.**  A science-quality
    implementation would model the spatial PSF (e.g. from many exposures
@@ -318,8 +419,8 @@ would be required for a production-quality Horne/Spextool implementation:
 | Symbol | Type | Description |
 |---|---|---|
 | `extract_weighted_optimal` | function | Main entry point |
-| `WeightedExtractionDefinition` | dataclass | Aperture, profile, variance-model, and rejection parameters |
-| `WeightedExtractedOrderSpectrum` | dataclass | Per-order 1-D spectrum (includes `n_rejected_pixels`, `final_mask`, `n_iterations_used`) |
+| `WeightedExtractionDefinition` | dataclass | Aperture, profile, variance-model, and rejection parameters (includes `reestimate_profile`) |
+| `WeightedExtractedOrderSpectrum` | dataclass | Per-order 1-D spectrum (includes `n_rejected_pixels`, `final_mask`, `n_iterations_used`, `profile_reestimated`, `initial_profile`) |
 | `WeightedExtractedSpectrumSet` | dataclass | Full result container |
 
 ---
