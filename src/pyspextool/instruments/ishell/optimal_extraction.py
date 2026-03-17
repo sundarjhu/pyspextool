@@ -99,13 +99,23 @@ What this module does
 
      Columns where the profile denominator is zero or NaN are set to NaN.
 
-  6. *(Optional)* If a *variance_image* is provided, propagates variance
+  6. *(Optional)* If a variance source is available, propagates variance
      through background subtraction and profile-weighted extraction::
 
          var_flux[col] = sum(P[:, col]**2 * (var_pixel + var_bg))
 
      where *var_bg* is the per-column background variance approximated as
      the median of the variance image within the background annulus.
+
+     The variance source is resolved with the following priority:
+
+     ``explicit variance_image > variance_model > None``
+
+     When *variance_image* is supplied it is used directly.  When only
+     *variance_model* is supplied, a per-pixel variance image is built
+     internally via
+     :func:`~pyspextool.instruments.ishell.variance_model.build_variance_image`.
+     If neither is supplied, no variance is propagated.
 
      .. note::
          Background variance is approximated using the median of the
@@ -582,12 +592,19 @@ def extract_optimal(
     subtract_background: bool = True,
     variance_image: Optional[npt.NDArray] = None,
     variance_model: Optional[VarianceModelDefinition] = None,
+    mask: Optional[npt.NDArray] = None,
 ) -> OptimalExtractedSpectrumSet:
     """Extract 1-D spectra from rectified orders using profile-weighted extraction.
 
     For each order in *rectified_orders*, selects aperture pixels, optionally
     subtracts a per-column background, estimates a provisional spatial profile,
     and computes a weighted 1-D extraction.
+
+    Non-finite pixels (NaN or inf) in *data* or *variance_image*, plus any
+    pixels flagged by *mask*, are excluded from both the flux sum and the
+    denominator (weights/normalization) so they do not bias the result.
+    Spectral columns where every aperture pixel is masked return NaN flux
+    and NaN variance (when variance is computed).
 
     Parameters
     ----------
@@ -615,6 +632,13 @@ def extract_optimal(
         :func:`~pyspextool.instruments.ishell.variance_model.build_variance_image`.
         If both *variance_image* and *variance_model* are provided,
         *variance_image* is used and *variance_model* is ignored.
+    mask : ndarray of bool or None, optional
+        Optional bad-pixel mask with the same shape as each order's
+        ``flux`` array.  Pixels where *mask* is ``True`` are treated as
+        bad and excluded from extraction and variance propagation.
+        Combined with the internal mask derived from non-finite (NaN/inf)
+        values in *data* and *variance_image*.  If ``None`` (default), no
+        additional masking beyond non-finite detection is applied.
 
     Returns
     -------
@@ -633,6 +657,9 @@ def extract_optimal(
     ValueError
         If *variance_image* is provided but its shape does not match the
         order's flux shape.
+    ValueError
+        If *mask* is provided but its shape does not match the order's
+        flux shape.
 
     Notes
     -----
@@ -725,6 +752,26 @@ def extract_optimal(
             var_2d = build_variance_image(flux_2d, variance_model).variance_image
         else:
             var_2d = None
+
+        # -- Build combined bad-pixel mask and apply it --
+        # Exclude NaN/inf from data and variance, plus any user-supplied mask.
+        bad = ~np.isfinite(flux_2d)
+        if var_2d is not None:
+            bad |= ~np.isfinite(var_2d)
+        if mask is not None:
+            mask_arr = np.asarray(mask, dtype=bool)
+            if mask_arr.shape != flux_2d.shape:
+                raise ValueError(
+                    f"Order {ro.order}: mask shape {mask_arr.shape} "
+                    f"does not match flux shape {flux_2d.shape}."
+                )
+            bad |= mask_arr
+        if np.any(bad):
+            flux_2d = flux_2d.copy()
+            flux_2d[bad] = np.nan
+            if var_2d is not None:
+                var_2d = var_2d.copy()
+                var_2d[bad] = np.nan
 
         spatial_frac = np.asarray(ro.spatial_frac, dtype=float)
         # shape (n_spatial,)
