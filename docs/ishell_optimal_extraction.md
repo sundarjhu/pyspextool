@@ -33,7 +33,7 @@ and ``subtract_background=True``, a per-column background is estimated as the
 **median** of pixels in the annulus:
 
 ```
-background_inner <= |dist| <= background_outer
+background_inner < |dist| <= background_outer
 ```
 
 and subtracted from every aperture pixel before profile estimation.

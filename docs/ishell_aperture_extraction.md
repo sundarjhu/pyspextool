@@ -75,7 +75,7 @@ are included:
 The background annulus is defined by two distances from `center_frac`:
 
 ```
-background_inner ≤ |spatial_frac − center_frac| ≤ background_outer
+background_inner < |spatial_frac − center_frac| ≤ background_outer
 ```
 
 The background region is **symmetric** about the aperture center: it
@@ -104,7 +104,7 @@ For each order in the `RectifiedOrderSet`:
 2. **Estimate background** *(if enabled).*
 
    Select background rows where
-   `background_inner ≤ dist ≤ background_outer`.
+   `background_inner < dist ≤ background_outer`.
 
    Compute a per-column background estimate as the median of those rows:
 

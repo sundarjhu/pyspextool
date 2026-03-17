@@ -63,7 +63,7 @@ What this module does
   *center_frac* ± *radius_frac* in fractional slit coordinates ``[0, 1]``.
 
 * Optionally estimates a per-column background as the median of spatial
-  pixels in a background annulus (``background_inner`` ≤ |distance| ≤
+  pixels in a background annulus (``background_inner`` < |distance| ≤
   ``background_outer``), and subtracts it from the aperture pixels before
   collapsing.
 
@@ -459,7 +459,7 @@ def extract_with_aperture(
     2. Select aperture pixels: ``dist <= radius_frac``.
     3. If background subtraction is enabled and the aperture defines a
        background region, select background pixels:
-       ``background_inner <= dist <= background_outer``.
+       ``background_inner < dist <= background_outer``.
        Compute a per-column background estimate as
        :func:`numpy.nanmedian` of those pixels (shape ``(n_spectral,)``).
        Subtract the background from every aperture pixel.
