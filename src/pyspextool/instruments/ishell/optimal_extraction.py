@@ -181,6 +181,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .rectified_orders import RectifiedOrderSet
+from .variance_model import VarianceModelDefinition, build_variance_image
 
 __all__ = [
     "OptimalExtractionDefinition",
@@ -580,6 +581,7 @@ def extract_optimal(
     *,
     subtract_background: bool = True,
     variance_image: Optional[npt.NDArray] = None,
+    variance_model: Optional[VarianceModelDefinition] = None,
 ) -> OptimalExtractedSpectrumSet:
     """Extract 1-D spectra from rectified orders using profile-weighted extraction.
 
@@ -602,19 +604,24 @@ def extract_optimal(
         subtraction is performed.
     variance_image : ndarray or None, optional
         Per-pixel variance image with the same shape as each order's
-        ``flux`` array (``n_spatial × n_spectral``).  If ``None``
-        (default), no variance propagation is performed and the returned
-        ``variance`` field will be ``None``.  If provided, variance is
-        propagated through background subtraction and profile-weighted
-        extraction; the result is stored in
-        :attr:`OptimalExtractedOrderSpectrum.variance`.
+        ``flux`` array (``n_spatial × n_spectral``).  If provided, it
+        takes priority over *variance_model*.  If ``None`` (default) and
+        *variance_model* is also ``None``, no variance propagation is
+        performed.
+    variance_model : :class:`~pyspextool.instruments.ishell.variance_model.VarianceModelDefinition` or None, optional
+        Stage-14 variance model definition.  If *variance_image* is
+        ``None`` and *variance_model* is provided, a variance image is
+        built internally for each order using
+        :func:`~pyspextool.instruments.ishell.variance_model.build_variance_image`.
+        If both *variance_image* and *variance_model* are provided,
+        *variance_image* is used and *variance_model* is ignored.
 
     Returns
     -------
     :class:`OptimalExtractedSpectrumSet`
         One :class:`OptimalExtractedOrderSpectrum` per order in
         *rectified_orders*.  Each spectrum's ``variance`` field contains
-        the propagated variance when *variance_image* is provided, or
+        the propagated variance when a variance source is provided, or
         ``None`` otherwise.
 
     Raises
@@ -629,6 +636,10 @@ def extract_optimal(
 
     Notes
     -----
+    **Variance source priority**
+
+    ``explicit variance_image > variance_model > None``
+
     **Algorithm**
 
     For each order:
@@ -651,7 +662,8 @@ def extract_optimal(
 
     **Variance propagation**
 
-    When *variance_image* is provided:
+    When a variance source is available (either *variance_image* or built
+    from *variance_model*):
 
     - Background variance per column is approximated as
       ``nanmedian(variance_image[bg_mask], axis=0)``.  This is a
@@ -708,6 +720,9 @@ def extract_optimal(
                     f"Order {ro.order}: variance_image shape {var_2d.shape} "
                     f"does not match flux shape {flux_2d.shape}."
                 )
+        elif variance_model is not None:
+            # Build variance image internally from the Stage-14 model.
+            var_2d = build_variance_image(flux_2d, variance_model).variance_image
         else:
             var_2d = None
 

@@ -123,14 +123,23 @@ For each order in the `RectifiedOrderSet`:
    * `"sum"` – `np.nansum(flux_ap, axis=0)`; all-NaN columns → NaN.
    * `"mean"` – `np.nanmean(flux_ap, axis=0)`; all-NaN columns → NaN.
 
-4. **Propagate variance** *(optional — only when `variance_image` is provided).*
+4. **Propagate variance** *(optional — when `variance_image` or `variance_model` is provided).*
 
-   Compute per-column background variance as the median of the variance
-   image in the background annulus:
+   The extraction functions can optionally generate a variance image
+   internally using the Stage 14 variance model.  Pass either:
 
-   ```python
-   var_bg = np.nanmedian(variance_image[bg_mask], axis=0)
-   ```
+   * `variance_image` – an explicit per-pixel variance array (takes priority), **or**
+   * `variance_model` – a `VarianceModelDefinition` that is used to build the
+     variance image internally via `build_variance_image()`.
+
+   Priority: `variance_image > variance_model > None`.
+
+   When a variance source is available, compute per-column background variance
+   as the median of the variance image in the background annulus:
+
+    ```python
+    var_bg = np.nanmedian(variance_image[bg_mask], axis=0)
+    ```
 
    Sum per-pixel variance (plus background contribution) over aperture rows:
 
@@ -143,8 +152,8 @@ For each order in the `RectifiedOrderSet`:
    > approximation and does not account for correlated noise or detailed
    > detector characteristics.
 
-   If `variance_image=None`, no variance is computed and the `variance`
-   field is `None`.
+   If neither `variance_image` nor `variance_model` is supplied, no variance
+   is computed and the `variance` field is `None`.
 
 5. **Store the result.**
 
@@ -159,7 +168,7 @@ For each order in the `RectifiedOrderSet`:
    | `aperture` | The `ApertureDefinition` used |
    | `method` | `"sum"` or `"mean"` |
    | `n_pixels_used` | Number of valid aperture rows used |
-   | `variance` | Propagated variance of `flux`, or `None` if no `variance_image` was supplied |
+   | `variance` | Propagated variance of `flux`, or `None` if no variance source was supplied |
 
 ---
 
@@ -218,7 +227,7 @@ from pyspextool.instruments.ishell.aperture_extraction import (
     ApertureDefinition,
     extract_with_aperture,
 )
-import numpy as np
+from pyspextool.instruments.ishell.variance_model import VarianceModelDefinition
 
 # Define the aperture: center at 50% of the slit, half-width 20%,
 # background from 30%–45% distance on each side.
@@ -229,14 +238,23 @@ aperture = ApertureDefinition(
     background_outer=0.45,
 )
 
-# rectified is a RectifiedOrderSet produced by build_rectified_orders().
-# variance_image is optional; pass np.ones_like(flux_image) for unit variance.
+# Option A: supply an explicit variance image.
 result = extract_with_aperture(
     rectified,
     aperture,
     method="sum",
     subtract_background=True,
     variance_image=variance_image,  # or None to skip variance propagation
+)
+
+# Option B: let the pipeline build the variance image from the Stage-14 model.
+vmodel = VarianceModelDefinition(read_noise_electron=10.0, gain_e_per_adu=2.0)
+result = extract_with_aperture(
+    rectified,
+    aperture,
+    method="sum",
+    subtract_background=True,
+    variance_model=vmodel,  # variance_image is built internally per order
 )
 
 for sp in result.spectra:
