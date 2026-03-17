@@ -1,4 +1,4 @@
-# iSHELL Weighted Optimal Extraction (Stages 17, 18 & 19) — Scaffold Documentation
+# iSHELL Weighted Optimal Extraction (Stages 17, 18, 19 & 20) — Scaffold Documentation
 
 > **Scaffold status.** This module is a provisional scaffold for the
 > iSHELL 2DXD reduction pipeline.  It is intentionally simplified and
@@ -8,7 +8,7 @@
 
 ## Overview
 
-`weighted_optimal_extraction.py` implements **Stages 17, 18, and 19** of the
+`weighted_optimal_extraction.py` implements **Stages 17, 18, 19, and 20** of the
 iSHELL 2DXD scaffold.
 
 - **Stage 17** introduced proto-Horne inverse-variance weighted spectral
@@ -26,6 +26,13 @@ iSHELL 2DXD scaffold.
   pixels, the spatial profile is re-estimated from the surviving good pixels
   before proceeding to the next iteration.  This moves the scaffold one step
   closer to the iterative Horne (1986) scheme.
+
+- **Stage 20** extends Stage 19 with a **profile source system** that allows
+  the spatial profile to come from three alternative sources: the original
+  empirical estimate (`"empirical"`), a Gaussian-smoothed variant of the
+  empirical estimate (`"smoothed_empirical"`), or a caller-supplied external
+  profile array (`"external"`).  The smoothed and external modes reduce
+  sensitivity to per-frame contamination of the profile.
 
 All stages are scaffold implementations and are **not** complete
 Spextool-equivalent implementations.
@@ -146,6 +153,106 @@ sub-image using one of two scaffold modes (identical to Stage 12):
 Negative profile values are clipped to zero before normalization.
 
 When `normalize_profile=True` (default), the profile columns sum to 1.0.
+
+---
+
+## Profile source system (Stage 20)
+
+Stage 20 adds a `profile_source` field to `WeightedExtractionDefinition`
+that controls where the spatial profile comes from.  Three values are
+supported:
+
+### `"empirical"` (default)
+
+The profile is estimated from the current aperture data using `profile_mode`
+(see above).  This is the Stage 17–19 behavior and is fully backward
+compatible.
+
+### `"smoothed_empirical"`
+
+The empirical profile is estimated from the data, then a Gaussian smoothing
+kernel is applied **along the spatial axis only** (axis 0) using
+`scipy.ndimage.gaussian_filter1d(..., mode='reflect')` with standard deviation
+`profile_smooth_sigma` pixels.
+
+**Why spatial-axis smoothing only?**  Smoothing along axis 0 sharpens the
+profile shape independently per wavelength column: each column's profile is
+smoothed in the spatial direction without mixing spectral information across
+columns.  This preserves any genuine wavelength-dependent profile variation
+while reducing row-to-row noise in the empirical estimate.
+
+**Effect of smoothing:**
+- Reduces the influence of individual noisy rows on the profile shape.
+- Suppresses single-pixel spikes caused by cosmic rays or hot pixels that
+  land in the profile-estimation region.
+- Slightly broadens the profile peak if the smoothing scale is large relative
+  to the PSF width.
+
+**Parameters:**
+- `profile_smooth_sigma`: standard deviation of the Gaussian kernel in spatial
+  pixels.  Values of 0.5–2.0 are typical for moderate smoothing.  When 0,
+  the result is identical to `"empirical"`.
+
+**Re-estimation behavior:**  When `reestimate_profile=True` is set inside the
+iterative rejection loop, the profile is re-estimated and then re-smoothed
+with the same `profile_smooth_sigma` after each rejection iteration.
+
+### `"external"`
+
+The caller supplies a pre-computed profile array via `external_profile` in
+the `WeightedExtractionDefinition`.  Accepted shapes:
+
+| Shape | Interpretation |
+|---|---|
+| `(n_ap_spatial, n_spectral)` | Full 2-D profile; each column used independently |
+| `(n_ap_spatial, 1)` | Same 1-D profile applied to all spectral columns |
+| `(n_ap_spatial,)` | Same 1-D profile applied to all spectral columns |
+
+Here `n_ap_spatial` is the number of spatial pixels selected by the aperture
+mask (determined at extraction time from `center_frac`, `radius_frac`, and the
+order's `spatial_frac` grid).  Shape is validated in `extract_weighted_optimal`,
+not at definition construction time, because the aperture size is unknown then.
+
+The external profile is:
+1. Validated for shape compatibility.
+2. Broadcast to `(n_ap_spatial, n_spectral)`.
+3. Negative values clipped to zero.
+4. Normalized column-by-column if `normalize_profile=True`.
+
+**`profile_mode` is ignored** when `profile_source="external"`.
+
+**Re-estimation behavior:**  The external profile is **never re-estimated**
+inside the iterative rejection loop, even if `reestimate_profile=True`.  The
+external profile is treated as fixed ground truth.  This is the intended
+behavior: an external profile is assumed to come from an independent,
+high-S/N source (e.g. many co-added exposures).
+
+### Re-estimation interaction summary
+
+| `profile_source` | `reestimate_profile=True` behavior |
+|---|---|
+| `"empirical"` | Re-estimate from surviving pixels after each rejection |
+| `"smoothed_empirical"` | Re-estimate empirical, then re-apply smoothing |
+| `"external"` | Profile kept fixed (re-estimation skipped) |
+
+### Output bookkeeping fields
+
+Two new fields are added to `WeightedExtractedOrderSpectrum`:
+
+| Field | Type | Description |
+|---|---|---|
+| `profile_source_used` | `str` | The value of `profile_source` used for this order |
+| `profile_smoothed` | `bool` | `True` if smoothing was applied (`profile_source="smoothed_empirical"` and `profile_smooth_sigma > 0`) |
+
+### Why this moves the scaffold closer to robust optimal extraction
+
+In full Horne (1986) extraction, the spatial profile is estimated from a
+**separate, independent, high-S/N observation** rather than from the frame
+being extracted.  The `"external"` source is the first scaffold mechanism that
+allows the profile to be decoupled from the science frame.  The
+`"smoothed_empirical"` source is a lightweight intermediate step that reduces
+profile contamination by pixel-level noise without requiring a separate
+observation.
 
 ---
 
@@ -387,29 +494,36 @@ would be required for a production-quality Horne/Spextool implementation:
    implements a first re-estimation step but does not iterate to full
    convergence of the (profile, rejection mask) pair.
 
-2. **PSF fitting beyond the empirical profile.**  A science-quality
+2. **PSF fitting beyond the empirical / smoothed profile.**  Stage 20 adds
+   smoothing and external-profile support, but the `"smoothed_empirical"`
+   mode still estimates the profile from the science frame.  A science-quality
    implementation would model the spatial PSF (e.g. from many exposures
-   or a Gaussian/Moffat parameterisation) rather than using the noisy
-   per-observation profile estimate.
+   or a Gaussian/Moffat parameterisation) rather than using a smoothed
+   version of the noisy per-observation profile.
 
-3. **Automatic aperture centroiding.**  The aperture center and radius
+3. **Cross-order / multi-frame external profile construction.**  Stage 20 adds
+   infrastructure to accept an external profile but does not provide tooling
+   to build one.  A proper implementation would co-add many frames to produce
+   a high-S/N profile template.
+
+4. **Automatic aperture centroiding.**  The aperture center and radius
    must be supplied explicitly; no automatic centroid finding or tracing
    is performed.
 
-4. **Sophisticated sky modelling.**  Background is a simple per-column
+5. **Sophisticated sky modelling.**  Background is a simple per-column
    median of an annulus.  Real pipelines use polynomial sky fitting or
    principal-component analysis.
 
-5. **Correlated / off-diagonal noise propagation.**  Only diagonal
+6. **Correlated / off-diagonal noise propagation.**  Only diagonal
    (per-pixel) variance is used; inter-pixel correlations from the
    detector or from rectification interpolation are ignored.
 
-6. **Profile-independent variance.**  The profile `P` is estimated from
-   the same data used for extraction.  A proper implementation would
-   estimate `P` from an independent, high-S/N source or from a
-   combined set of many exposures.
+7. **Profile-independent variance.**  When `profile_source="empirical"` or
+   `"smoothed_empirical"`, the profile `P` is estimated from the same data
+   used for extraction.  Use `profile_source="external"` to supply a
+   truly independent profile.
 
-7. **Telluric correction, order merging, flux calibration.**  These
+8. **Telluric correction, order merging, flux calibration.**  These
    belong to later stages.
 
 ---
@@ -419,8 +533,8 @@ would be required for a production-quality Horne/Spextool implementation:
 | Symbol | Type | Description |
 |---|---|---|
 | `extract_weighted_optimal` | function | Main entry point |
-| `WeightedExtractionDefinition` | dataclass | Aperture, profile, variance-model, and rejection parameters (includes `reestimate_profile`) |
-| `WeightedExtractedOrderSpectrum` | dataclass | Per-order 1-D spectrum (includes `n_rejected_pixels`, `final_mask`, `n_iterations_used`, `profile_reestimated`, `initial_profile`) |
+| `WeightedExtractionDefinition` | dataclass | Aperture, profile, variance-model, and rejection parameters (includes `reestimate_profile`, `profile_source`, `external_profile`, `profile_smooth_sigma`) |
+| `WeightedExtractedOrderSpectrum` | dataclass | Per-order 1-D spectrum (includes `n_rejected_pixels`, `final_mask`, `n_iterations_used`, `profile_reestimated`, `initial_profile`, `profile_source_used`, `profile_smoothed`) |
 | `WeightedExtractedSpectrumSet` | dataclass | Full result container |
 
 ---
