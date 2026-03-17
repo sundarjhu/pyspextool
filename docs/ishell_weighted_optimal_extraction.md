@@ -1,4 +1,4 @@
-# iSHELL Weighted Optimal Extraction (Stage 17) — Scaffold Documentation
+# iSHELL Weighted Optimal Extraction (Stages 17 & 18) — Scaffold Documentation
 
 > **Scaffold status.** This module is a provisional scaffold for the
 > iSHELL 2DXD reduction pipeline.  It is intentionally simplified and
@@ -8,15 +8,21 @@
 
 ## Overview
 
-`weighted_optimal_extraction.py` implements **Stage 17** of the iSHELL
-2DXD scaffold: a first proto-Horne inverse-variance weighted spectral
-extraction.
+`weighted_optimal_extraction.py` implements **Stages 17 and 18** of the
+iSHELL 2DXD scaffold.
 
-It is an evolutionary step beyond the Stage-12 profile-weighted scaffold
-(`optimal_extraction.py`) because it incorporates a per-pixel variance
-image into the extraction weights.  It is **closer to Horne (1986)-style
-optimal extraction** than Stage 12 but is still not a complete
-Spextool-equivalent implementation.
+- **Stage 17** introduced proto-Horne inverse-variance weighted spectral
+  extraction using the existing profile estimate and a per-pixel variance
+  image.  It is an evolutionary step beyond the Stage-12 profile-weighted
+  scaffold (`optimal_extraction.py`) because it incorporates per-pixel
+  variance into the extraction weights.
+
+- **Stage 18** extends Stage 17 with an optional **iterative sigma-clipping
+  outlier-rejection loop** that identifies and removes discrepant
+  (e.g. cosmic-ray-like) pixels before the final extraction pass.
+
+Both stages are scaffold implementations and are **not** complete
+Spextool-equivalent implementations.
 
 ---
 
@@ -81,7 +87,7 @@ The combination makes this module the first scaffold stage to implement
 | Variance required? | No (optional) | No, but unit V used if absent |
 | Weights | profile-squared only | profile-squared / variance |
 | Closer to Horne? | No | Yes |
-| Iterative rejection | No | No |
+| Iterative rejection | No | Optional (Stage 18) |
 
 When `V = 1` (unit variance, the fallback), the extracted **flux** is
 identical to the Stage-12 formula:
@@ -165,14 +171,120 @@ and denominator:
 
 ---
 
+## Iterative outlier rejection (Stage 18)
+
+When `reject_outliers=True` in the `WeightedExtractionDefinition`, an
+optional sigma-clipping loop is applied **after** the initial profile
+estimation and **before** the final extraction pass.
+
+### Algorithm
+
+For each iteration (up to `max_iterations`):
+
+1. **Extract** a current best-estimate 1-D spectrum using the proto-Horne
+   formula with the current pixel mask applied.
+
+2. **Build a model image** inside the aperture:
+
+   ```
+   model[i, col] = profile[i, col] * flux_1d[col]
+   ```
+
+3. **Compute residuals**:
+
+   ```
+   resid[i, col] = data[i, col] - model[i, col]
+   ```
+
+4. **Normalize residuals** using the per-pixel variance:
+
+   ```
+   norm_resid[i, col] = resid[i, col] / sqrt(variance[i, col])
+   ```
+
+   Only computed where `variance[i, col]` is finite and > 0.
+
+5. **Flag additional bad pixels** where:
+
+   ```
+   |norm_resid[i, col]| > sigma_clip
+   ```
+
+   Subject to the following constraints:
+
+   - Only within aperture pixels that are not already masked.
+   - Only where variance is finite and > 0.
+   - **Per-column guard:** if rejecting all outlier candidates in a column
+     would leave fewer than `min_valid_pixels` valid pixels, the entire
+     column is skipped for that iteration.
+
+6. **Stop early** if no new pixels were rejected in the last iteration.
+
+### Parameters
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `reject_outliers` | `False` | Enable/disable the rejection loop |
+| `sigma_clip` | `5.0` | Rejection threshold in units of `resid / sqrt(V)` |
+| `max_iterations` | `3` | Maximum number of rejection iterations |
+| `min_valid_pixels` | `2` | Minimum valid pixels that must remain per column |
+
+### Output bookkeeping
+
+The returned `WeightedExtractedOrderSpectrum` includes three additional
+fields when rejection is enabled:
+
+| Field | Type | Description |
+|---|---|---|
+| `n_rejected_pixels` | `int` | Total pixels rejected across all iterations |
+| `final_mask` | `ndarray[bool]` or `None` | `True` where iteratively rejected (shape: `n_ap × n_spectral`) |
+| `n_iterations_used` | `int` | Number of iterations performed |
+
+When `reject_outliers=False`, `n_rejected_pixels=0`, `final_mask=None`,
+and `n_iterations_used=0`.
+
+### Relationship to Horne (1986)
+
+Horne (1986) describes an iterative rejection scheme that:
+
+1. Uses the **variance model** directly (not the empirical `sqrt(V)`) to
+   normalize residuals.
+2. **Re-estimates the spatial profile** after each rejection to avoid
+   contaminating the profile with rejected pixels.
+3. Iterates until convergence, not just until no new rejections.
+
+This scaffold differs in important ways:
+
+- The spatial profile is **held fixed** after the initial estimate.  It is
+  not re-estimated after rejection.  This means that if an outlier
+  significantly biases the profile estimate (e.g. in `columnwise` mode),
+  the residuals in the first iteration may not perfectly isolate the
+  outlier.  The `global_median` profile mode is more robust in this regard.
+- Only a finite number of iterations (`max_iterations`) are performed.
+- The `min_valid_pixels` guard is a conservative scaffold simplification
+  that prevents over-rejection in columns with few valid pixels.
+
+### Limitations of this scaffold
+
+- **No profile re-estimation after rejection.**
+- **Cascade rejection risk**: if one large outlier inflates the extracted
+  flux substantially, the model at other aperture pixels may also be
+  inflated, causing their residuals to exceed `sigma_clip`.  The
+  `min_valid_pixels` guard reduces but does not eliminate this risk.
+- **Not suitable for science-quality cosmic-ray identification** in its
+  current form.
+
+---
+
 ## What remains unimplemented
 
 The following are **intentionally absent** in this scaffold stage.  They
 would be required for a production-quality Horne/Spextool implementation:
 
-1. **Iterative cosmic-ray / bad-pixel rejection.**  Horne (1986) describes
-   a sigma-clipping loop that updates the bad-pixel mask using the current
-   variance estimate.  This stage performs only a single extraction pass.
+1. **Full Horne iterative profile re-estimation.**  A complete Horne (1986)
+   implementation iterates both the pixel rejection and the spatial profile
+   estimate jointly.  The Stage-18 scaffold fixes the profile after the
+   initial estimate and does not update it after rejection.
 
 2. **PSF fitting beyond the empirical profile.**  A science-quality
    implementation would model the spatial PSF (e.g. from many exposures
@@ -206,8 +318,8 @@ would be required for a production-quality Horne/Spextool implementation:
 | Symbol | Type | Description |
 |---|---|---|
 | `extract_weighted_optimal` | function | Main entry point |
-| `WeightedExtractionDefinition` | dataclass | Aperture, profile, and variance-model parameters |
-| `WeightedExtractedOrderSpectrum` | dataclass | Per-order 1-D spectrum |
+| `WeightedExtractionDefinition` | dataclass | Aperture, profile, variance-model, and rejection parameters |
+| `WeightedExtractedOrderSpectrum` | dataclass | Per-order 1-D spectrum (includes `n_rejected_pixels`, `final_mask`, `n_iterations_used`) |
 | `WeightedExtractedSpectrumSet` | dataclass | Full result container |
 
 ---

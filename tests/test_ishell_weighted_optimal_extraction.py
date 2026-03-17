@@ -1485,3 +1485,566 @@ class TestH1WeightedExtractionSmokeTest:
         extracted, _ = h1_weighted_result
         for sp in extracted.spectra:
             assert sp.method == "horne_weighted"
+
+
+# ===========================================================================
+# 14. Iterative outlier rejection: definition validation (error tests)
+# ===========================================================================
+
+
+class TestIterativeRejectionDefinitionValidation:
+    """Validation tests for the outlier-rejection fields in WeightedExtractionDefinition."""
+
+    def test_default_reject_outliers_is_false(self):
+        """reject_outliers defaults to False."""
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.1)
+        assert ed.reject_outliers is False
+
+    def test_default_max_iterations(self):
+        """max_iterations defaults to 3."""
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.1)
+        assert ed.max_iterations == 3
+
+    def test_default_sigma_clip(self):
+        """sigma_clip defaults to 5.0."""
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.1)
+        assert ed.sigma_clip == 5.0
+
+    def test_default_min_valid_pixels(self):
+        """min_valid_pixels defaults to 2."""
+        ed = WeightedExtractionDefinition(center_frac=0.5, radius_frac=0.1)
+        assert ed.min_valid_pixels == 2
+
+    def test_reject_outliers_enabled(self):
+        """reject_outliers=True with valid parameters is accepted."""
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.1,
+            reject_outliers=True,
+            max_iterations=5,
+            sigma_clip=3.0,
+            min_valid_pixels=3,
+        )
+        assert ed.reject_outliers is True
+        assert ed.max_iterations == 5
+        assert ed.sigma_clip == 3.0
+        assert ed.min_valid_pixels == 3
+
+    def test_invalid_sigma_clip_zero(self):
+        """ValueError if sigma_clip == 0."""
+        with pytest.raises(ValueError, match="sigma_clip"):
+            WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.1, sigma_clip=0.0
+            )
+
+    def test_invalid_sigma_clip_negative(self):
+        """ValueError if sigma_clip < 0."""
+        with pytest.raises(ValueError, match="sigma_clip"):
+            WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.1, sigma_clip=-1.0
+            )
+
+    def test_invalid_max_iterations_zero(self):
+        """ValueError if max_iterations == 0."""
+        with pytest.raises(ValueError, match="max_iterations"):
+            WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.1, max_iterations=0
+            )
+
+    def test_invalid_max_iterations_negative(self):
+        """ValueError if max_iterations < 0."""
+        with pytest.raises(ValueError, match="max_iterations"):
+            WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.1, max_iterations=-1
+            )
+
+    def test_invalid_min_valid_pixels_zero(self):
+        """ValueError if min_valid_pixels == 0."""
+        with pytest.raises(ValueError, match="min_valid_pixels"):
+            WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.1, min_valid_pixels=0
+            )
+
+    def test_invalid_min_valid_pixels_negative(self):
+        """ValueError if min_valid_pixels < 0."""
+        with pytest.raises(ValueError, match="min_valid_pixels"):
+            WeightedExtractionDefinition(
+                center_frac=0.5, radius_frac=0.1, min_valid_pixels=-1
+            )
+
+    def test_max_iterations_one_is_valid(self):
+        """max_iterations=1 is the minimum valid value."""
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.1, max_iterations=1
+        )
+        assert ed.max_iterations == 1
+
+    def test_min_valid_pixels_one_is_valid(self):
+        """min_valid_pixels=1 is the minimum valid value."""
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5, radius_frac=0.1, min_valid_pixels=1
+        )
+        assert ed.min_valid_pixels == 1
+
+
+# ===========================================================================
+# 15. Iterative outlier rejection: synthetic behaviour tests
+# ===========================================================================
+
+# Outlier test parameters: all rows in aperture so n_ap == _N_AP_OUTLIER.
+_N_AP_OUTLIER = 20
+_N_SPEC_OUTLIER = 32
+_OUTLIER_ROW = 10
+_OUTLIER_COL = 5
+_TRUE_FLUX = 100.0
+_OUTLIER_AMP = 50.0
+
+
+def _make_outlier_ros(
+    n_spatial: int = _N_AP_OUTLIER,
+    n_spectral: int = _N_SPEC_OUTLIER,
+    true_flux: float = _TRUE_FLUX,
+    outlier_amp: float = _OUTLIER_AMP,
+    outlier_row: int = _OUTLIER_ROW,
+    outlier_col: int = _OUTLIER_COL,
+):
+    """Synthetic uniform-profile data with one injected outlier pixel.
+
+    Returns (ros, variance) where variance is a unit-variance image.
+    With a box profile of n_spatial pixels and radius_frac=0.5, the
+    extracted flux at clean columns equals true_flux.
+    """
+    spatial_frac = np.linspace(0.0, 1.0, n_spatial)
+    pixel_flux = true_flux / n_spatial
+    flux_2d = np.full((n_spatial, n_spectral), pixel_flux)
+    flux_2d[outlier_row, outlier_col] += outlier_amp
+    variance = np.ones((n_spatial, n_spectral))
+
+    order = RectifiedOrder(
+        order=311,
+        order_index=0,
+        wavelength_um=np.linspace(1.55, 1.60, n_spectral),
+        spatial_frac=spatial_frac,
+        flux=flux_2d,
+        source_image_shape=(200, 800),
+    )
+    ros = RectifiedOrderSet(
+        mode="H1_test",
+        rectified_orders=[order],
+        source_image_shape=(200, 800),
+    )
+    return ros, variance
+
+
+def _ed_outlier(sigma_clip: float = 5.0, **kwargs) -> WeightedExtractionDefinition:
+    """Full-aperture definition with rejection enabled."""
+    return WeightedExtractionDefinition(
+        center_frac=0.5,
+        radius_frac=0.5,
+        reject_outliers=True,
+        sigma_clip=sigma_clip,
+        **kwargs,
+    )
+
+
+def _ed_no_outlier() -> WeightedExtractionDefinition:
+    """Full-aperture definition with rejection disabled."""
+    return WeightedExtractionDefinition(
+        center_frac=0.5,
+        radius_frac=0.5,
+        reject_outliers=False,
+    )
+
+
+class TestIterativeOutlierRejection:
+    """Synthetic-data tests for the iterative outlier-rejection scaffold."""
+
+    def test_outlier_rejected_when_enabled(self):
+        """A single extreme outlier pixel is rejected when reject_outliers=True."""
+        ros, variance = _make_outlier_ros()
+        result = extract_weighted_optimal(
+            ros, _ed_outlier(), variance_image=variance, subtract_background=False
+        )
+        sp = result.spectra[0]
+        assert sp.n_rejected_pixels >= 1
+        assert sp.final_mask is not None
+        assert sp.final_mask[_OUTLIER_ROW, _OUTLIER_COL], (
+            f"Outlier pixel ({_OUTLIER_ROW}, {_OUTLIER_COL}) should be in final_mask."
+        )
+
+    def test_outlier_not_rejected_when_disabled(self):
+        """The same outlier pixel is not rejected when reject_outliers=False."""
+        ros, variance = _make_outlier_ros()
+        result = extract_weighted_optimal(
+            ros, _ed_no_outlier(), variance_image=variance, subtract_background=False
+        )
+        sp = result.spectra[0]
+        assert sp.n_rejected_pixels == 0
+        assert sp.final_mask is None
+        assert sp.n_iterations_used == 0
+
+    def test_rejection_reduces_outlier_influence(self):
+        """Rejection reduces the influence of a cosmic-ray-like pixel on extracted flux.
+
+        With a box profile of n=20 pixels and unit variance, the extracted flux
+        at the outlier column is true_flux + outlier_amp without rejection and
+        approximately true_flux after rejection.
+        """
+        ros, variance = _make_outlier_ros()
+
+        r_rej = extract_weighted_optimal(
+            ros, _ed_outlier(), variance_image=variance, subtract_background=False
+        )
+        r_no = extract_weighted_optimal(
+            ros, _ed_no_outlier(), variance_image=variance, subtract_background=False
+        )
+
+        flux_rej = r_rej.spectra[0].flux[_OUTLIER_COL]
+        flux_no = r_no.spectra[0].flux[_OUTLIER_COL]
+
+        assert flux_rej < flux_no, (
+            f"Rejected flux ({flux_rej:.2f}) should be less than "
+            f"non-rejected flux ({flux_no:.2f})."
+        )
+        np.testing.assert_allclose(flux_rej, _TRUE_FLUX, atol=1.0)
+
+    def test_output_shapes_identical(self):
+        """reject_outliers=True does not change any output array shapes."""
+        ros, variance = _make_outlier_ros()
+        r_rej = extract_weighted_optimal(
+            ros, _ed_outlier(), variance_image=variance, subtract_background=False
+        )
+        r_no = extract_weighted_optimal(
+            ros, _ed_no_outlier(), variance_image=variance, subtract_background=False
+        )
+        sp_rej = r_rej.spectra[0]
+        sp_no = r_no.spectra[0]
+        assert sp_rej.flux.shape == sp_no.flux.shape
+        assert sp_rej.variance.shape == sp_no.variance.shape
+        assert sp_rej.profile.shape == sp_no.profile.shape
+
+    def test_non_outlier_columns_unchanged(self):
+        """Columns without outliers produce the same flux regardless of rejection flag."""
+        ros, variance = _make_outlier_ros()
+        r_rej = extract_weighted_optimal(
+            ros, _ed_outlier(), variance_image=variance, subtract_background=False
+        )
+        r_no = extract_weighted_optimal(
+            ros, _ed_no_outlier(), variance_image=variance, subtract_background=False
+        )
+        sp_rej = r_rej.spectra[0]
+        sp_no = r_no.spectra[0]
+        for col in range(sp_rej.n_spectral):
+            if col == _OUTLIER_COL:
+                continue
+            np.testing.assert_allclose(
+                sp_rej.flux[col], sp_no.flux[col], rtol=1e-10,
+                err_msg=f"Column {col} should be unaffected by rejection.",
+            )
+
+    def test_n_iterations_used_positive_when_rejection_enabled(self):
+        """n_iterations_used >= 1 when reject_outliers=True."""
+        ros, variance = _make_outlier_ros()
+        result = extract_weighted_optimal(
+            ros, _ed_outlier(), variance_image=variance, subtract_background=False
+        )
+        assert result.spectra[0].n_iterations_used >= 1
+
+    def test_final_mask_shape_matches_aperture(self):
+        """final_mask shape is (n_ap_spatial, n_spectral)."""
+        ros, variance = _make_outlier_ros(
+            n_spatial=_N_AP_OUTLIER, n_spectral=_N_SPEC_OUTLIER
+        )
+        result = extract_weighted_optimal(
+            ros, _ed_outlier(), variance_image=variance, subtract_background=False
+        )
+        sp = result.spectra[0]
+        assert sp.final_mask is not None
+        assert sp.final_mask.shape == (_N_AP_OUTLIER, _N_SPEC_OUTLIER)
+
+    def test_early_stop_when_no_rejections(self):
+        """Iteration stops early when no outliers exist in the data.
+
+        For clean data, the first iteration finds no candidates and sets
+        n_iterations_used=1 (the check pass itself counts as one iteration).
+        """
+        ros = _make_synthetic_rectified_order_set(fill_value=2.0)
+        variance = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.2,
+            reject_outliers=True,
+            max_iterations=10,
+            sigma_clip=5.0,
+        )
+        result = extract_weighted_optimal(
+            ros, ed, variance_image=variance, subtract_background=False
+        )
+        for sp in result.spectra:
+            assert sp.n_rejected_pixels == 0
+            assert sp.n_iterations_used == 1, (
+                "Expected early stop after 1 iteration for clean data."
+            )
+            assert sp.final_mask is not None and not np.any(sp.final_mask), (
+                "final_mask should exist but have no True entries for clean data."
+            )
+
+    def test_n_iterations_bounded_by_max_iterations(self):
+        """n_iterations_used never exceeds max_iterations."""
+        ros, variance = _make_outlier_ros()
+        max_iter = 2
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.5,
+            reject_outliers=True,
+            max_iterations=max_iter,
+            sigma_clip=5.0,
+        )
+        result = extract_weighted_optimal(
+            ros, ed, variance_image=variance, subtract_background=False
+        )
+        assert result.spectra[0].n_iterations_used <= max_iter
+
+    def test_min_valid_pixels_prevents_rejection(self):
+        """Rejection is blocked when it would leave fewer than min_valid_pixels."""
+        ros, variance = _make_outlier_ros(n_spatial=_N_AP_OUTLIER)
+        # Require ALL pixels to remain valid → no pixel can ever be rejected.
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.5,
+            reject_outliers=True,
+            sigma_clip=5.0,
+            min_valid_pixels=_N_AP_OUTLIER,
+        )
+        result = extract_weighted_optimal(
+            ros, ed, variance_image=variance, subtract_background=False
+        )
+        assert result.spectra[0].n_rejected_pixels == 0, (
+            "min_valid_pixels == n_ap should prevent any rejection."
+        )
+
+    def test_min_valid_pixels_one_allows_rejection(self):
+        """With min_valid_pixels=1 the outlier pixel is still rejected."""
+        ros, variance = _make_outlier_ros(n_spatial=_N_AP_OUTLIER)
+        ed = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.5,
+            reject_outliers=True,
+            sigma_clip=5.0,
+            min_valid_pixels=1,
+        )
+        result = extract_weighted_optimal(
+            ros, ed, variance_image=variance, subtract_background=False
+        )
+        assert result.spectra[0].n_rejected_pixels >= 1
+
+    def test_user_mask_and_iterative_rejection_combine(self):
+        """User-masked pixels and iteratively rejected pixels are both excluded."""
+        ros, variance = _make_outlier_ros()
+        user_mask = np.zeros((_N_AP_OUTLIER, _N_SPEC_OUTLIER), dtype=bool)
+        user_mask[0, :] = True  # mask entire first row
+
+        result = extract_weighted_optimal(
+            ros, _ed_outlier(), variance_image=variance,
+            mask=user_mask, subtract_background=False
+        )
+        sp = result.spectra[0]
+
+        # Row 0 was user-masked, not iteratively rejected → not in final_mask.
+        assert sp.final_mask is not None
+        assert not np.any(sp.final_mask[0, :]), (
+            "Row 0 was user-masked, not iteratively rejected; "
+            "final_mask should be False for it."
+        )
+        # The injected outlier should appear in final_mask.
+        assert sp.final_mask[_OUTLIER_ROW, _OUTLIER_COL], (
+            "Outlier pixel should appear in final_mask."
+        )
+
+    def test_user_mask_does_not_count_as_rejected(self):
+        """n_rejected_pixels counts only iterative rejections, not user-masked pixels."""
+        ros, variance = _make_outlier_ros()
+        user_mask = np.zeros((_N_AP_OUTLIER, _N_SPEC_OUTLIER), dtype=bool)
+        user_mask[1, :] = True  # mask entire row 1
+
+        r_no = extract_weighted_optimal(
+            ros, _ed_no_outlier(), variance_image=variance,
+            mask=user_mask, subtract_background=False
+        )
+        assert r_no.spectra[0].n_rejected_pixels == 0
+
+    def test_no_rejection_bookkeeping_zero_when_disabled(self):
+        """When reject_outliers=False, all bookkeeping fields are 0 or None."""
+        ros = _make_synthetic_rectified_order_set()
+        ed = _make_center_extraction_def()
+        assert ed.reject_outliers is False
+        result = extract_weighted_optimal(ros, ed, subtract_background=False)
+        for sp in result.spectra:
+            assert sp.n_rejected_pixels == 0
+            assert sp.final_mask is None
+            assert sp.n_iterations_used == 0
+
+    def test_spectra_finite_at_outlier_column_after_rejection(self):
+        """Extracted flux/variance at the outlier column remain finite after rejection."""
+        ros, variance = _make_outlier_ros()
+        result = extract_weighted_optimal(
+            ros, _ed_outlier(), variance_image=variance, subtract_background=False
+        )
+        sp = result.spectra[0]
+        assert np.isfinite(sp.flux[_OUTLIER_COL]), (
+            "flux at the outlier column should still be finite after rejection."
+        )
+        assert np.isfinite(sp.variance[_OUTLIER_COL]), (
+            "variance at the outlier column should still be finite after rejection."
+        )
+
+    def test_n_rejected_pixels_consistent_with_final_mask(self):
+        """n_rejected_pixels equals the number of True entries in final_mask."""
+        ros, variance = _make_outlier_ros()
+        result = extract_weighted_optimal(
+            ros, _ed_outlier(), variance_image=variance, subtract_background=False
+        )
+        sp = result.spectra[0]
+        assert sp.final_mask is not None
+        assert sp.n_rejected_pixels == int(np.sum(sp.final_mask))
+
+
+# ===========================================================================
+# 16. H1 smoke tests for iterative rejection
+# ===========================================================================
+
+
+@pytest.mark.skipif(
+    not _HAVE_H1_DATA,
+    reason="Real H1 calibration FITS files not available (LFS not pulled).",
+)
+class TestH1IterativeRejectionSmokeTest:
+    """Smoke tests for reject_outliers=True/False using real H1 calibration data."""
+
+    @pytest.fixture(scope="class")
+    def h1_rejection_results(self):
+        """Run weighted extraction with and without rejection on real H1 data."""
+        import astropy.io.fits as fits
+
+        from pyspextool.instruments.ishell.arc_tracing import trace_arc_lines
+        from pyspextool.instruments.ishell.calibrations import (
+            read_line_list,
+            read_wavecalinfo,
+        )
+        from pyspextool.instruments.ishell.rectification_indices import (
+            build_rectification_indices,
+        )
+        from pyspextool.instruments.ishell.rectified_orders import (
+            build_rectified_orders,
+        )
+        from pyspextool.instruments.ishell.tracing import trace_orders_from_flat
+        from pyspextool.instruments.ishell.wavecal_2d import (
+            fit_provisional_wavelength_map,
+        )
+        from pyspextool.instruments.ishell.wavecal_2d_refine import (
+            fit_refined_coefficient_surface,
+        )
+
+        flat_trace = trace_orders_from_flat(
+            _H1_FLAT_FILES, col_range=(650, 1550)
+        )
+        geom = flat_trace.to_order_geometry_set("H1", col_range=(650, 1550))
+        arc_result = trace_arc_lines(_H1_ARC_FILES, geom)
+        wci = read_wavecalinfo("H1")
+        ll = read_line_list("H1")
+        wav_map = fit_provisional_wavelength_map(
+            arc_result, wci, ll, dispersion_degree=3
+        )
+        surface = fit_refined_coefficient_surface(wav_map, disp_degree=3)
+        rect_indices = build_rectification_indices(geom, surface, wav_map=wav_map)
+        with fits.open(_H1_FLAT_FILES[0]) as hdul:
+            detector_image = hdul[0].data.astype(float)
+        rectified = build_rectified_orders(detector_image, rect_indices)
+
+        var_model = VarianceModelDefinition(
+            read_noise_electron=11.0,
+            gain_e_per_adu=1.8,
+        )
+        base = dict(
+            center_frac=0.5,
+            radius_frac=0.2,
+            background_inner=0.3,
+            background_outer=0.45,
+            profile_mode="global_median",
+        )
+        ed_no_rej = WeightedExtractionDefinition(**base, reject_outliers=False)
+        ed_with_rej = WeightedExtractionDefinition(
+            **base, reject_outliers=True, sigma_clip=5.0, max_iterations=3
+        )
+        r_no = extract_weighted_optimal(
+            rectified, ed_no_rej, variance_model=var_model, subtract_background=True
+        )
+        r_yes = extract_weighted_optimal(
+            rectified, ed_with_rej, variance_model=var_model, subtract_background=True
+        )
+        return r_no, r_yes, rectified
+
+    def test_no_crashes(self, h1_rejection_results):
+        """Both reject_outliers=False and True complete without error."""
+        r_no, r_yes, _ = h1_rejection_results
+        assert r_no is not None
+        assert r_yes is not None
+
+    def test_output_shapes_identical(self, h1_rejection_results):
+        """Output array shapes are unchanged by reject_outliers=True."""
+        r_no, r_yes, _ = h1_rejection_results
+        for sp_no, sp_yes in zip(r_no.spectra, r_yes.spectra):
+            assert sp_no.flux.shape == sp_yes.flux.shape
+            assert sp_no.variance.shape == sp_yes.variance.shape
+            assert sp_no.profile.shape == sp_yes.profile.shape
+
+    def test_extracted_spectra_finite_where_expected(self, h1_rejection_results):
+        """Extracted spectra remain finite for most columns when rejection is on."""
+        _, r_yes, _ = h1_rejection_results
+        for sp in r_yes.spectra:
+            finite_frac = np.mean(np.isfinite(sp.flux))
+            assert finite_frac > 0.5, (
+                f"Order {sp.order}: fewer than 50% of flux values are finite "
+                f"({finite_frac:.1%}) with rejection enabled."
+            )
+
+    def test_n_rejected_pixels_reported_consistently(self, h1_rejection_results):
+        """n_rejected_pixels is a non-negative integer for every order."""
+        r_no, r_yes, _ = h1_rejection_results
+        for sp in r_no.spectra:
+            assert sp.n_rejected_pixels == 0
+        for sp in r_yes.spectra:
+            assert isinstance(sp.n_rejected_pixels, int)
+            assert sp.n_rejected_pixels >= 0
+
+    def test_final_mask_none_without_rejection(self, h1_rejection_results):
+        """final_mask is None when reject_outliers=False."""
+        r_no, _, _ = h1_rejection_results
+        for sp in r_no.spectra:
+            assert sp.final_mask is None
+
+    def test_n_iterations_zero_without_rejection(self, h1_rejection_results):
+        """n_iterations_used is 0 when reject_outliers=False."""
+        r_no, _, _ = h1_rejection_results
+        for sp in r_no.spectra:
+            assert sp.n_iterations_used == 0
+
+    def test_n_iterations_positive_with_rejection(self, h1_rejection_results):
+        """n_iterations_used >= 1 for every order when reject_outliers=True."""
+        _, r_yes, _ = h1_rejection_results
+        for sp in r_yes.spectra:
+            assert sp.n_iterations_used >= 1
+
+    def test_final_mask_shape_with_rejection(self, h1_rejection_results):
+        """final_mask shape is (n_ap_spatial, n_spectral) when reject_outliers=True."""
+        _, r_yes, rectified = h1_rejection_results
+        for sp, ro in zip(r_yes.spectra, rectified.rectified_orders):
+            assert sp.final_mask is not None
+            assert sp.final_mask.shape[1] == ro.n_spectral
+
+    def test_final_mask_consistent_with_n_rejected(self, h1_rejection_results):
+        """n_rejected_pixels equals the number of True entries in final_mask."""
+        _, r_yes, _ = h1_rejection_results
+        for sp in r_yes.spectra:
+            assert sp.final_mask is not None
+            assert sp.n_rejected_pixels == int(np.sum(sp.final_mask))
