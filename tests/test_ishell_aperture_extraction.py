@@ -749,7 +749,79 @@ class TestApertureEdgeCases:
 
 
 # ===========================================================================
-# 8. Parametric shape-consistency tests
+# 8. Variance propagation
+# ===========================================================================
+
+
+class TestExtractWithApertureVariancePropagation:
+    """Tests for variance propagation in extract_with_aperture."""
+
+    def test_variance_shape_with_ones_image(self):
+        """With variance_image=ones, variance has shape (n_spectral,)."""
+        ros = _make_synthetic_rectified_order_set()
+        ap = _make_center_aperture()
+        image = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        result = extract_with_aperture(ros, ap, variance_image=image)
+        for sp in result.spectra:
+            assert sp.variance is not None
+            assert sp.variance.shape == sp.flux.shape
+
+    def test_variance_nonnegative_with_ones_image(self):
+        """With variance_image=ones, all finite variance values are >= 0."""
+        ros = _make_synthetic_rectified_order_set()
+        ap = _make_center_aperture()
+        image = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        result = extract_with_aperture(ros, ap, variance_image=image)
+        for sp in result.spectra:
+            finite_mask = np.isfinite(sp.variance)
+            assert np.all(sp.variance[finite_mask] >= 0)
+
+    def test_variance_computed_without_variance_image(self):
+        """Variance is computed even when variance_image is None (unit variance)."""
+        ros = _make_synthetic_rectified_order_set()
+        ap = _make_center_aperture()
+        result = extract_with_aperture(ros, ap)
+        for sp in result.spectra:
+            assert sp.variance is not None
+            assert sp.variance.shape == sp.flux.shape
+            finite_mask = np.isfinite(sp.variance)
+            assert np.all(sp.variance[finite_mask] >= 0)
+
+    def test_variance_with_background_subtraction(self):
+        """With background region, variance is still non-negative and correctly shaped."""
+        ros = _make_synthetic_rectified_order_set()
+        ap = _make_center_aperture_with_bg()
+        image = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        result = extract_with_aperture(ros, ap, variance_image=image)
+        for sp in result.spectra:
+            assert sp.variance is not None
+            assert sp.variance.shape == sp.flux.shape
+            finite_mask = np.isfinite(sp.variance)
+            assert np.all(sp.variance[finite_mask] >= 0)
+
+    def test_variance_shape_mismatch_raises(self):
+        """ValueError if variance_image shape does not match flux shape."""
+        ros = _make_synthetic_rectified_order_set()
+        ap = _make_center_aperture()
+        bad_variance = np.ones((_N_SPATIAL + 1, _N_SPECTRAL))
+        with pytest.raises(ValueError, match="variance_image"):
+            extract_with_aperture(ros, ap, variance_image=bad_variance)
+
+    def test_variance_larger_with_larger_variance_image(self):
+        """Variance scales with the input variance_image values."""
+        ros = _make_synthetic_rectified_order_set()
+        ap = _make_center_aperture()
+        var_low = np.ones((_N_SPATIAL, _N_SPECTRAL))
+        var_high = np.ones((_N_SPATIAL, _N_SPECTRAL)) * 4.0
+        result_low = extract_with_aperture(ros, ap, variance_image=var_low)
+        result_high = extract_with_aperture(ros, ap, variance_image=var_high)
+        for sp_low, sp_high in zip(result_low.spectra, result_high.spectra):
+            finite = np.isfinite(sp_low.variance) & np.isfinite(sp_high.variance)
+            assert np.all(sp_high.variance[finite] > sp_low.variance[finite])
+
+
+# ===========================================================================
+# 9. Parametric shape-consistency tests
 # ===========================================================================
 
 
@@ -770,7 +842,7 @@ def test_output_shapes_parametric(n_spectral, n_spatial):
 
 
 # ===========================================================================
-# 9. Error handling
+# 10. Error handling
 # ===========================================================================
 
 
@@ -808,7 +880,7 @@ class TestExtractWithApertureErrors:
 
 
 # ===========================================================================
-# 10. Smoke test: real H1 calibration data
+# 11. Smoke test: real H1 calibration data
 # ===========================================================================
 
 
