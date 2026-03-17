@@ -99,13 +99,23 @@ What this module does
 
      Columns where the profile denominator is zero or NaN are set to NaN.
 
-  6. *(Optional)* If a *variance_image* is provided, propagates variance
+  6. *(Optional)* If a variance source is available, propagates variance
      through background subtraction and profile-weighted extraction::
 
          var_flux[col] = sum(P[:, col]**2 * (var_pixel + var_bg))
 
      where *var_bg* is the per-column background variance approximated as
      the median of the variance image within the background annulus.
+
+     The variance source is resolved with the following priority:
+
+     ``explicit variance_image > variance_model > None``
+
+     When *variance_image* is supplied it is used directly.  When only
+     *variance_model* is supplied, a per-pixel variance image is built
+     internally via
+     :func:`~pyspextool.instruments.ishell.variance_model.build_variance_image`.
+     If neither is supplied, no variance is propagated.
 
      .. note::
          Background variance is approximated using the median of the
