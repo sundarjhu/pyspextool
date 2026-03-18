@@ -1,11 +1,10 @@
-# iSHELL Profile Warnings — Stage 24 Scaffold
+# iSHELL Profile Warnings — Stage 24 / 25 Scaffold
 
 > **Warnings are informational and do not imply automatic failure.**
 
-This document describes **Stage 24** of the iSHELL 2DXD reduction scaffold:
-a diagnostic reporting and warning layer that converts the numeric metrics
-produced by Stage 23 (`profile_diagnostics.py`) into structured,
-human-readable warnings.
+This document describes **Stage 24** and **Stage 25** of the iSHELL 2DXD
+reduction scaffold.  Stage 24 introduced a diagnostic reporting and warning
+layer; Stage 25 extends it with user-configurable warning policies.
 
 ---
 
@@ -174,8 +173,8 @@ metrics), and are only produced when a leakage diagnostic set is provided.
 | Field | Value |
 |---|---|
 | Severity | `severe` |
-| Threshold | `possible_template_leakage is True` |
-| Metric | `TemplateLeakageDiagnostics.profile_correlation` |
+| Threshold | `profile_correlation > policy.leakage_corr_min AND profile_l2_difference < policy.leakage_l2_max` |
+| Metric | `TemplateLeakageDiagnostics.profile_correlation` / `profile_l2_difference` |
 
 **Physical meaning:**  
 The external template profile is suspiciously similar to the empirical profile
@@ -184,11 +183,14 @@ template may have been built from the same data that is being extracted
 ("leakage"), which would inflate the signal-to-noise ratio of the extracted
 spectrum.
 
-The underlying flag is set in Stage 23 when:
+The warning fires when **both** conditions are satisfied simultaneously:
 
 ```
-profile_correlation > 0.98 AND profile_l2_difference < 0.05
+profile_correlation > policy.leakage_corr_min  (default 0.98)
+profile_l2_difference < policy.leakage_l2_max  (default 0.05)
 ```
+
+Both thresholds are configurable via `ProfileWarningPolicy` (Stage 25).
 
 **How to interpret:**  
 Verify that the template was built from calibration data independent of the
@@ -407,3 +409,146 @@ These limitations will need to be addressed in a future stage for the
 pipeline to be suitable for science-quality autonomous decisions.
 
 > **Warnings are informational and do not imply automatic failure.**
+
+---
+
+## Configurable Warning Policies (Stage 25)
+
+Stage 25 introduces `ProfileWarningPolicy`, a dataclass that allows users to
+tune warning thresholds and enable/disable individual warning types without
+changing any extraction behaviour.
+
+> **Changing thresholds does not make the results science-quality.**
+> All thresholds remain heuristic constants for human inspection only.
+
+### Policy fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `finite_fraction_min` | `float` | `0.9` | Minimum finite-pixel fraction; `LOW_FINITE_FRACTION` fires below this |
+| `roughness_max` | `float` | `0.05` | Maximum profile roughness; `HIGH_ROUGHNESS` fires above this |
+| `flux_l2_diff_max` | `float` | `0.2` | Maximum normalised L2 flux difference; `LARGE_FLUX_DIFFERENCE` fires above this |
+| `finite_flux_min` | `float` | `0.8` | Minimum finite-flux fraction; `LOW_FINITE_FLUX` fires below this |
+| `leakage_corr_min` | `float` | `0.98` | `POSSIBLE_TEMPLATE_LEAKAGE` fires when `profile_correlation > leakage_corr_min` **and** `profile_l2_difference < leakage_l2_max` |
+| `leakage_l2_max` | `float` | `0.05` | `POSSIBLE_TEMPLATE_LEAKAGE` fires when `profile_correlation > leakage_corr_min` **and** `profile_l2_difference < leakage_l2_max` |
+| `enable_low_finite_fraction` | `bool` | `True` | Set `False` to suppress `LOW_FINITE_FRACTION` entirely |
+| `enable_not_normalized` | `bool` | `True` | Set `False` to suppress `NOT_NORMALIZED` entirely |
+| `enable_high_roughness` | `bool` | `True` | Set `False` to suppress `HIGH_ROUGHNESS` entirely |
+| `enable_large_flux_difference` | `bool` | `True` | Set `False` to suppress `LARGE_FLUX_DIFFERENCE` entirely |
+| `enable_low_finite_flux` | `bool` | `True` | Set `False` to suppress `LOW_FINITE_FLUX` entirely |
+| `enable_leakage_warning` | `bool` | `True` | Set `False` to suppress `POSSIBLE_TEMPLATE_LEAKAGE` entirely |
+
+**Validation rules:**
+
+- All threshold fields must be finite numbers.
+- Fraction fields (`finite_fraction_min`, `finite_flux_min`,
+  `leakage_corr_min`) must be in `[0, 1]`.
+- Non-fraction, non-negative fields (`roughness_max`, `flux_l2_diff_max`,
+  `leakage_l2_max`) must be `>= 0`.
+
+### How thresholds affect warnings
+
+Each numeric threshold is a simple scalar boundary:
+
+- **Lower** `finite_fraction_min` or `finite_flux_min` → fewer
+  `LOW_FINITE_FRACTION` / `LOW_FINITE_FLUX` warnings (higher tolerance for
+  NaN contamination).
+- **Higher** `finite_fraction_min` or `finite_flux_min` → more warnings
+  (stricter).
+- **Higher** `roughness_max` or `flux_l2_diff_max` → fewer `HIGH_ROUGHNESS` /
+  `LARGE_FLUX_DIFFERENCE` warnings (higher tolerance for spatial noise /
+  extraction disagreement).
+- **Lower** `roughness_max` or `flux_l2_diff_max` → more warnings (stricter).
+- **Lower** `leakage_corr_min` → `POSSIBLE_TEMPLATE_LEAKAGE` fires at lower
+  profile correlations (more sensitive to potential leakage).
+- **Higher** `leakage_corr_min` → warning only fires at very high correlations
+  (fewer false positives for smooth, similar profiles).
+- **Higher** `leakage_l2_max` → warning fires even when profiles differ more
+  in L2 norm (more sensitive).
+- **Lower** `leakage_l2_max` → warning only fires when profiles are nearly
+  identical in L2 norm (fewer false positives).
+
+The `enable_*` flags take priority: when `False`, the corresponding warning
+code is never emitted regardless of the threshold value.
+
+### Example configurations
+
+```python
+from pyspextool.instruments.ishell.profile_warnings import (
+    ProfileWarningPolicy,
+    generate_profile_warnings,
+    format_profile_warnings,
+    run_diagnostics_with_warnings,
+)
+
+# Default policy — reproduces Stage 24 behaviour exactly
+result = run_diagnostics_with_warnings(
+    science_ros, extraction_def, profile_templates
+)
+print(format_profile_warnings(result.warnings))
+
+# Strict policy — more sensitive, surfaces borderline issues
+strict_policy = ProfileWarningPolicy.strict()
+result = run_diagnostics_with_warnings(
+    science_ros, extraction_def, profile_templates, policy=strict_policy
+)
+
+# Conservative policy — fewer warnings, focus on clear problems
+conservative_policy = ProfileWarningPolicy.conservative()
+result = run_diagnostics_with_warnings(
+    science_ros, extraction_def, profile_templates, policy=conservative_policy
+)
+
+# Custom policy — raise finite-fraction sensitivity only
+custom_policy = ProfileWarningPolicy(finite_fraction_min=0.95)
+ws = generate_profile_warnings(tmpl_diags, policy=custom_policy)
+
+# Disable noisy warning types
+quiet_policy = ProfileWarningPolicy(
+    enable_high_roughness=False,
+    enable_not_normalized=False,
+)
+ws = generate_profile_warnings(tmpl_diags, policy=quiet_policy)
+
+# Filter formatted output to severe warnings only
+text = format_profile_warnings(ws, include_info=False, include_warning=False)
+
+# Flat (non-grouped) output
+text = format_profile_warnings(ws, group_by_order=False)
+```
+
+### Preset policies
+
+Two convenience presets are provided:
+
+- `ProfileWarningPolicy.strict()` — lower thresholds, surfaces more warnings.
+  Useful during initial pipeline validation.
+- `ProfileWarningPolicy.conservative()` — higher thresholds, fewer warnings.
+  Useful when focusing on clear problems only.
+
+Neither preset changes extraction behaviour.  They are convenience
+constructors that return `ProfileWarningPolicy` instances.
+
+### Formatting options
+
+`format_profile_warnings()` accepts four additional keyword arguments:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `include_info` | `True` | When `False`, omit `info`-level lines |
+| `include_warning` | `True` | When `False`, omit `warning`-level lines |
+| `include_severe` | `True` | When `False`, omit `severe`-level lines |
+| `group_by_order` | `True` | When `False`, produce flat output without `Order N:` headers |
+
+Default values preserve Stage 24 output exactly.
+
+### Stage 25 constraints
+
+Stage 25 does **not** implement:
+
+- automatic fallback switching based on policy
+- template rejection based on policy
+- pipeline decision logic of any kind
+- adaptive thresholds derived from data
+
+All behaviour remains explicit, user-controlled, and transparent.
