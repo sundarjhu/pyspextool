@@ -173,8 +173,8 @@ metrics), and are only produced when a leakage diagnostic set is provided.
 | Field | Value |
 |---|---|
 | Severity | `severe` |
-| Threshold | `possible_template_leakage is True` |
-| Metric | `TemplateLeakageDiagnostics.profile_correlation` |
+| Threshold | `profile_correlation > policy.leakage_corr_min AND profile_l2_difference < policy.leakage_l2_max` |
+| Metric | `TemplateLeakageDiagnostics.profile_correlation` / `profile_l2_difference` |
 
 **Physical meaning:**  
 The external template profile is suspiciously similar to the empirical profile
@@ -183,11 +183,14 @@ template may have been built from the same data that is being extracted
 ("leakage"), which would inflate the signal-to-noise ratio of the extracted
 spectrum.
 
-The underlying flag is set in Stage 23 when:
+The warning fires when **both** conditions are satisfied simultaneously:
 
 ```
-profile_correlation > 0.98 AND profile_l2_difference < 0.05
+profile_correlation > policy.leakage_corr_min  (default 0.98)
+profile_l2_difference < policy.leakage_l2_max  (default 0.05)
 ```
+
+Both thresholds are configurable via `ProfileWarningPolicy` (Stage 25).
 
 **How to interpret:**  
 Verify that the template was built from calibration data independent of the
@@ -426,8 +429,8 @@ changing any extraction behaviour.
 | `roughness_max` | `float` | `0.05` | Maximum profile roughness; `HIGH_ROUGHNESS` fires above this |
 | `flux_l2_diff_max` | `float` | `0.2` | Maximum normalised L2 flux difference; `LARGE_FLUX_DIFFERENCE` fires above this |
 | `finite_flux_min` | `float` | `0.8` | Minimum finite-flux fraction; `LOW_FINITE_FLUX` fires below this |
-| `leakage_corr_min` | `float` | `0.98` | Reference leakage correlation threshold (informational; leakage flag set by Stage 23) |
-| `leakage_l2_max` | `float` | `0.05` | Reference leakage L2 threshold (informational; leakage flag set by Stage 23) |
+| `leakage_corr_min` | `float` | `0.98` | `POSSIBLE_TEMPLATE_LEAKAGE` fires when `profile_correlation > leakage_corr_min` **and** `profile_l2_difference < leakage_l2_max` |
+| `leakage_l2_max` | `float` | `0.05` | `POSSIBLE_TEMPLATE_LEAKAGE` fires when `profile_correlation > leakage_corr_min` **and** `profile_l2_difference < leakage_l2_max` |
 | `enable_low_finite_fraction` | `bool` | `True` | Set `False` to suppress `LOW_FINITE_FRACTION` entirely |
 | `enable_not_normalized` | `bool` | `True` | Set `False` to suppress `NOT_NORMALIZED` entirely |
 | `enable_high_roughness` | `bool` | `True` | Set `False` to suppress `HIGH_ROUGHNESS` entirely |
@@ -456,6 +459,14 @@ Each numeric threshold is a simple scalar boundary:
   `LARGE_FLUX_DIFFERENCE` warnings (higher tolerance for spatial noise /
   extraction disagreement).
 - **Lower** `roughness_max` or `flux_l2_diff_max` → more warnings (stricter).
+- **Lower** `leakage_corr_min` → `POSSIBLE_TEMPLATE_LEAKAGE` fires at lower
+  profile correlations (more sensitive to potential leakage).
+- **Higher** `leakage_corr_min` → warning only fires at very high correlations
+  (fewer false positives for smooth, similar profiles).
+- **Higher** `leakage_l2_max` → warning fires even when profiles differ more
+  in L2 norm (more sensitive).
+- **Lower** `leakage_l2_max` → warning only fires when profiles are nearly
+  identical in L2 norm (fewer false positives).
 
 The `enable_*` flags take priority: when `False`, the corresponding warning
 code is never emitted regardless of the threshold value.

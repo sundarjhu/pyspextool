@@ -108,12 +108,16 @@ THRESHOLD_LARGE_FLUX_DIFFERENCE: float = 0.2
 #: Values below this suggest many bins failed in the external extraction.
 THRESHOLD_LOW_FINITE_FLUX: float = 0.8
 
-#: Minimum leakage correlation above which the leakage flag may be set.
-#: (Used internally by Stage 23; exposed here as a reference constant.)
+#: Minimum profile correlation above which the leakage warning may fire.
+#: ``POSSIBLE_TEMPLATE_LEAKAGE`` is raised when profile_correlation exceeds
+#: this value **and** the profile L2 difference is below
+#: :data:`THRESHOLD_LEAKAGE_L2_MAX`.
 THRESHOLD_LEAKAGE_CORR_MIN: float = 0.98
 
-#: Maximum L2 profile difference below which the leakage flag may be set.
-#: (Used internally by Stage 23; exposed here as a reference constant.)
+#: Maximum profile L2 difference below which the leakage warning may fire.
+#: ``POSSIBLE_TEMPLATE_LEAKAGE`` is raised when profile_l2_difference is
+#: below this value **and** the profile correlation exceeds
+#: :data:`THRESHOLD_LEAKAGE_CORR_MIN`.
 THRESHOLD_LEAKAGE_L2_MAX: float = 0.05
 
 
@@ -149,12 +153,17 @@ class ProfileWarningPolicy:
         Minimum finite-flux fraction below which ``LOW_FINITE_FLUX`` is
         raised.  Default ``0.8``.
     leakage_corr_min : float
-        Profile-correlation threshold used by the leakage heuristic.  This
-        value is informational here; the actual leakage flag is set by Stage
-        23.  Default ``0.98``.
+        Profile-correlation threshold for the leakage heuristic.
+        ``POSSIBLE_TEMPLATE_LEAKAGE`` is raised when
+        ``profile_correlation > leakage_corr_min``
+        **and** ``profile_l2_difference < leakage_l2_max``.
+        Default ``0.98``.
     leakage_l2_max : float
-        Profile L2-difference threshold used by the leakage heuristic.
-        Informational here; set by Stage 23.  Default ``0.05``.
+        Profile L2-difference threshold for the leakage heuristic.
+        ``POSSIBLE_TEMPLATE_LEAKAGE`` is raised when
+        ``profile_correlation > leakage_corr_min``
+        **and** ``profile_l2_difference < leakage_l2_max``.
+        Default ``0.05``.
     enable_low_finite_fraction : bool
         When ``False`` the ``LOW_FINITE_FRACTION`` warning is never emitted.
     enable_not_normalized : bool
@@ -210,7 +219,11 @@ class ProfileWarningPolicy:
                     f"got {value!r}"
                 )
 
-        # Fraction fields must be in [0, 1]
+        # Fraction fields and leakage_corr_min must be in [0, 1].
+        # leakage_corr_min is constrained to [0, 1] because the warning is
+        # designed to detect *high positive* correlation; setting a negative
+        # threshold would make the warning fire for uncorrelated or
+        # anti-correlated profiles, which is not the intended use.
         for name in ("finite_fraction_min", "finite_flux_min", "leakage_corr_min"):
             v = getattr(self, name)
             if not (0.0 <= v <= 1.0):
@@ -433,7 +446,8 @@ def generate_profile_warnings(
 
     **Leakage warnings** (from *leakage_diag_set*):
 
-    - ``POSSIBLE_TEMPLATE_LEAKAGE`` — ``possible_template_leakage is True``
+    - ``POSSIBLE_TEMPLATE_LEAKAGE`` — ``profile_correlation > policy.leakage_corr_min``
+      **and** ``profile_l2_difference < policy.leakage_l2_max``
 
     Parameters
     ----------
@@ -588,7 +602,11 @@ def generate_profile_warnings(
             order = diag.order
 
             # POSSIBLE_TEMPLATE_LEAKAGE
-            if policy.enable_leakage_warning and diag.possible_template_leakage:
+            leakage_triggered = (
+                diag.profile_correlation > policy.leakage_corr_min
+                and diag.profile_l2_difference < policy.leakage_l2_max
+            )
+            if policy.enable_leakage_warning and leakage_triggered:
                 all_warnings.append(
                     ProfileWarning(
                         order=order,

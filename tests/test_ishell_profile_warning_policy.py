@@ -542,6 +542,111 @@ class TestCustomThresholds:
         w = next(w for w in ws.warnings if w.code == "LOW_FINITE_FRACTION")
         assert w.threshold == 0.75
 
+    def test_lower_leakage_corr_min_triggers_leakage_warning(self):
+        # corr=0.96 is above default 0.98? No → no warning by default.
+        # Lower corr_min to 0.95 → 0.96 > 0.95 AND l2 < 0.05 → fires.
+        leak_set = _make_leakage_diag_set([
+            _make_leakage_diag(
+                order=311,
+                profile_correlation=0.96,
+                profile_l2_difference=0.01,
+                possible_template_leakage=False,
+            ),
+        ])
+        diag_set = _make_profile_diag_set([_make_profile_diag(order=311)])
+        # Default policy: 0.96 > 0.98? No → no warning
+        ws_default = generate_profile_warnings(diag_set, leakage_diag_set=leak_set)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" not in {w.code for w in ws_default.warnings}
+        # Lower corr_min: 0.96 > 0.95? Yes AND 0.01 < 0.05? Yes → fires
+        policy = ProfileWarningPolicy(leakage_corr_min=0.95)
+        ws_custom = generate_profile_warnings(diag_set, leakage_diag_set=leak_set, policy=policy)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" in {w.code for w in ws_custom.warnings}
+
+    def test_higher_leakage_corr_min_suppresses_leakage_warning(self):
+        # corr=0.99 (above default 0.98) → fires by default.
+        # Raise corr_min to 0.995 → 0.99 > 0.995? No → suppressed.
+        leak_set = _make_leakage_diag_set([
+            _make_leakage_diag(
+                order=311,
+                profile_correlation=0.99,
+                profile_l2_difference=0.01,
+                possible_template_leakage=True,
+            ),
+        ])
+        diag_set = _make_profile_diag_set([_make_profile_diag(order=311)])
+        # Default policy fires
+        ws_default = generate_profile_warnings(diag_set, leakage_diag_set=leak_set)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" in {w.code for w in ws_default.warnings}
+        # Raised corr_min: 0.99 > 0.995? No → suppressed
+        policy = ProfileWarningPolicy(leakage_corr_min=0.995)
+        ws_custom = generate_profile_warnings(diag_set, leakage_diag_set=leak_set, policy=policy)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" not in {w.code for w in ws_custom.warnings}
+
+    def test_higher_leakage_l2_max_triggers_leakage_warning(self):
+        # l2_diff=0.08 (above default 0.05 max) → no warning by default.
+        # Raise l2_max to 0.10 → 0.08 < 0.10 AND corr > 0.98 → fires.
+        leak_set = _make_leakage_diag_set([
+            _make_leakage_diag(
+                order=311,
+                profile_correlation=0.99,
+                profile_l2_difference=0.08,
+                possible_template_leakage=False,
+            ),
+        ])
+        diag_set = _make_profile_diag_set([_make_profile_diag(order=311)])
+        # Default policy: 0.08 < 0.05? No → no warning
+        ws_default = generate_profile_warnings(diag_set, leakage_diag_set=leak_set)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" not in {w.code for w in ws_default.warnings}
+        # Raised l2_max: 0.08 < 0.10? Yes AND 0.99 > 0.98? Yes → fires
+        policy = ProfileWarningPolicy(leakage_l2_max=0.10)
+        ws_custom = generate_profile_warnings(diag_set, leakage_diag_set=leak_set, policy=policy)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" in {w.code for w in ws_custom.warnings}
+
+    def test_lower_leakage_l2_max_suppresses_leakage_warning(self):
+        # l2_diff=0.03 (below default 0.05 max) → fires by default.
+        # Lower l2_max to 0.02 → 0.03 < 0.02? No → suppressed.
+        leak_set = _make_leakage_diag_set([
+            _make_leakage_diag(
+                order=311,
+                profile_correlation=0.99,
+                profile_l2_difference=0.03,
+                possible_template_leakage=True,
+            ),
+        ])
+        diag_set = _make_profile_diag_set([_make_profile_diag(order=311)])
+        # Default policy fires
+        ws_default = generate_profile_warnings(diag_set, leakage_diag_set=leak_set)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" in {w.code for w in ws_default.warnings}
+        # Lower l2_max: 0.03 < 0.02? No → suppressed
+        policy = ProfileWarningPolicy(leakage_l2_max=0.02)
+        ws_custom = generate_profile_warnings(diag_set, leakage_diag_set=leak_set, policy=policy)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" not in {w.code for w in ws_custom.warnings}
+
+    def test_leakage_requires_both_conditions(self):
+        """Both correlation AND l2 conditions must be satisfied simultaneously."""
+        diag_set = _make_profile_diag_set([_make_profile_diag(order=311)])
+
+        # High correlation but large l2_diff → no warning
+        leak_high_corr_only = _make_leakage_diag_set([
+            _make_leakage_diag(order=311, profile_correlation=0.999, profile_l2_difference=0.99),
+        ])
+        ws = generate_profile_warnings(diag_set, leakage_diag_set=leak_high_corr_only)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" not in {w.code for w in ws.warnings}
+
+        # Low l2_diff but low correlation → no warning
+        leak_low_l2_only = _make_leakage_diag_set([
+            _make_leakage_diag(order=311, profile_correlation=0.5, profile_l2_difference=0.001),
+        ])
+        ws = generate_profile_warnings(diag_set, leakage_diag_set=leak_low_l2_only)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" not in {w.code for w in ws.warnings}
+
+        # Both conditions met → warning fires
+        leak_both = _make_leakage_diag_set([
+            _make_leakage_diag(order=311, profile_correlation=0.999, profile_l2_difference=0.001),
+        ])
+        ws = generate_profile_warnings(diag_set, leakage_diag_set=leak_both)
+        assert "POSSIBLE_TEMPLATE_LEAKAGE" in {w.code for w in ws.warnings}
+
 
 # ===========================================================================
 # 5. Disabling individual warning types
@@ -601,7 +706,12 @@ class TestEnableFlags:
     def test_disable_leakage_warning(self):
         diag_set = _make_profile_diag_set([_make_profile_diag(order=311)])
         leak_set = _make_leakage_diag_set([
-            _make_leakage_diag(order=311, possible_template_leakage=True),
+            _make_leakage_diag(
+                order=311,
+                profile_correlation=0.99,
+                profile_l2_difference=0.01,
+                possible_template_leakage=True,
+            ),
         ])
         policy = ProfileWarningPolicy(enable_leakage_warning=False)
         ws = generate_profile_warnings(diag_set, leakage_diag_set=leak_set, policy=policy)
@@ -617,7 +727,12 @@ class TestEnableFlags:
             _make_comparison_diag(order=311, flux_l2_difference=0.9, finite_fraction_flux=0.1),
         ])
         leak_set = _make_leakage_diag_set([
-            _make_leakage_diag(order=311, possible_template_leakage=True),
+            _make_leakage_diag(
+                order=311,
+                profile_correlation=0.99,
+                profile_l2_difference=0.01,
+                possible_template_leakage=True,
+            ),
         ])
         policy = ProfileWarningPolicy(
             enable_low_finite_fraction=False,
