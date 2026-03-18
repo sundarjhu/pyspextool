@@ -255,3 +255,6 @@ WeightedExtractedSpectrumSet
 
 The template set can be built from the same data used for extraction (single
 frame) or from a separate, higher-SNR calibration frame or stack.
+Templates are typically built from calibration or stacked frames, not the
+same data being extracted; using independent calibration data ensures that the
+profile estimate is not contaminated by the noise of the science target.

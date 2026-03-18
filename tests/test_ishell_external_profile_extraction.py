@@ -22,9 +22,11 @@ Coverage:
       * verify extraction completes and outputs are valid,
       * verify external_profile_applied is True for all orders.
   - Smoke test on real H1 calibration data (skipped when LFS files absent):
-      * build templates from one dataset,
-      * apply to the same dataset as a smoke target,
-      * verify no crashes, correct shapes, finite flux/variance values.
+      * build templates from a calibration dataset (rectified from flat frames),
+      * apply templates to a distinct science dataset (small-noise perturbation
+        of the calibration image, simulating a separate science exposure),
+      * verify no crashes, correct shapes, finite flux/variance values,
+        external_profile_applied is True for all orders.
 """
 
 from __future__ import annotations
@@ -632,20 +634,40 @@ class TestIntegration:
 class TestSmoke:
     """Smoke tests using real iSHELL H1 calibration data.
 
+    Demonstrates the realistic two-dataset workflow:
+
+    * **Calibration dataset** — rectified orders built from the H1 flat frame,
+      used to build the external profile template (Stage 21).
+    * **Science dataset** — a lightly perturbed copy of the same detector
+      image, simulating a separate science exposure.  Used for extraction
+      (Stage 22).
+
+    Using two distinct datasets ensures the test exercises the intended
+    separation between template-building and extraction.  (In practice the
+    templates would come from a high-SNR standard-star or flat exposure taken
+    at a different time.)
+
     Chain:
       1. Flat-order tracing (Stage 1)
       2. Arc-line tracing (Stage 2)
       3. Provisional wavelength mapping (Stage 3)
       4. Coefficient-surface refinement (Stage 5)
       5. Rectification indices (Stage 6)
-      6. Rectified orders (Stage 7)
-      7. External profile template building (Stage 21)
-      8. External-profile extraction (Stage 22, this module)
+      6. Rectified orders — calibration image (Stage 7)
+      7. Rectified orders — science image (perturbed copy, Stage 7)
+      8. External profile template building from calibration set (Stage 21)
+      9. External-profile extraction of science set (Stage 22, this module)
     """
 
     @pytest.fixture(scope="class")
-    def h1_chain_result(self):
-        """Run the H1 calibration chain and return (template_set, rectified)."""
+    def h1_calibration_to_science_fixture(self):
+        """Run the H1 chain and return (templates, cal_rectified, sci_rectified).
+
+        ``cal_rectified`` is built from the first flat frame.
+        ``sci_rectified`` is built from a small-noise-perturbed copy of the
+        same detector image, acting as a stand-in for an independent science
+        exposure.
+        """
         import astropy.io.fits as fits
 
         from pyspextool.instruments.ishell.arc_tracing import trace_arc_lines
@@ -666,6 +688,10 @@ class TestSmoke:
         from pyspextool.instruments.ishell.wavecal_2d_refine import (
             fit_refined_coefficient_surface,
         )
+
+        # ------------------------------------------------------------------
+        # Stages 1–6: shared calibration chain
+        # ------------------------------------------------------------------
 
         # Stage 1
         flat_trace = trace_orders_from_flat(
@@ -689,75 +715,105 @@ class TestSmoke:
         # Stage 6
         rect_indices = build_rectification_indices(geom, surface, wav_map=wav_map)
 
-        # Stage 7: rectified orders from the first flat frame as science target
+        # ------------------------------------------------------------------
+        # Stage 7 (calibration): rectified orders from the first flat frame
+        # ------------------------------------------------------------------
         with fits.open(_H1_FLAT_FILES[0]) as hdul:
-            detector_image = hdul[0].data.astype(float)
-        rectified = build_rectified_orders(detector_image, rect_indices)
+            cal_image = hdul[0].data.astype(float)
+        cal_rectified = build_rectified_orders(cal_image, rect_indices)
 
-        # Stage 21: build templates
+        # ------------------------------------------------------------------
+        # Stage 7 (science): rectified orders from a lightly perturbed copy
+        # of the same detector image, simulating a separate science exposure.
+        # A 1 % Gaussian noise perturbation is sufficient to make the two
+        # datasets distinct while keeping flux levels realistic.
+        # ------------------------------------------------------------------
+        rng = np.random.default_rng(seed=12345)
+        sci_image = cal_image + rng.normal(
+            scale=0.01 * np.nanmedian(np.abs(cal_image)),
+            size=cal_image.shape,
+        )
+        sci_rectified = build_rectified_orders(sci_image, rect_indices)
+
+        # ------------------------------------------------------------------
+        # Stage 21: build external profile templates from the calibration set
+        # ------------------------------------------------------------------
         template_def = ProfileTemplateDefinition(
             combine_method="median",
             normalize_profile=True,
             smooth_sigma=0.0,
         )
-        templates = build_external_profile_template(rectified, template_def)
+        templates = build_external_profile_template(cal_rectified, template_def)
 
-        return templates, rectified
+        return templates, cal_rectified, sci_rectified
 
-    def test_no_crash(self, h1_chain_result):
-        """Stage 22 extraction completes without error."""
-        templates, rectified = h1_chain_result
+    def test_h1_calibration_to_science_workflow(self, h1_calibration_to_science_fixture):
+        """Stage 22 extraction of a science frame using calibration-frame templates."""
+        templates, _cal, sci_rectified = h1_calibration_to_science_fixture
         extraction_def = WeightedExtractionDefinition(
             center_frac=0.5,
             radius_frac=0.45,
         )
-        result = extract_with_external_profile(rectified, extraction_def, templates)
+        result = extract_with_external_profile(sci_rectified, extraction_def, templates)
         assert isinstance(result, ExternalProfileExtractionResult)
 
-    def test_correct_n_orders(self, h1_chain_result):
-        """Number of output spectra matches number of rectified orders."""
-        templates, rectified = h1_chain_result
+    def test_external_profile_applied_all_orders(self, h1_calibration_to_science_fixture):
+        """external_profile_applied is True for every science order."""
+        templates, _cal, sci_rectified = h1_calibration_to_science_fixture
         extraction_def = WeightedExtractionDefinition(
             center_frac=0.5,
             radius_frac=0.45,
         )
-        result = extract_with_external_profile(rectified, extraction_def, templates)
-        assert result.n_orders == rectified.n_orders
+        result = extract_with_external_profile(sci_rectified, extraction_def, templates)
+        for order_num in sci_rectified.orders:
+            assert result.external_profile_applied[order_num] is True, (
+                f"Order {order_num}: expected external_profile_applied=True."
+            )
 
-    def test_correct_shapes(self, h1_chain_result):
-        """Each output spectrum has the expected shape."""
-        templates, rectified = h1_chain_result
+    def test_correct_n_orders(self, h1_calibration_to_science_fixture):
+        """Number of output spectra matches number of science rectified orders."""
+        templates, _cal, sci_rectified = h1_calibration_to_science_fixture
         extraction_def = WeightedExtractionDefinition(
             center_frac=0.5,
             radius_frac=0.45,
         )
-        result = extract_with_external_profile(rectified, extraction_def, templates)
+        result = extract_with_external_profile(sci_rectified, extraction_def, templates)
+        assert result.n_orders == sci_rectified.n_orders
+
+    def test_correct_shapes(self, h1_calibration_to_science_fixture):
+        """Each output spectrum has the expected shape."""
+        templates, _cal, sci_rectified = h1_calibration_to_science_fixture
+        extraction_def = WeightedExtractionDefinition(
+            center_frac=0.5,
+            radius_frac=0.45,
+        )
+        result = extract_with_external_profile(sci_rectified, extraction_def, templates)
         for sp in result.spectra.spectra:
-            n_spec = rectified.get_order(sp.order).n_spectral
+            n_spec = sci_rectified.get_order(sp.order).n_spectral
             assert sp.flux.shape == (n_spec,)
             assert sp.variance.shape == (n_spec,)
 
-    def test_reasonable_flux(self, h1_chain_result):
+    def test_reasonable_flux(self, h1_calibration_to_science_fixture):
         """At least some spectral channels have finite flux per order."""
-        templates, rectified = h1_chain_result
+        templates, _cal, sci_rectified = h1_calibration_to_science_fixture
         extraction_def = WeightedExtractionDefinition(
             center_frac=0.5,
             radius_frac=0.45,
         )
-        result = extract_with_external_profile(rectified, extraction_def, templates)
+        result = extract_with_external_profile(sci_rectified, extraction_def, templates)
         for sp in result.spectra.spectra:
             assert np.any(np.isfinite(sp.flux)), (
                 f"Order {sp.order}: all flux values are NaN."
             )
 
-    def test_variance_positive(self, h1_chain_result):
+    def test_variance_positive(self, h1_calibration_to_science_fixture):
         """Finite variance values are positive per order."""
-        templates, rectified = h1_chain_result
+        templates, _cal, sci_rectified = h1_calibration_to_science_fixture
         extraction_def = WeightedExtractionDefinition(
             center_frac=0.5,
             radius_frac=0.45,
         )
-        result = extract_with_external_profile(rectified, extraction_def, templates)
+        result = extract_with_external_profile(sci_rectified, extraction_def, templates)
         for sp in result.spectra.spectra:
             finite_var = sp.variance[np.isfinite(sp.variance)]
             assert np.all(finite_var > 0), (

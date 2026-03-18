@@ -73,7 +73,21 @@ Convenience properties forward to the wrapped `WeightedExtractedSpectrumSet`:
 
 ## Example Workflow
 
-### Step 1: Build a profile template (Stage 21)
+The standard usage pattern is:
+
+1. **Build templates from calibration frames** — use a high-SNR flat,
+   standard-star, or stacked exposure that shares the same iSHELL mode and
+   slit geometry as your science target.
+2. **Apply templates to science frames** — pass the templates and the
+   science-frame `RectifiedOrderSet` to `extract_with_external_profile()`.
+
+> **Note:** In unit and smoke tests it is sometimes convenient to build the
+> template and run extraction on the same dataset.  This is acceptable for
+> verifying shapes and API behavior, but real usage should always build
+> templates from *independent* calibration or high-S/N frames so that the
+> profile estimate is not contaminated by the noise of the science target.
+
+### Step 1: Build a profile template from calibration frames (Stage 21)
 
 ```python
 import numpy as np
@@ -82,7 +96,8 @@ from pyspextool.instruments.ishell.profile_templates import (
     build_external_profile_template,
 )
 
-# calibration_rectified is a RectifiedOrderSet built from flat / standard frames
+# calibration_rectified is a RectifiedOrderSet built from flat / standard frames,
+# NOT the same data you intend to extract.
 template_def = ProfileTemplateDefinition(
     combine_method="median",   # robust combination across frames
     normalize_profile=True,    # columns sum to 1.0
@@ -112,6 +127,7 @@ extraction_def = WeightedExtractionDefinition(
     sigma_clip=5.0,
 )
 
+# science_rectified is a DIFFERENT RectifiedOrderSet from the science target.
 result = extract_with_external_profile(
     science_rectified,     # RectifiedOrderSet for the science target
     extraction_def,
