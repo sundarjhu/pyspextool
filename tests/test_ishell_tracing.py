@@ -32,6 +32,7 @@ from pyspextool.instruments.ishell.tracing import (
     trace_orders_from_flat,
 )
 from pyspextool.instruments.ishell.geometry import OrderGeometrySet
+from pyspextool.instruments.ishell.io_utils import is_fits_file
 
 # ---------------------------------------------------------------------------
 # Path to the real H1 calibration data
@@ -51,7 +52,7 @@ def _h1_flat_files() -> list[str]:
     paths = sorted(
         os.path.join(_H1_RAW_DIR, f)
         for f in os.listdir(_H1_RAW_DIR)
-        if "flat" in f and f.endswith(".fits")
+        if "flat" in f and is_fits_file(f)
     )
     # Filter out LFS pointer files
     real_paths = []

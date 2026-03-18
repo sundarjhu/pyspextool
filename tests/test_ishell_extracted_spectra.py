@@ -45,6 +45,7 @@ from pyspextool.instruments.ishell.rectified_orders import (
     RectifiedOrderSet,
     build_rectified_orders,
 )
+from pyspextool.instruments.ishell.io_utils import is_fits_file
 
 # ---------------------------------------------------------------------------
 # Path helpers for real H1 calibration data
@@ -76,7 +77,7 @@ def _real_files(pattern: str) -> list[str]:
         for p in (
             os.path.join(_H1_RAW_DIR, f)
             for f in os.listdir(_H1_RAW_DIR)
-            if pattern in f and f.endswith(".fits")
+            if pattern in f and is_fits_file(f)
         )
         if _is_real_fits(p)
     )
