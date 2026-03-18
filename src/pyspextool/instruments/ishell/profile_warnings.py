@@ -54,11 +54,11 @@ from .profile_diagnostics import (
     ExternalVsEmpiricalDiagnosticsSet,
     FullProfileDiagnosticsResult,
     ProfileDiagnosticsSet,
-    RectifiedOrderSet,
     TemplateLeakageDiagnosticsSet,
     run_full_profile_diagnostics,
 )
 from .profile_templates import ExternalProfileTemplateSet
+from .rectified_orders import RectifiedOrderSet
 from .variance_model import VarianceModelDefinition
 from .weighted_optimal_extraction import WeightedExtractionDefinition
 
