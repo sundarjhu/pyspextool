@@ -10,6 +10,10 @@ These tests verify:
   - Key output files are produced when the driver succeeds.
   - The ``run_k3_example`` function raises ``FileNotFoundError`` when the
     raw directory is missing.
+  - The ``K3BenchmarkConfig`` dataclass exposes correct defaults and can be
+    overridden via keyword arguments to ``run_k3_example``.
+  - Output FITS files are named according to ``wavecal_output_name``.
+  - QA plot filenames honour ``qa_plot_prefix``.
 
 NOTE: The K3 data files in this repository are ``.fits.gz``.  These tests
 exercise the gzip-transparent read path without requiring decompression.
@@ -78,12 +82,18 @@ _HAVE_K3_DATA = len(_K3_FLAT_FILES) >= 1 and len(_K3_ARC_FILES) >= 1
 def _import_driver():
     """Import run_k3_example from the scripts directory."""
     import importlib.util
+    import sys
+
     scripts_dir = os.path.join(_REPO_ROOT, "scripts")
     spec = importlib.util.spec_from_file_location(
         "run_ishell_k3_example",
         os.path.join(scripts_dir, "run_ishell_k3_example.py"),
     )
     mod = importlib.util.module_from_spec(spec)
+    # Register in sys.modules before exec so the module is properly
+    # initialised and can be looked up by name during module-level
+    # class/decorator evaluation (e.g. @dataclass uses sys.modules[__name__]).
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -219,9 +229,111 @@ class TestDriverMissingDirectory:
                 no_plots=True,
             )
 
+    def test_unknown_override_raises_type_error(self, tmp_path):
+        """run_k3_example raises TypeError for an unrecognised keyword."""
+        driver = _import_driver()
+        raw_dir = str(tmp_path / "raw")
+        os.makedirs(raw_dir)
+        with pytest.raises(TypeError, match="unexpected keyword"):
+            driver.run_k3_example(
+                raw_dir=raw_dir,
+                out_dir=str(tmp_path / "output"),
+                no_plots=True,
+                totally_unknown_param="oops",
+            )
+
 
 # ---------------------------------------------------------------------------
-# 4. K3 raw data present: end-to-end smoke test
+# 4a. K3BenchmarkConfig: unit tests (no raw data needed)
+# ---------------------------------------------------------------------------
+
+
+class TestK3BenchmarkConfig:
+    """K3BenchmarkConfig dataclass API tests."""
+
+    def test_default_flat_frames(self):
+        """Default flat_frames matches IDL manual frames 6–10."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.flat_frames == list(range(6, 11))
+
+    def test_default_arc_frames(self):
+        """Default arc_frames matches IDL manual frames 11–12."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.arc_frames == list(range(11, 13))
+
+    def test_default_dark_frames(self):
+        """Default dark_frames matches IDL manual frames 25–29."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.dark_frames == list(range(25, 30))
+
+    def test_default_object_frames(self):
+        """Default object_frames matches IDL manual spc frames 1–5."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.object_frames == list(range(1, 6))
+
+    def test_default_standard_frames(self):
+        """Default standard_frames matches IDL manual spc frames 13–17."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.standard_frames == list(range(13, 18))
+
+    def test_default_wavecal_output_name(self):
+        """Default wavecal_output_name is 'wavecal11-12' (IDL convention)."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.wavecal_output_name == "wavecal11-12"
+
+    def test_default_flat_output_name(self):
+        """Default flat_output_name is 'flat6-10' (IDL convention)."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.flat_output_name == "flat6-10"
+
+    def test_default_dark_output_name(self):
+        """Default dark_output_name is 'dark25-29' (IDL convention)."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.dark_output_name == "dark25-29"
+
+    def test_default_qa_plot_prefix(self):
+        """Default qa_plot_prefix is 'qa'."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.qa_plot_prefix == "qa"
+
+    def test_default_mode_name(self):
+        """Default mode_name is 'K3'."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert cfg.mode_name == "K3"
+
+    def test_custom_wavecal_output_name(self):
+        """K3BenchmarkConfig can be constructed with a custom wavecal name."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig(wavecal_output_name="my_wavecal")
+        assert cfg.wavecal_output_name == "my_wavecal"
+
+    def test_custom_flat_frames(self):
+        """K3BenchmarkConfig accepts custom flat frame lists."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig(flat_frames=[1, 2, 3])
+        assert cfg.flat_frames == [1, 2, 3]
+
+    def test_each_config_instance_has_independent_frame_lists(self):
+        """Two separate K3BenchmarkConfig instances do not share frame lists."""
+        driver = _import_driver()
+        cfg1 = driver.K3BenchmarkConfig()
+        cfg2 = driver.K3BenchmarkConfig()
+        cfg1.flat_frames.append(99)
+        assert 99 not in cfg2.flat_frames
+
+
+# ---------------------------------------------------------------------------
+# 4b. K3 raw data present: end-to-end smoke test
 # ---------------------------------------------------------------------------
 
 
@@ -277,6 +389,21 @@ class TestK3BenchmarkSmoke:
         assert completed.get("stage2_arc_tracing"), "Stage 2 should complete"
         assert completed.get("stage3_provisional_wavemap"), "Stage 3 should complete"
 
+    def test_benchmark_driver_via_config_object(self):
+        """run_k3_example accepts a K3BenchmarkConfig object."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            cfg = driver.K3BenchmarkConfig(
+                raw_dir=_K3_RAW_DIR,
+                output_dir=out_dir,
+                no_plots=True,
+            )
+            completed = driver.run_k3_example(cfg)
+
+        assert completed.get("stage1_flat_tracing"), "Stage 1 should complete"
+        assert completed.get("stage2_arc_tracing"), "Stage 2 should complete"
+
     def test_benchmark_driver_produces_output_dir(self):
         """run_k3_example creates the output directory."""
         driver = _import_driver()
@@ -290,8 +417,8 @@ class TestK3BenchmarkSmoke:
             )
             assert os.path.isdir(out_dir)
 
-    def test_wavecal_fits_written(self):
-        """run_k3_example writes K3_wavecal.fits (plain .fits, not .fits.gz)."""
+    def test_wavecal_output_name_default(self):
+        """Default run writes wavecal11-12.fits (IDL manual convention)."""
         driver = _import_driver()
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = os.path.join(tmp, "output")
@@ -301,15 +428,32 @@ class TestK3BenchmarkSmoke:
                 no_plots=True,
             )
             if completed.get("stage8_calibration_fits"):
-                out_path = os.path.join(out_dir, "K3_wavecal.fits")
+                out_path = os.path.join(out_dir, "wavecal11-12.fits")
                 assert os.path.isfile(out_path), (
-                    f"Expected output FITS at {out_path}"
+                    f"Expected default wavecal FITS at {out_path}"
                 )
                 # Must be plain .fits, not .fits.gz
-                assert out_path.endswith(".fits") and not out_path.endswith(".fits.gz")
+                assert not out_path.endswith(".fits.gz")
 
-    def test_qa_plots_saved(self):
-        """run_k3_example saves PNG QA files when --save-plots is used."""
+    def test_wavecal_output_name_custom(self):
+        """wavecal_output_name override is honoured in written filenames."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                wavecal_output_name="my_custom_wavecal",
+                no_plots=True,
+            )
+            if completed.get("stage8_calibration_fits"):
+                out_path = os.path.join(out_dir, "my_custom_wavecal.fits")
+                assert os.path.isfile(out_path), (
+                    f"Expected custom-named wavecal FITS at {out_path}"
+                )
+
+    def test_qa_plot_prefix_default(self):
+        """Default QA plots use prefix 'qa'."""
         driver = _import_driver()
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = os.path.join(tmp, "output")
@@ -319,8 +463,42 @@ class TestK3BenchmarkSmoke:
                 save_plots=True,
                 no_plots=False,
             )
-            # At least the flat-orders QA plot should exist
             flat_plot = os.path.join(out_dir, "qa_flat_orders.png")
             assert os.path.isfile(flat_plot), (
                 f"Expected QA plot at {flat_plot}"
             )
+
+    def test_qa_plot_prefix_custom(self):
+        """Custom qa_plot_prefix is reflected in QA plot filenames."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                qa_plot_prefix="bench",
+                save_plots=True,
+                no_plots=False,
+            )
+            flat_plot = os.path.join(out_dir, "bench_flat_orders.png")
+            assert os.path.isfile(flat_plot), (
+                f"Expected prefixed QA plot at {flat_plot}"
+            )
+
+    def test_override_via_config_wavecal_name(self):
+        """K3BenchmarkConfig.wavecal_output_name controls the output filename."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            cfg = driver.K3BenchmarkConfig(
+                raw_dir=_K3_RAW_DIR,
+                output_dir=out_dir,
+                wavecal_output_name="cfg_wavecal",
+                no_plots=True,
+            )
+            completed = driver.run_k3_example(cfg)
+            if completed.get("stage8_calibration_fits"):
+                out_path = os.path.join(out_dir, "cfg_wavecal.fits")
+                assert os.path.isfile(out_path), (
+                    f"Expected config-named wavecal FITS at {out_path}"
+                )

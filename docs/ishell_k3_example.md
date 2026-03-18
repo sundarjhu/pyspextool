@@ -71,6 +71,62 @@ Output products written by the benchmark script are always plain `.fits`.
 
 ---
 
+## Configuration object
+
+The benchmark driver is controlled by a `K3BenchmarkConfig` dataclass.  All
+fields have sensible defaults matching the IDL Spextool manual's canonical K3
+example.
+
+```python
+from scripts.run_ishell_k3_example import K3BenchmarkConfig, run_k3_example
+
+# Use all defaults
+completed = run_k3_example()
+
+# Override specific fields via keyword arguments
+completed = run_k3_example(
+    raw_dir="/data/K3",
+    wavecal_output_name="wavecal11-12",
+    no_plots=True,
+)
+
+# Pass a fully custom config object
+cfg = K3BenchmarkConfig(
+    raw_dir="/data/K3",
+    output_dir="/tmp/k3_output",
+    flat_frames=[6, 7, 8, 9, 10],
+    arc_frames=[11, 12],
+    wavecal_output_name="wavecal11-12",
+    flat_output_name="flat6-10",
+    dark_output_name="dark25-29",
+    qa_plot_prefix="qa",
+    save_plots=True,
+    mode_name="K3",
+)
+completed = run_k3_example(cfg)
+```
+
+### K3BenchmarkConfig fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `raw_dir` | str | repo K3 test-data dir | Directory containing raw K3 FITS files |
+| `output_dir` | str | `<raw_dir>/../output/` | Output directory for FITS and plots |
+| `flat_frames` | list[int] | `[6,7,8,9,10]` | Flat frame sequence numbers |
+| `arc_frames` | list[int] | `[11,12]` | Arc frame sequence numbers |
+| `dark_frames` | list[int] | `[25,26,27,28,29]` | Dark frame sequence numbers |
+| `object_frames` | list[int] | `[1,2,3,4,5]` | Object spc frame numbers |
+| `standard_frames` | list[int] | `[13,14,15,16,17]` | A0 V standard spc frame numbers |
+| `flat_output_name` | str | `"flat6-10"` | Stem for flat calibration output file |
+| `wavecal_output_name` | str | `"wavecal11-12"` | Stem for wavecal output file |
+| `dark_output_name` | str | `"dark25-29"` | Stem for dark output file |
+| `qa_plot_prefix` | str | `"qa"` | Prefix for all QA plot filenames |
+| `save_plots` | bool | `False` | Save plots as PNG instead of displaying |
+| `no_plots` | bool | `False` | Skip all QA plotting |
+| `mode_name` | str | `"K3"` | iSHELL mode for calibration resource lookup |
+
+---
+
 ## Running the benchmark script
 
 From the top-level repository directory:
@@ -79,21 +135,50 @@ From the top-level repository directory:
 python scripts/run_ishell_k3_example.py
 ```
 
-### Optional arguments
+### CLI arguments
 
 | Flag | Description |
 |------|-------------|
 | `--raw-dir PATH` | Override the default raw-data directory |
 | `--out-dir PATH` | Override the default output directory |
+| `--flat-frames INTS` | Comma-separated flat frame numbers (e.g. `6,7,8,9,10`) |
+| `--arc-frames INTS` | Comma-separated arc frame numbers (e.g. `11,12`) |
+| `--dark-frames INTS` | Comma-separated dark frame numbers (e.g. `25,26,27,28,29`) |
+| `--object-frames INTS` | Comma-separated object spc frame numbers |
+| `--standard-frames INTS` | Comma-separated standard spc frame numbers |
+| `--flat-output-name NAME` | Stem for flat calibration output (default: `flat6-10`) |
+| `--wavecal-output-name NAME` | Stem for wavecal output (default: `wavecal11-12`) |
+| `--dark-output-name NAME` | Stem for dark output (default: `dark25-29`) |
+| `--qa-plot-prefix PREFIX` | Prefix for QA plot filenames (default: `qa`) |
+| `--mode-name MODE` | iSHELL mode (default: `K3`) |
 | `--save-plots` | Save QA plots as PNG files instead of displaying them |
 | `--no-plots` | Skip all QA plotting |
 
-### Example: save QA plots and specify an alternate output directory
+### Examples
+
+Save QA plots and specify an alternate output directory:
 
 ```bash
 python scripts/run_ishell_k3_example.py \
     --save-plots \
     --out-dir /tmp/k3_output
+```
+
+Use IDL Spextool manual output-name conventions explicitly:
+
+```bash
+python scripts/run_ishell_k3_example.py \
+    --wavecal-output-name wavecal11-12 \
+    --flat-output-name flat6-10 \
+    --no-plots
+```
+
+Custom output prefix for QA plots:
+
+```bash
+python scripts/run_ishell_k3_example.py \
+    --save-plots \
+    --qa-plot-prefix bench
 ```
 
 ### Expected output location
@@ -109,21 +194,26 @@ data/testdata/ishell_k3_example/output/
 ## What the script produces
 
 The script prints a concise stage-by-stage summary and, where implemented,
-writes FITS outputs and QA plots:
+writes FITS outputs and QA plots.
 
 ### FITS outputs
 
-| File | Description |
-|------|-------------|
-| `wavecal11-12.fits` | Provisional wavelength/spatial calibration product |
+The wavecal output filename is controlled by `--wavecal-output-name` (default
+`wavecal11-12`).  A companion spatcal file is written alongside it.
+
+| File (default names) | Description |
+|----------------------|-------------|
+| `wavecal11-12.fits` | Provisional wavelength calibration product |
+| `wavecal11-12_spatcal.fits` | Provisional spatial calibration product |
 
 ### QA plots (Python scaffold)
 
 All plots are labelled *"Python scaffold QA"* to distinguish them from the
-IDL Spextool manual figures.
+IDL Spextool manual figures.  The prefix is controlled by `--qa-plot-prefix`
+(default `qa`).
 
-| File | Description |
-|------|-------------|
+| File (default prefix) | Description |
+|-----------------------|-------------|
 | `qa_flat_orders.png` | Traced order centres overlaid on the combined flat |
 | `qa_arc_lines.png` | Traced arc-line seed positions overlaid on the combined arc |
 | `qa_wavecal_residuals.png` | Wavelength-solution match residuals (histogram + by-order scatter) |
@@ -191,8 +281,8 @@ If the K3 raw files are absent, all data-dependent tests skip cleanly:
 SKIPPED [reason: K3 raw files not present]
 ```
 
-The non-data tests (file-format recognition, driver import, error-handling)
-always run regardless of whether the K3 data are present.
+The non-data tests (file-format recognition, driver import, config defaults,
+error-handling) always run regardless of whether the K3 data are present.
 
 ---
 
@@ -209,3 +299,4 @@ This Python benchmark is intended to:
 
 The QA plots produced by this script are labelled *"Python scaffold QA"* and
 should not be assumed to match the IDL manual's figures exactly.
+

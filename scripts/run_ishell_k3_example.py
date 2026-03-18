@@ -21,10 +21,20 @@ Run from the top-level repository directory::
 
 Optional flags::
 
-    --raw-dir   PATH   Override the default raw-data directory.
-    --out-dir   PATH   Override the default output directory.
-    --save-plots       Save QA plots as PNG files (default: display them).
-    --no-plots         Skip all QA plotting.
+    --raw-dir            PATH   Override the default raw-data directory.
+    --out-dir            PATH   Override the default output directory.
+    --flat-frames        INTS   Comma-separated flat frame numbers (default: 6,7,8,9,10).
+    --arc-frames         INTS   Comma-separated arc frame numbers  (default: 11,12).
+    --dark-frames        INTS   Comma-separated dark frame numbers (default: 25,26,27,28,29).
+    --object-frames      INTS   Comma-separated object spc frame numbers (default: 1,2,3,4,5).
+    --standard-frames    INTS   Comma-separated standard spc frame numbers (default: 13,14,15,16,17).
+    --flat-output-name   NAME   Stem for flat calibration output file (default: flat6-10).
+    --wavecal-output-name NAME  Stem for wavecal output file (default: wavecal11-12).
+    --dark-output-name   NAME   Stem for dark output file (default: dark25-29).
+    --qa-plot-prefix     PREFIX Prefix for QA plot filenames (default: qa).
+    --mode-name          MODE   iSHELL mode (default: K3).
+    --save-plots                Save QA plots as PNG files (default: display them).
+    --no-plots                  Skip all QA plotting.
 
 All input FITS files may be either ``.fits`` or ``.fits.gz``.
 Output FITS files are always written as plain ``.fits``.
@@ -62,6 +72,7 @@ import logging
 import os
 import sys
 import warnings
+from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
 # Ensure the package is importable when running from the repo root.
@@ -104,7 +115,8 @@ from pyspextool.instruments.ishell.calibration_products import (  # noqa: E402
     build_calibration_products,
 )
 from pyspextool.instruments.ishell.calibration_fits import (  # noqa: E402
-    write_calibration_fits,
+    write_wavecal_fits,
+    write_spatcal_fits,
 )
 from pyspextool.instruments.ishell.calibrations import (  # noqa: E402
     read_wavecalinfo,
@@ -112,6 +124,7 @@ from pyspextool.instruments.ishell.calibrations import (  # noqa: E402
 )
 from pyspextool.instruments.ishell.io_utils import (  # noqa: E402
     find_fits_files,
+    ensure_fits_suffix,
 )
 
 # ---------------------------------------------------------------------------
@@ -123,22 +136,6 @@ logging.basicConfig(
     format="%(levelname)s  %(name)s  %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# K3 mode name
-# ---------------------------------------------------------------------------
-
-_MODE = "K3"
-
-# ---------------------------------------------------------------------------
-# Frame-number groups from the IDL Spextool manual
-# ---------------------------------------------------------------------------
-
-_FLAT_FRAME_NUMBERS = list(range(6, 11))    # frames 6–10
-_ARC_FRAME_NUMBERS = list(range(11, 13))    # frames 11–12
-_DARK_FRAME_NUMBERS = list(range(25, 30))   # frames 25–29
-_OBJECT_FRAME_NUMBERS = list(range(1, 6))   # spc frames 1–5
-_STANDARD_FRAME_NUMBERS = list(range(13, 18))  # spc frames 13–17
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +161,106 @@ def _default_out_dir() -> str:
         _find_repo_root(),
         "data", "testdata", "ishell_k3_example", "output",
     )
+
+
+# ---------------------------------------------------------------------------
+# Configuration dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class K3BenchmarkConfig:
+    """Configuration for the K3 benchmark reduction driver.
+
+    All fields have sensible defaults that match the IDL Spextool manual's
+    canonical K3 example.  Override individual fields to customise the run.
+
+    Parameters
+    ----------
+    raw_dir : str
+        Directory containing the raw K3 FITS files (``.fits`` or
+        ``.fits.gz``).  Defaults to the repository's bundled K3 test-data
+        directory.
+    output_dir : str
+        Directory where output FITS files and QA plots are written.
+        Created automatically if absent.  Defaults to a sibling ``output/``
+        directory inside the K3 test-data tree.
+    flat_frames : list of int
+        Frame sequence numbers for the QTH flat exposures.
+        IDL manual default: 6–10.
+    arc_frames : list of int
+        Frame sequence numbers for the ThAr arc exposures.
+        IDL manual default: 11–12.
+    dark_frames : list of int
+        Frame sequence numbers for the dark exposures.
+        IDL manual default: 25–29.
+    object_frames : list of int
+        Frame sequence numbers for the science object exposures.
+        IDL manual default: 1–5.
+    standard_frames : list of int
+        Frame sequence numbers for the A0 V standard exposures.
+        IDL manual default: 13–17.
+    flat_output_name : str
+        Stem (without ``.fits``) for the flat calibration output file.
+        IDL manual convention: ``"flat6-10"``.
+    wavecal_output_name : str
+        Stem (without ``.fits``) for the wavecal output file.
+        IDL manual convention: ``"wavecal11-12"``.
+    dark_output_name : str
+        Stem (without ``.fits``) for the dark output file.
+        IDL manual convention: ``"dark25-29"``.
+    qa_plot_prefix : str
+        Prefix prepended to all QA plot filenames, e.g. ``"qa"`` produces
+        ``qa_flat_orders.png``, ``qa_arc_lines.png``, etc.
+    save_plots : bool
+        If ``True``, save QA plots as PNG files instead of displaying them
+        interactively.
+    no_plots : bool
+        If ``True``, skip all QA plotting entirely.
+    mode_name : str
+        iSHELL observing mode name used to look up packaged calibration
+        resources (flat-info, wavecal-info, line list).  Default: ``"K3"``.
+    """
+
+    raw_dir: str = field(default_factory=_default_raw_dir)
+    output_dir: str = field(default_factory=_default_out_dir)
+
+    # Frame-number groups (IDL Spextool manual K3 defaults)
+    flat_frames: list[int] = field(
+        default_factory=lambda: [6, 7, 8, 9, 10]
+    )
+    arc_frames: list[int] = field(
+        default_factory=lambda: [11, 12]
+    )
+    dark_frames: list[int] = field(
+        default_factory=lambda: [25, 26, 27, 28, 29]
+    )
+    object_frames: list[int] = field(
+        default_factory=lambda: [1, 2, 3, 4, 5]
+    )
+    standard_frames: list[int] = field(
+        default_factory=lambda: [13, 14, 15, 16, 17]
+    )
+
+    # Output naming (IDL manual convention)
+    flat_output_name: str = "flat6-10"
+    wavecal_output_name: str = "wavecal11-12"
+    dark_output_name: str = "dark25-29"
+
+    # QA plot prefix
+    qa_plot_prefix: str = "qa"
+
+    # Plot behaviour
+    save_plots: bool = False
+    no_plots: bool = False
+
+    # iSHELL mode
+    mode_name: str = "K3"
+
+
+# ---------------------------------------------------------------------------
+# File selection helper
+# ---------------------------------------------------------------------------
 
 
 def _select_files(
@@ -200,6 +297,11 @@ def _select_files(
     return sorted(matched)
 
 
+# ---------------------------------------------------------------------------
+# Console helpers
+# ---------------------------------------------------------------------------
+
+
 def _banner(text: str) -> None:
     line = "=" * 60
     print(f"\n{line}")
@@ -220,7 +322,13 @@ def _skip(stage: str, reason: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _plot_flat_orders(flat_img, trace, out_dir: str, save: bool) -> None:
+def _plot_flat_orders(
+    flat_img,
+    trace,
+    out_dir: str,
+    save: bool,
+    prefix: str,
+) -> None:
     """Python scaffold QA: traced order centres overlaid on the combined flat."""
     try:
         import matplotlib
@@ -252,7 +360,7 @@ def _plot_flat_orders(flat_img, trace, out_dir: str, save: bool) -> None:
         ax.set_ylabel("Row (pixels)")
 
         if save:
-            out_path = os.path.join(out_dir, "qa_flat_orders.png")
+            out_path = os.path.join(out_dir, f"{prefix}_flat_orders.png")
             fig.savefig(out_path, dpi=120, bbox_inches="tight")
             print(f"  [QA] Saved: {out_path}")
         else:
@@ -262,7 +370,13 @@ def _plot_flat_orders(flat_img, trace, out_dir: str, save: bool) -> None:
         print(f"  [QA] flat-orders plot skipped: {exc}")
 
 
-def _plot_arc_lines(arc_img, arc_result, out_dir: str, save: bool) -> None:
+def _plot_arc_lines(
+    arc_img,
+    arc_result,
+    out_dir: str,
+    save: bool,
+    prefix: str,
+) -> None:
     """Python scaffold QA: traced arc-line seed columns on the combined arc."""
     try:
         import matplotlib
@@ -301,7 +415,7 @@ def _plot_arc_lines(arc_img, arc_result, out_dir: str, save: bool) -> None:
         ax.set_ylabel("Row (pixels)")
 
         if save:
-            out_path = os.path.join(out_dir, "qa_arc_lines.png")
+            out_path = os.path.join(out_dir, f"{prefix}_arc_lines.png")
             fig.savefig(out_path, dpi=120, bbox_inches="tight")
             print(f"  [QA] Saved: {out_path}")
         else:
@@ -311,7 +425,12 @@ def _plot_arc_lines(arc_img, arc_result, out_dir: str, save: bool) -> None:
         print(f"  [QA] arc-lines plot skipped: {exc}")
 
 
-def _plot_wavecal_residuals(prov_map, out_dir: str, save: bool) -> None:
+def _plot_wavecal_residuals(
+    prov_map,
+    out_dir: str,
+    save: bool,
+    prefix: str,
+) -> None:
     """Python scaffold QA: wavelength-solution match residuals."""
     try:
         import matplotlib
@@ -357,7 +476,9 @@ def _plot_wavecal_residuals(prov_map, out_dir: str, save: bool) -> None:
         fig.tight_layout()
 
         if save:
-            out_path = os.path.join(out_dir, "qa_wavecal_residuals.png")
+            out_path = os.path.join(
+                out_dir, f"{prefix}_wavecal_residuals.png"
+            )
             fig.savefig(out_path, dpi=120, bbox_inches="tight")
             print(f"  [QA] Saved: {out_path}")
         else:
@@ -367,7 +488,12 @@ def _plot_wavecal_residuals(prov_map, out_dir: str, save: bool) -> None:
         print(f"  [QA] wavecal-residuals plot skipped: {exc}")
 
 
-def _plot_rectified_order(rect_set, out_dir: str, save: bool) -> None:
+def _plot_rectified_order(
+    rect_set,
+    out_dir: str,
+    save: bool,
+    prefix: str,
+) -> None:
     """Python scaffold QA: first available rectified order image."""
     try:
         import matplotlib
@@ -407,7 +533,9 @@ def _plot_rectified_order(rect_set, out_dir: str, save: bool) -> None:
         ax.set_ylabel("Spatial row (pixels)")
 
         if save:
-            out_path = os.path.join(out_dir, "qa_rectified_order.png")
+            out_path = os.path.join(
+                out_dir, f"{prefix}_rectified_order.png"
+            )
             fig.savefig(out_path, dpi=120, bbox_inches="tight")
             print(f"  [QA] Saved: {out_path}")
         else:
@@ -423,24 +551,38 @@ def _plot_rectified_order(rect_set, out_dir: str, save: bool) -> None:
 
 
 def run_k3_example(
-    raw_dir: str,
-    out_dir: str,
-    *,
-    save_plots: bool = False,
-    no_plots: bool = False,
+    config: K3BenchmarkConfig | None = None,
+    **overrides,
 ) -> dict[str, bool]:
     """Run the K3 benchmark reduction chain.
 
     Parameters
     ----------
-    raw_dir : str
-        Directory containing raw K3 FITS files (``.fits`` or ``.fits.gz``).
-    out_dir : str
-        Directory where output FITS files and QA plots are written.
-    save_plots : bool
-        If ``True``, save QA plots as PNG files instead of displaying them.
-    no_plots : bool
-        If ``True``, skip all QA plotting.
+    config : K3BenchmarkConfig, optional
+        Configuration object.  If ``None``, a default
+        :class:`K3BenchmarkConfig` is constructed first.
+    **overrides
+        Any :class:`K3BenchmarkConfig` field name may be passed as a
+        keyword argument to override the corresponding field in *config*
+        (or the default config when *config* is ``None``).
+
+        Supported override keys (all optional):
+
+        - ``raw_dir``               – raw K3 data directory
+        - ``out_dir``               – output directory (alias for ``output_dir``)
+        - ``output_dir``            – output directory
+        - ``flat_frames``           – list of flat frame numbers
+        - ``arc_frames``            – list of arc frame numbers
+        - ``dark_frames``           – list of dark frame numbers
+        - ``object_frames``         – list of object frame numbers
+        - ``standard_frames``       – list of standard frame numbers
+        - ``flat_output_name``      – stem for flat FITS output
+        - ``wavecal_output_name``   – stem for wavecal FITS output
+        - ``dark_output_name``      – stem for dark FITS output
+        - ``qa_plot_prefix``        – prefix for QA plot filenames
+        - ``save_plots``            – save plots as PNG
+        - ``no_plots``              – skip all plots
+        - ``mode_name``             – iSHELL mode string
 
     Returns
     -------
@@ -450,9 +592,69 @@ def run_k3_example(
     Raises
     ------
     FileNotFoundError
-        If *raw_dir* does not exist or the required K3 flat/arc files are
-        absent.
+        If the raw directory does not exist or the required flat/arc files
+        are absent.
+    TypeError
+        If an unrecognised keyword argument is passed.
+
+    Examples
+    --------
+    Run with all defaults::
+
+        from scripts.run_ishell_k3_example import run_k3_example
+        completed = run_k3_example()
+
+    Override individual fields::
+
+        completed = run_k3_example(
+            raw_dir="/data/K3",
+            wavecal_output_name="wavecal11-12",
+            no_plots=True,
+        )
+
+    Pass a fully custom config::
+
+        from scripts.run_ishell_k3_example import K3BenchmarkConfig, run_k3_example
+        cfg = K3BenchmarkConfig(
+            raw_dir="/data/K3",
+            wavecal_output_name="my_wavecal",
+            save_plots=True,
+        )
+        completed = run_k3_example(cfg)
     """
+    # ------------------------------------------------------------------
+    # Build effective config from defaults + any overrides
+    # ------------------------------------------------------------------
+
+    cfg = K3BenchmarkConfig() if config is None else config
+
+    # Support ``out_dir`` as a convenience alias for ``output_dir``
+    if "out_dir" in overrides and "output_dir" not in overrides:
+        overrides["output_dir"] = overrides.pop("out_dir")
+
+    # Validate override keys before applying them
+    valid_fields = {f for f in cfg.__dataclass_fields__}
+    bad_keys = set(overrides) - valid_fields
+    if bad_keys:
+        raise TypeError(
+            f"run_k3_example() got unexpected keyword argument(s): "
+            f"{sorted(bad_keys)}"
+        )
+
+    # Apply overrides (shallow copy to avoid mutating the caller's config)
+    if overrides:
+        import dataclasses
+        cfg = dataclasses.replace(cfg, **overrides)
+
+    raw_dir = cfg.raw_dir
+    out_dir = cfg.output_dir
+    mode = cfg.mode_name
+    save_plots = cfg.save_plots
+    no_plots = cfg.no_plots
+    prefix = cfg.qa_plot_prefix
+    wavecal_name = cfg.wavecal_output_name
+    flat_name = cfg.flat_output_name
+
     completed: dict[str, bool] = {}
 
     # ------------------------------------------------------------------
@@ -469,38 +671,54 @@ def run_k3_example(
 
     all_files = find_fits_files(raw_dir)
 
-    flat_files = _select_files(all_files, "flat", _FLAT_FRAME_NUMBERS)
-    arc_files = _select_files(all_files, "arc", _ARC_FRAME_NUMBERS)
-    dark_files = _select_files(all_files, "dark", _DARK_FRAME_NUMBERS)
-    object_files = _select_files(all_files, "spc", _OBJECT_FRAME_NUMBERS)
-    standard_files = _select_files(all_files, "spc", _STANDARD_FRAME_NUMBERS)
+    flat_files = _select_files(all_files, "flat", cfg.flat_frames)
+    arc_files = _select_files(all_files, "arc", cfg.arc_frames)
+    dark_files = _select_files(all_files, "dark", cfg.dark_frames)
+    object_files = _select_files(all_files, "spc", cfg.object_frames)
+    standard_files = _select_files(all_files, "spc", cfg.standard_frames)
+
+    flat_range = f"{min(cfg.flat_frames)}–{max(cfg.flat_frames)}"
+    arc_range = f"{min(cfg.arc_frames)}–{max(cfg.arc_frames)}"
+    dark_range = (
+        f"{min(cfg.dark_frames)}–{max(cfg.dark_frames)}"
+        if cfg.dark_frames else "none"
+    )
+    obj_range = (
+        f"{min(cfg.object_frames)}–{max(cfg.object_frames)}"
+        if cfg.object_frames else "none"
+    )
+    std_range = (
+        f"{min(cfg.standard_frames)}–{max(cfg.standard_frames)}"
+        if cfg.standard_frames else "none"
+    )
 
     _banner("K3 Benchmark: file discovery")
+    print(f"  Mode        : {mode}")
     print(f"  Raw dir     : {raw_dir}")
     print(f"  Output dir  : {out_dir}")
-    print(f"  Flat files  : {len(flat_files)}  (frames 6–10)")
-    print(f"  Arc files   : {len(arc_files)}   (frames 11–12)")
-    print(f"  Dark files  : {len(dark_files)}  (frames 25–29)")
-    print(f"  Object spc  : {len(object_files)}  (frames 1–5)")
-    print(f"  Std A0V spc : {len(standard_files)}  (frames 13–17)")
+    print(f"  Flat files  : {len(flat_files)}  (frames {flat_range})")
+    print(f"  Arc files   : {len(arc_files)}   (frames {arc_range})")
+    print(f"  Dark files  : {len(dark_files)}  (frames {dark_range})")
+    print(f"  Object spc  : {len(object_files)}  (frames {obj_range})")
+    print(f"  Std A0V spc : {len(standard_files)}  (frames {std_range})")
 
     if not flat_files:
         raise FileNotFoundError(
-            f"No flat files (frames 6–10) found in {raw_dir!r}. "
+            f"No flat files (frames {flat_range}) found in {raw_dir!r}. "
             "Ensure the K3 FITS files are present."
         )
     if not arc_files:
         raise FileNotFoundError(
-            f"No arc files (frames 11–12) found in {raw_dir!r}. "
+            f"No arc files (frames {arc_range}) found in {raw_dir!r}. "
             "Ensure the K3 FITS files are present."
         )
 
     # ------------------------------------------------------------------
-    # Load packaged K3 calibration resources
+    # Load packaged calibration resources for the configured mode
     # ------------------------------------------------------------------
 
-    wavecalinfo = read_wavecalinfo(_MODE)
-    line_list = read_line_list(_MODE)
+    wavecalinfo = read_wavecalinfo(mode)
+    line_list = read_line_list(mode)
 
     # ------------------------------------------------------------------
     # Stage 1: Flat/order tracing
@@ -509,14 +727,15 @@ def run_k3_example(
     _banner("Stage 1: Flat / order-centre tracing")
     flat_img = load_and_combine_flats(flat_files)
     trace = trace_orders_from_flat(flat_files)
-    geom = trace.to_order_geometry_set(_MODE)
+    geom = trace.to_order_geometry_set(mode)
     print(f"  Orders detected : {trace.n_orders}")
     print(f"  Median fit RMS  : {float(trace.fit_rms.mean()):.2f} px (mean across orders)")
     _ok("Stage 1 — flat/order tracing")
     completed["stage1_flat_tracing"] = True
 
     if not no_plots:
-        _plot_flat_orders(flat_img, trace, out_dir, save=save_plots)
+        _plot_flat_orders(flat_img, trace, out_dir, save=save_plots,
+                          prefix=prefix)
 
     # ------------------------------------------------------------------
     # Stage 2: Arc-line tracing
@@ -532,7 +751,8 @@ def run_k3_example(
     completed["stage2_arc_tracing"] = True
 
     if not no_plots:
-        _plot_arc_lines(arc_img, arc_result, out_dir, save=save_plots)
+        _plot_arc_lines(arc_img, arc_result, out_dir, save=save_plots,
+                        prefix=prefix)
 
     # ------------------------------------------------------------------
     # Stage 3: Provisional wavelength map
@@ -553,7 +773,8 @@ def run_k3_example(
     completed["stage3_provisional_wavemap"] = True
 
     if not no_plots:
-        _plot_wavecal_residuals(prov_map, out_dir, save=save_plots)
+        _plot_wavecal_residuals(prov_map, out_dir, save=save_plots,
+                                prefix=prefix)
 
     # ------------------------------------------------------------------
     # Stage 4: Global wavelength surface
@@ -623,7 +844,8 @@ def run_k3_example(
             completed["stage7_rectified_orders"] = True
 
             if not no_plots:
-                _plot_rectified_order(rect_set, out_dir, save=save_plots)
+                _plot_rectified_order(rect_set, out_dir, save=save_plots,
+                                      prefix=prefix)
         except Exception as exc:  # noqa: BLE001
             print(f"  Stage 7 raised: {exc}")
             _skip("Stage 7 — rectified order images", "exception (see above)")
@@ -642,9 +864,16 @@ def run_k3_example(
     if rect_set is not None:
         try:
             cal_products = build_calibration_products(rect_set)
-            paths = write_calibration_fits(cal_products, out_dir)
-            print(f"  Wavecal FITS written : {paths[0]}")
-            print(f"  Spatcal FITS written : {paths[1]}")
+            wavecal_path = ensure_fits_suffix(
+                os.path.join(out_dir, wavecal_name)
+            )
+            spatcal_path = ensure_fits_suffix(
+                os.path.join(out_dir, f"{wavecal_name}_spatcal")
+            )
+            write_wavecal_fits(cal_products, wavecal_path)
+            write_spatcal_fits(cal_products, spatcal_path)
+            print(f"  Wavecal FITS written : {wavecal_path}")
+            print(f"  Spatcal FITS written : {spatcal_path}")
             _ok("Stage 8 — calibration FITS")
             completed["stage8_calibration_fits"] = True
         except Exception as exc:  # noqa: BLE001
@@ -689,8 +918,13 @@ def run_k3_example(
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI helpers
 # ---------------------------------------------------------------------------
+
+
+def _parse_int_list(value: str) -> list[int]:
+    """Parse a comma-separated string of integers, e.g. ``"6,7,8,9,10"``."""
+    return [int(x.strip()) for x in value.split(",") if x.strip()]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -698,11 +932,14 @@ def _parse_args() -> argparse.Namespace:
         description="iSHELL K3 benchmark driver (Python scaffold)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+
+    # --- paths ---
     parser.add_argument(
         "--raw-dir",
         default=None,
         metavar="PATH",
-        help="Raw K3 data directory (default: data/testdata/ishell_k3_example/raw/)",
+        help="Raw K3 data directory "
+             "(default: data/testdata/ishell_k3_example/raw/)",
     )
     parser.add_argument(
         "--out-dir",
@@ -711,6 +948,75 @@ def _parse_args() -> argparse.Namespace:
         help="Output directory for FITS products and QA plots "
              "(default: data/testdata/ishell_k3_example/output/)",
     )
+
+    # --- frame numbers ---
+    parser.add_argument(
+        "--flat-frames",
+        default=None,
+        metavar="INTS",
+        help="Comma-separated flat frame numbers (default: 6,7,8,9,10)",
+    )
+    parser.add_argument(
+        "--arc-frames",
+        default=None,
+        metavar="INTS",
+        help="Comma-separated arc frame numbers (default: 11,12)",
+    )
+    parser.add_argument(
+        "--dark-frames",
+        default=None,
+        metavar="INTS",
+        help="Comma-separated dark frame numbers (default: 25,26,27,28,29)",
+    )
+    parser.add_argument(
+        "--object-frames",
+        default=None,
+        metavar="INTS",
+        help="Comma-separated object spc frame numbers (default: 1,2,3,4,5)",
+    )
+    parser.add_argument(
+        "--standard-frames",
+        default=None,
+        metavar="INTS",
+        help="Comma-separated standard spc frame numbers "
+             "(default: 13,14,15,16,17)",
+    )
+
+    # --- output names ---
+    parser.add_argument(
+        "--flat-output-name",
+        default=None,
+        metavar="NAME",
+        help="Stem for flat calibration output file (default: flat6-10)",
+    )
+    parser.add_argument(
+        "--wavecal-output-name",
+        default=None,
+        metavar="NAME",
+        help="Stem for wavecal output file (default: wavecal11-12)",
+    )
+    parser.add_argument(
+        "--dark-output-name",
+        default=None,
+        metavar="NAME",
+        help="Stem for dark output file (default: dark25-29)",
+    )
+    parser.add_argument(
+        "--qa-plot-prefix",
+        default=None,
+        metavar="PREFIX",
+        help="Prefix for QA plot filenames (default: qa)",
+    )
+
+    # --- mode ---
+    parser.add_argument(
+        "--mode-name",
+        default=None,
+        metavar="MODE",
+        help="iSHELL observing mode (default: K3)",
+    )
+
+    # --- plot behaviour ---
     parser.add_argument(
         "--save-plots",
         action="store_true",
@@ -729,16 +1035,40 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
-    raw_dir = args.raw_dir or _default_raw_dir()
-    out_dir = args.out_dir or _default_out_dir()
+    # Build overrides dict from CLI — only include values that were actually
+    # specified so that K3BenchmarkConfig defaults remain in effect otherwise.
+    overrides: dict = {}
+    if args.raw_dir is not None:
+        overrides["raw_dir"] = args.raw_dir
+    if args.out_dir is not None:
+        overrides["output_dir"] = args.out_dir
+    if args.flat_frames is not None:
+        overrides["flat_frames"] = _parse_int_list(args.flat_frames)
+    if args.arc_frames is not None:
+        overrides["arc_frames"] = _parse_int_list(args.arc_frames)
+    if args.dark_frames is not None:
+        overrides["dark_frames"] = _parse_int_list(args.dark_frames)
+    if args.object_frames is not None:
+        overrides["object_frames"] = _parse_int_list(args.object_frames)
+    if args.standard_frames is not None:
+        overrides["standard_frames"] = _parse_int_list(args.standard_frames)
+    if args.flat_output_name is not None:
+        overrides["flat_output_name"] = args.flat_output_name
+    if args.wavecal_output_name is not None:
+        overrides["wavecal_output_name"] = args.wavecal_output_name
+    if args.dark_output_name is not None:
+        overrides["dark_output_name"] = args.dark_output_name
+    if args.qa_plot_prefix is not None:
+        overrides["qa_plot_prefix"] = args.qa_plot_prefix
+    if args.mode_name is not None:
+        overrides["mode_name"] = args.mode_name
+    if args.save_plots:
+        overrides["save_plots"] = True
+    if args.no_plots:
+        overrides["no_plots"] = True
 
     try:
-        run_k3_example(
-            raw_dir=raw_dir,
-            out_dir=out_dir,
-            save_plots=args.save_plots,
-            no_plots=args.no_plots,
-        )
+        run_k3_example(**overrides)
     except FileNotFoundError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
         sys.exit(1)
