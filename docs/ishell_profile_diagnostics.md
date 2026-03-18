@@ -102,7 +102,7 @@ of the science frame and the external template profile.
 |---|---|
 | `profile_correlation` | Pearson correlation between science empirical and external template profiles (aperture rows only).  Near 1.0 means nearly identical shapes. |
 | `profile_l2_difference` | Shape-normalised L2 difference after unit-norm normalisation of both profiles.  Near 0.0 means identical shapes. |
-| `flux_image_correlation` | Pearson correlation between the science flux image (flattened) and the template-derived model image. |
+| `flux_image_correlation` | Pearson correlation between the science aperture flux image (flattened) and the template-derived model image `outer(profile, colspec)`, where `colspec[j] = nansum(flux_ap[:, j])` is the per-column summed flux. Varies column-by-column, making it a physically faithful proxy for the extracted spectrum model. |
 | `possible_template_leakage` | Heuristic flag: `True` when `profile_correlation > 0.98` **AND** `profile_l2_difference < 0.05`. |
 
 The `possible_template_leakage` flag is set using two simple thresholds:

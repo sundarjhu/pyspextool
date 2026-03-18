@@ -570,10 +570,17 @@ class TemplateLeakageDiagnostics:
         ``float('nan')`` when no finite paired values exist.
     flux_image_correlation : float
         Pearson correlation coefficient between the science aperture flux
-        image (flattened) and the template-derived model image
-        (``profile * median_flux``), restricted to the aperture rows
-        defined in *extraction_def*.  ``float('nan')`` when fewer than
-        two finite pairs exist.
+        image (flattened) and the template-derived model image, restricted
+        to the aperture rows defined in *extraction_def*.
+
+        The model is built as ``outer(profile, colspec)`` where
+        ``colspec[j] = nansum(flux_ap[:, j])`` is the per-column summed
+        flux — a minimal but column-varying proxy for the extracted 1-D
+        spectrum.  This makes the model physically faithful in the sense
+        that each spectral column is scaled independently rather than by
+        a single scalar.
+
+        ``float('nan')`` when fewer than two finite pairs exist.
     possible_template_leakage : bool
         Heuristic flag set to ``True`` when *both* of the following
         hold:
@@ -767,19 +774,17 @@ def _compute_single_leakage_diagnostics(
         l2_diff = float("nan")
 
     # ------------------------------------------------------------------ #
-    # flux_image_correlation (optional)
+    # flux_image_correlation
     # ------------------------------------------------------------------ #
-    # Model: template profile * median-across-spectral flux scalar
+    # Build a per-column extracted-spectrum estimate (shape (n_spectral,))
+    # as the nansum of the aperture rows for each spectral column.  This
+    # is a minimal but physically faithful proxy for the 1-D extracted
+    # spectrum: the full model image is outer(profile, colspec), which
+    # varies column-by-column rather than being constant across wavelength.
     with np.errstate(all="ignore"):
-        median_flux = float(np.nanmedian(flux_ap))
-    model_ap = ext_profile_ap * median_flux  # shape (n_ap_rows,)
-    # Flatten flux_ap and model for correlation
-    flux_ap_flat = flux_ap.ravel()
-    model_flat = (
-        np.outer(ext_profile_ap, np.ones(flux_ap.shape[1])).ravel()
-        * median_flux
-    )
-    flux_img_corr = _pearson_correlation(flux_ap_flat, model_flat)
+        colspec = np.nansum(flux_ap, axis=0)  # shape (n_spectral,)
+    model_2d = np.outer(ext_profile_ap, colspec)  # (n_ap_rows, n_spectral)
+    flux_img_corr = _pearson_correlation(flux_ap.ravel(), model_2d.ravel())
 
     # ------------------------------------------------------------------ #
     # possible_template_leakage flag

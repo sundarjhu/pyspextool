@@ -516,6 +516,62 @@ class TestLeakageDetectionCorrelation:
                 f"Order {d.order}: unexpected leakage flag for independent noise"
             )
 
+    def test_flux_image_correlation_tracks_spectral_variation(self):
+        """flux_image_correlation should use a per-column spectrum model.
+
+        When the science flux image has a non-constant spectral shape (flux
+        ramps linearly across columns), the per-column outer-product model
+        ``outer(profile, colspec)`` tracks the column-wise variation and
+        produces a high correlation with the data.  A constant-scalar model
+        would not.
+        """
+        n_spatial = _N_SPATIAL
+        n_spectral = _N_SPECTRAL
+        spatial = np.linspace(0.0, 1.0, n_spatial)
+
+        # Gaussian spatial profile × linearly ramping spectral envelope.
+        center_frac = 0.5
+        sigma_frac = 0.1
+        profile_1d = np.exp(-0.5 * ((spatial - center_frac) / sigma_frac) ** 2)
+        profile_1d /= profile_1d.sum()
+        spectral_ramp = np.linspace(1.0, 10.0, n_spectral)  # varies strongly
+        flux_2d = np.outer(profile_1d, spectral_ramp) * 100.0
+
+        orders = []
+        for idx, p in enumerate(_ORDER_PARAMS):
+            orders.append(
+                RectifiedOrder(
+                    order=p["order_number"],
+                    order_index=idx,
+                    wavelength_um=np.linspace(
+                        1.55 + idx * 0.05, 1.59 + idx * 0.05, n_spectral
+                    ),
+                    spatial_frac=spatial.copy(),
+                    flux=flux_2d.copy(),
+                    source_image_shape=(200, 800),
+                )
+            )
+        ros = RectifiedOrderSet(
+            mode=_MODE,
+            rectified_orders=orders,
+            source_image_shape=(200, 800),
+        )
+        tmpl = _make_template_set(ros, normalize=True)
+        ext_def = _make_extraction_def()
+        result = compute_leakage_diagnostics(ros, tmpl, ext_def)
+
+        for d in result.diagnostics:
+            assert np.isfinite(d.flux_image_correlation), (
+                f"Order {d.order}: flux_image_correlation should be finite"
+            )
+            # The outer-product model tracks the column-varying spectrum,
+            # so correlation with the data should be high.
+            assert d.flux_image_correlation > 0.9, (
+                f"Order {d.order}: expected high flux_image_correlation for "
+                f"matching profile × ramping spectrum, "
+                f"got {d.flux_image_correlation}"
+            )
+
     def test_threshold_constants_are_reasonable(self):
         """Sanity check on the threshold values."""
         assert 0.9 < LEAKAGE_CORRELATION_THRESHOLD < 1.0
