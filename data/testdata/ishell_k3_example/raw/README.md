@@ -43,11 +43,29 @@ Output products written by the benchmark script are always plain `.fits`.
 ## Where outputs go
 
 The benchmark driver script (`scripts/run_ishell_k3_example.py`) writes
-all output FITS files and QA plots to:
+all output FITS files and QA plots to an output directory of your choice.
+
+**Default location** (used when no override is given):
 
     data/testdata/ishell_k3_example/output/
 
 That directory is created automatically on first run.
+
+**Override the output directory** at the command line:
+
+    python scripts/run_ishell_k3_example.py --out-dir /path/to/my/output
+
+Or via the Python API:
+
+    from scripts.run_ishell_k3_example import K3BenchmarkConfig, run_k3_example
+
+    run_k3_example(output_dir="/path/to/my/output")
+    # or
+    cfg = K3BenchmarkConfig(output_dir="/path/to/my/output")
+    run_k3_example(cfg)
+
+See `docs/ishell_k3_example.md` for a full list of configurable fields and
+CLI flags.
 
 ---
 
