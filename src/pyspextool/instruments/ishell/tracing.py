@@ -325,8 +325,9 @@ def trace_orders_from_flat(
 
     Examples
     --------
-    >>> import glob
-    >>> flat_paths = sorted(glob.glob("data/testdata/ishell_h1_calibrations/raw/*.flat.*.fits"))
+    >>> from pyspextool.instruments.ishell.io_utils import find_fits_files
+    >>> all_paths = find_fits_files("data/testdata/ishell_h1_calibrations/raw")
+    >>> flat_paths = [str(p) for p in all_paths if "flat" in p.name]
     >>> trace = trace_orders_from_flat(flat_paths)
     >>> print(f"Found {trace.n_orders} orders")
     >>> geom = trace.to_order_geometry_set("H1")

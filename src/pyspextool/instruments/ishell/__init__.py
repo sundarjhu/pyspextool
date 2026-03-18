@@ -1,3 +1,4 @@
+from . import io_utils  # noqa: F401 – FITS file discovery and path utilities
 from . import wavecal  # noqa: F401 – make wavecal importable as sub-module
 from . import preprocess  # noqa: F401 – make preprocess importable as sub-module
 from . import extract  # noqa: F401 – make extract importable as sub-module
