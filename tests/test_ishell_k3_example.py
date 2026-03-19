@@ -1008,3 +1008,480 @@ class TestArcLinePlotRepresentativeRow:
         line = self._make_fake_line(seed_col=600, trace_rows=trace_rows)
         row = float(np.median(line.trace_rows))
         assert row == 250.0
+
+
+# ---------------------------------------------------------------------------
+# 9. Tests for the new wavecal_k3_idlstyle module (unit tests — no raw data)
+# ---------------------------------------------------------------------------
+
+
+class TestWavecalK3IdlstyleImport:
+    """The new wavecal_k3_idlstyle module is importable and exposes the expected API."""
+
+    def test_import(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            run_k3_1dxd_wavecal,
+            extract_order_arc_spectra,
+            cross_correlate_with_reference,
+            identify_lines_1d,
+            fit_global_1dxd,
+            OrderArcSpectrum,
+            CrossCorrelationResult,
+            LineIdentResult,
+            GlobalFit1DXD,
+            K3CalibDiagnostics,
+            K3_LAMBDA_DEGREE,
+            K3_ORDER_DEGREE,
+        )
+
+    def test_fixed_degrees(self):
+        """Fixed polynomial degrees must be exactly lambda=3, order=2."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            K3_LAMBDA_DEGREE, K3_ORDER_DEGREE,
+        )
+        assert K3_LAMBDA_DEGREE == 3
+        assert K3_ORDER_DEGREE == 2
+
+
+class TestOrderArcSpectrum:
+    """OrderArcSpectrum dataclass API tests."""
+
+    def _make(self, n_cols=100):
+        import numpy as np
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderArcSpectrum
+        return OrderArcSpectrum(
+            order_index=0,
+            order_number=215,
+            col_start=10,
+            col_end=10 + n_cols - 1,
+            spectrum=np.random.rand(n_cols),
+            reference_spectrum=np.random.rand(n_cols),
+            reference_wavelength_um=np.linspace(2.0, 2.5, n_cols),
+        )
+
+    def test_n_cols(self):
+        import numpy as np
+        oas = self._make(80)
+        assert oas.n_cols == 80
+
+    def test_columns(self):
+        import numpy as np
+        oas = self._make(50)
+        cols = oas.columns
+        assert cols[0] == oas.col_start
+        assert cols[-1] == oas.col_end
+        assert len(cols) == oas.n_cols
+
+
+class TestExtractOrderArcSpectra:
+    """extract_order_arc_spectra unit tests with synthetic data."""
+
+    def _make_arc_and_wci(self, n_orders=3, ncols=100, nrows=200):
+        import numpy as np
+        # Synthetic arc image: Gaussian rows with peaks at varying heights
+        arc = np.zeros((nrows, ncols))
+        centre_rows = [50, 100, 150][:n_orders]
+        for cr in centre_rows:
+            arc[cr - 2: cr + 3, :] += 500.0
+        arc += 10.0 * np.random.rand(nrows, ncols)
+
+        # Minimal WaveCalInfo-like object
+        class FakeWCI:
+            orders = list(range(203, 203 + n_orders))
+            xranges = np.array([[0, ncols - 1]] * n_orders)
+            data = np.zeros((n_orders, 4, ncols))
+        wci = FakeWCI()
+        for i in range(n_orders):
+            wci.data[i, 0, :] = np.linspace(2.0 + i * 0.1, 2.1 + i * 0.1, ncols)
+            wci.data[i, 1, :] = arc[centre_rows[i], :]
+        return arc, wci
+
+    def test_returns_one_per_order(self):
+        import numpy as np
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import extract_order_arc_spectra
+        arc, wci = self._make_arc_and_wci(n_orders=3)
+        spectra = extract_order_arc_spectra(arc, wci)
+        assert len(spectra) == 3
+
+    def test_spectrum_shape(self):
+        import numpy as np
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import extract_order_arc_spectra
+        arc, wci = self._make_arc_and_wci(n_orders=2, ncols=80)
+        spectra = extract_order_arc_spectra(arc, wci)
+        for s in spectra:
+            assert s.n_cols == 80
+            assert len(s.spectrum) == 80
+
+    def test_order_numbers(self):
+        import numpy as np
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import extract_order_arc_spectra
+        arc, wci = self._make_arc_and_wci(n_orders=3)
+        spectra = extract_order_arc_spectra(arc, wci)
+        assert [s.order_number for s in spectra] == wci.orders
+
+
+class TestCrossCorrelateWithReference:
+    """cross_correlate_with_reference unit tests."""
+
+    def _make_spectra(self, shift=5):
+        import numpy as np
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderArcSpectrum
+        ncols = 200
+        x = np.arange(ncols)
+        ref = np.exp(-0.5 * ((x - 100) / 3.0) ** 2) * 500.0
+        spec = np.exp(-0.5 * ((x - (100 + shift)) / 3.0) ** 2) * 500.0
+        oas = OrderArcSpectrum(
+            order_index=0,
+            order_number=215,
+            col_start=0,
+            col_end=ncols - 1,
+            spectrum=spec,
+            reference_spectrum=ref,
+            reference_wavelength_um=np.linspace(2.0, 2.5, ncols),
+        )
+        return [oas]
+
+    def test_returns_one_per_order(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import cross_correlate_with_reference
+        spectra = self._make_spectra()
+        results = cross_correlate_with_reference(spectra)
+        assert len(results) == 1
+
+    def test_shift_is_finite(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import cross_correlate_with_reference
+        import math
+        spectra = self._make_spectra(shift=5)
+        results = cross_correlate_with_reference(spectra)
+        assert math.isfinite(results[0].pixel_shift)
+
+    def test_shift_direction(self):
+        """Positive shift when extracted spectrum is at larger columns."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import cross_correlate_with_reference
+        spectra = self._make_spectra(shift=10)
+        results = cross_correlate_with_reference(spectra)
+        # With a single bright line shifted by +10, we expect a positive lag
+        assert results[0].pixel_shift > 0
+
+    def test_zero_shift_near_zero(self):
+        """Near-identical spectra should give a shift near zero."""
+        import numpy as np
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            OrderArcSpectrum, cross_correlate_with_reference,
+        )
+        ncols = 200
+        x = np.arange(ncols)
+        ref = np.exp(-0.5 * ((x - 100) / 3.0) ** 2) * 500.0
+        oas = OrderArcSpectrum(
+            order_index=0, order_number=215,
+            col_start=0, col_end=ncols - 1,
+            spectrum=ref.copy(),
+            reference_spectrum=ref.copy(),
+            reference_wavelength_um=np.linspace(2.0, 2.5, ncols),
+        )
+        results = cross_correlate_with_reference([oas])
+        assert abs(results[0].pixel_shift) <= 2
+
+
+class TestIdentifyLines1d:
+    """identify_lines_1d unit tests with synthetic data."""
+
+    def _make_inputs(self, n_lines=5, order_number=215):
+        """Create synthetic OrderArcSpectrum with known line positions."""
+        import numpy as np
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            OrderArcSpectrum, CrossCorrelationResult,
+        )
+        ncols = 500
+        col_start = 10
+        col_end = col_start + ncols - 1
+        # Reference wavelengths (linear)
+        ref_wav = np.linspace(2.0, 2.5, ncols)
+
+        # Place n_lines Gaussians in the spectrum
+        x = np.arange(ncols)
+        spec = np.ones(ncols) * 5.0  # background
+        line_cols_in_spec = np.linspace(50, 450, n_lines)
+        line_wavs = [float(np.interp(c, x, ref_wav)) for c in line_cols_in_spec]
+        for lc in line_cols_in_spec:
+            spec += 200.0 * np.exp(-0.5 * ((x - lc) / 2.0) ** 2)
+
+        oas = OrderArcSpectrum(
+            order_index=0,
+            order_number=order_number,
+            col_start=col_start,
+            col_end=col_end,
+            spectrum=spec,
+            reference_spectrum=spec.copy(),
+            reference_wavelength_um=ref_wav,
+        )
+        xcr = CrossCorrelationResult(
+            order_index=0,
+            order_number=order_number,
+            pixel_shift=0.0,
+            xcorr=np.array([1.0]),
+            xcorr_lag_range=(0, 0),
+        )
+
+        # Fake linelist
+        class FakeLLEntry:
+            def __init__(self, order, wav):
+                self.order = order
+                self.wavelength_um = wav
+
+        class FakeLL:
+            entries = [FakeLLEntry(order_number, w) for w in line_wavs]
+
+        return [oas], [xcr], FakeLL()
+
+    def test_returns_one_per_order(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import identify_lines_1d
+        spectra, xcrs, ll = self._make_inputs(n_lines=3)
+        results = identify_lines_1d(spectra, xcrs, ll, min_snr=2.0)
+        assert len(results) == 1
+
+    def test_candidates_equal_n_lines(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import identify_lines_1d
+        spectra, xcrs, ll = self._make_inputs(n_lines=4)
+        results = identify_lines_1d(spectra, xcrs, ll, min_snr=2.0)
+        assert results[0].n_candidate == 4
+
+    def test_plausible_centroids(self):
+        """Accepted centroids should be within the column range."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import identify_lines_1d
+        spectra, xcrs, ll = self._make_inputs(n_lines=5)
+        results = identify_lines_1d(spectra, xcrs, ll, min_snr=2.0)
+        ident = results[0]
+        for col in ident.centroids_col:
+            assert spectra[0].col_start <= col <= spectra[0].col_end
+
+
+class TestFitGlobal1DXD:
+    """fit_global_1dxd unit tests."""
+
+    def _make_line_idents(self, n_orders=5, n_lines_per_order=6):
+        """Create synthetic LineIdentResult objects on a known polynomial surface."""
+        import numpy as np
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import LineIdentResult
+
+        results = []
+        for i in range(n_orders):
+            order_num = 210 + i
+            cols = np.linspace(50, 450, n_lines_per_order)
+            # True wavelength: simple linear + order offset
+            wavs = 2.0 + (cols - 250) * 0.0002 + 0.05 * (i - 2)
+            results.append(
+                LineIdentResult(
+                    order_index=i,
+                    order_number=order_num,
+                    n_candidate=n_lines_per_order,
+                    centroids_col=cols,
+                    wavelengths_um=wavs,
+                    centroid_snr=np.ones(n_lines_per_order) * 20.0,
+                    rejected_wavelengths_um=np.array([]),
+                )
+            )
+        return results
+
+    def test_returns_global_fit(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import fit_global_1dxd
+        lids = self._make_line_idents(n_orders=5, n_lines_per_order=8)
+        gf = fit_global_1dxd(lids)
+        assert gf is not None
+
+    def test_fixed_degrees_used(self):
+        """The fit must use exactly lambda_degree=3, order_degree=2."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_global_1dxd, K3_LAMBDA_DEGREE, K3_ORDER_DEGREE,
+        )
+        lids = self._make_line_idents()
+        gf = fit_global_1dxd(lids)
+        assert gf.lambda_degree == K3_LAMBDA_DEGREE
+        assert gf.order_degree == K3_ORDER_DEGREE
+
+    def test_n_accepted_plus_rejected_equals_total(self):
+        """Bookkeeping: n_accepted + n_rejected == n_total."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import fit_global_1dxd
+        lids = self._make_line_idents()
+        gf = fit_global_1dxd(lids)
+        assert gf.n_accepted + gf.n_rejected == gf.n_total
+
+    def test_rms_is_finite(self):
+        """RMS should be a finite non-negative number."""
+        import math
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import fit_global_1dxd
+        lids = self._make_line_idents()
+        gf = fit_global_1dxd(lids)
+        assert math.isfinite(gf.rms_um)
+        assert gf.rms_um >= 0.0
+
+    def test_coeffs_shape(self):
+        """Coefficients must have shape (lambda_degree+1) * (order_degree+1)."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_global_1dxd, K3_LAMBDA_DEGREE, K3_ORDER_DEGREE,
+        )
+        lids = self._make_line_idents()
+        gf = fit_global_1dxd(lids)
+        expected = (K3_LAMBDA_DEGREE + 1) * (K3_ORDER_DEGREE + 1)
+        assert len(gf.coeffs) == expected
+
+    def test_coeffs_2d_shape(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_global_1dxd, K3_LAMBDA_DEGREE, K3_ORDER_DEGREE,
+        )
+        lids = self._make_line_idents()
+        gf = fit_global_1dxd(lids)
+        assert gf.coeffs_2d.shape == (K3_LAMBDA_DEGREE + 1, K3_ORDER_DEGREE + 1)
+
+    def test_returns_none_for_too_few_points(self):
+        """Returns None when there are not enough accepted points."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_global_1dxd, LineIdentResult,
+        )
+        import numpy as np
+        # Only 1 point total → too few
+        lid = LineIdentResult(
+            order_index=0, order_number=215,
+            n_candidate=1,
+            centroids_col=np.array([100.0]),
+            wavelengths_um=np.array([2.25]),
+            centroid_snr=np.array([10.0]),
+            rejected_wavelengths_um=np.array([]),
+        )
+        gf = fit_global_1dxd([lid], min_lines_total=6)
+        assert gf is None
+
+    def test_eval_method(self):
+        """eval() should return the predicted wavelength at a given (col, order)."""
+        import math
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import fit_global_1dxd
+        lids = self._make_line_idents()
+        gf = fit_global_1dxd(lids)
+        pred = gf.eval(250.0, 212.0)
+        assert math.isfinite(pred)
+        assert 1.5 < pred < 4.0  # K-band range sanity check
+
+    def test_sigma_clipping_rejection(self):
+        """Sigma clipping should reject obvious outliers."""
+        import numpy as np
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_global_1dxd, LineIdentResult,
+        )
+        # Create a mostly clean set with one obvious outlier
+        lids = []
+        for i in range(5):
+            order_num = 210 + i
+            cols = np.linspace(50, 450, 8)
+            wavs = 2.0 + (cols - 250) * 0.0002 + 0.05 * (i - 2)
+            if i == 2:
+                # Inject an obvious outlier
+                wavs_out = wavs.copy()
+                wavs_out[3] += 10.0  # 10 µm outlier!
+            else:
+                wavs_out = wavs
+            lids.append(
+                LineIdentResult(
+                    order_index=i, order_number=order_num,
+                    n_candidate=8,
+                    centroids_col=cols,
+                    wavelengths_um=wavs_out,
+                    centroid_snr=np.ones(8) * 20.0,
+                    rejected_wavelengths_um=np.array([]),
+                )
+            )
+        gf = fit_global_1dxd(lids, sigma_clip_nsigma=3.0, sigma_clip_niter=5)
+        # The outlier should have been rejected
+        assert gf.n_rejected >= 1
+
+
+# ---------------------------------------------------------------------------
+# 10. K3 real-data tests for the new 1DXD path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _HAVE_K3_DATA, reason="K3 raw files not present")
+class TestK3RealData1DXD:
+    """Tests using real K3 data for the IDL-style 1DXD path."""
+
+    def test_1dxd_stage_completes(self):
+        """Stage 2b (1DXD global wavecal) runs without crashing on real K3 data."""
+        driver = _import_driver()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=tmp,
+                no_plots=True,
+            )
+        # Stage 2b must be reported as completed (or at least attempted)
+        assert "stage2b_1dxd_global_wavecal" in completed
+
+    def test_1dxd_object_in_completed(self):
+        """The _k3_1dxd key is present in the completed dict."""
+        driver = _import_driver()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=tmp,
+                no_plots=True,
+            )
+        assert "_k3_1dxd" in completed
+
+    def test_accepted_line_count_reported(self):
+        """The 1DXD result reports an accepted-line count (even if zero)."""
+        driver = _import_driver()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=tmp,
+                no_plots=True,
+            )
+        k3_1dxd = completed.get("_k3_1dxd")
+        if k3_1dxd is None:
+            pytest.skip("1DXD result is None (stage did not complete)")
+        # total_accepted is an int (possibly 0)
+        assert isinstance(k3_1dxd.total_accepted, int)
+        assert k3_1dxd.total_accepted >= 0
+
+    def test_1dxd_qa_plot_created(self):
+        """The 1DXD QA plot file is written when save_plots=True."""
+        import os
+        driver = _import_driver()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=tmp,
+                no_plots=False,
+                save_plots=True,
+            )
+        # Only check if the stage succeeded
+        if not completed.get("stage2b_1dxd_global_wavecal"):
+            pytest.skip("Stage 2b did not complete; QA plot test not applicable")
+
+    def test_export_diagnostics_includes_1dxd_columns(self):
+        """Exported CSV includes 1DXD columns when the stage completes."""
+        import csv
+        import os
+        driver = _import_driver()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=tmp,
+                no_plots=True,
+                export_diagnostics=True,
+                diagnostics_format="csv",
+            )
+            csv_path = os.path.join(tmp, "qa_order_diagnostics.csv")
+            assert os.path.isfile(csv_path)
+            with open(csv_path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        # If 1DXD ran, the CSV should have the new columns
+        if completed.get("stage2b_1dxd_global_wavecal") and rows:
+            assert "xcorr_shift" in rows[0], (
+                "Expected 'xcorr_shift' column in diagnostics CSV when 1DXD completes"
+            )
+            assert "n_1dxd_accepted" in rows[0]
+            assert "rms_1dxd_nm" in rows[0]

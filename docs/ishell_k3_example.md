@@ -238,12 +238,43 @@ are **implemented and exercised** by the benchmark script:
 |-------|--------|-------------|
 | 1 | `tracing.py` | Flat/order-centre tracing from QTH flat frames |
 | 2 | `arc_tracing.py` | 2-D arc-line tracing |
-| 3 | `wavecal_2d.py` | Provisional per-order wavelength mapping |
+| **2b** | **`wavecal_k3_idlstyle.py`** | **IDL-style global 1DXD wavelength calibration (NEW PRIMARY K3 path)** |
+| 3 | `wavecal_2d.py` | Provisional per-order wavelength mapping (scaffold, retained for downstream rectification) |
 | 4 | `wavecal_2d_surface.py` | Global wavelength surface fit |
 | 5 | `wavecal_2d_refine.py` | Coefficient-surface refinement |
 | 6 | `rectification_indices.py` | Rectification-index generation |
 | 7 | `rectified_orders.py` | Rectified order images |
 | 8 | `calibration_fits.py` | Write calibration FITS products |
+
+### New Stage 2b: IDL-style global 1DXD wavelength calibration
+
+Stage 2b is the new **primary K3 wavelength-calibration path** that replaces
+the old per-order scaffold path for the K3 benchmark.  It follows the IDL
+Spextool sequence more closely:
+
+1. **Extract 1-D arc spectra per order** from the median-combined arc image,
+   using the order centre-row geometry.
+2. **Cross-correlate with the stored reference spectrum** (plane 1 of
+   `K3_wavecalinfo.fits`) to estimate a per-order pixel offset.
+3. **Identify and centroid arc lines in 1-D** using shifted expected positions
+   from the cross-correlation step.
+4. **Fit a global 1DXD wavelength solution** across all accepted K3 line
+   centroids together:
+   ```
+   lambda = f(column, order)
+   ```
+   with fixed degrees `lambda_degree=3`, `order_degree=2`.
+5. **Apply iterative sigma-clipping** (`nsigma=3.0`, up to 5 iterations) in
+   the global fit.
+
+The module lives in:
+
+```
+src/pyspextool/instruments/ishell/wavecal_k3_idlstyle.py
+```
+
+For the architectural design rationale, see
+[docs/ishell_k3_1dxd_design.md](ishell_k3_1dxd_design.md).
 
 ### First-pass observations on K3 data
 
@@ -422,12 +453,35 @@ full K3 reduction flow described in the IDL Spextool manual.
 The following mismatches are **known and documented** as of this benchmark
 pass.  They reflect scaffold-level limitations, not incorrect code:
 
+### New 1DXD path (Stage 2b — primary K3 route)
+
 | Issue | Description |
 |-------|-------------|
-| Residual scale | Provisional 1DXD residuals are larger than the IDL manual's Figure 3 (RMS ~0.019 Å).  This is expected: the Python scaffold uses a coarse line-matching strategy without the full 2DXD surface fit. |
+| Cross-correlation reliability | Per-order pixel shifts from cross-correlation may be inaccurate for orders where the reference arc spectrum (plane 1 of `K3_wavecalinfo.fits`) has low signal or poor overlap with the real arc image.  Robust shift estimation (sub-pixel Gaussian fitting of the XCorr peak) would improve this. |
+| Centre-row estimation | The 1-D spectrum extraction estimates the order centre row from a global-maximum profile of the cross-dispersion median.  A flexure-corrected traced centre row would be more accurate. |
+| Line centroiding | Gaussian fitting is used with a fixed window; for blended or very faint lines, the centroid may be unreliable. |
+| Residual scale (1DXD) | Until real K3 data are exercised, the global fit RMS is not verified against the IDL manual's Figure 3 benchmark (RMS ~0.019 Å = 0.0019 nm). |
+
+### Scaffold path (Stages 3–8 — retained for downstream rectification)
+
+| Issue | Description |
+|-------|-------------|
 | 2DCoeffFit analogue | The `qa_2d_coeff_fit.png` is a partial analogue only.  No model surface overlay, no curvature coefficient panel, and no per-line rejection indicator are currently available. |
 | Non-monotonic wavelength surfaces | Several orders show non-monotonic wavelength surfaces during rectification (logged as `RuntimeWarning`).  These are expected artefacts of the provisional coefficient surface and not a bug in rectification logic. |
-| Order polynomial degree reduction | Some orders use a lower polynomial degree than requested because too few arc lines were accepted.  This degrades the local wavelength solution accuracy. |
+| Order polynomial degree reduction | Some orders in the scaffold path use a lower polynomial degree than requested because too few arc lines were accepted.  This degrades the local wavelength solution accuracy. |
+
+---
+
+## Old scaffold path vs new 1DXD path
+
+| Aspect | Old scaffold (Stages 3–8) | New IDL-style path (Stage 2b) |
+|--------|--------------------------|-------------------------------|
+| Primary calibration model | Per-order polynomial fits | Global 1DXD surface `f(col, order)` |
+| Source of λ-IDs | 2-D seed-based direct line matching | 1-D centroiding after cross-correlation shift |
+| Weak-order handling | Per-order degree reduction | Global fit regularises via cross-order smoothness |
+| Outlier rejection | None | Iterative σ-clipping in global fit |
+| Polynomial degrees | Per-order selected automatically | Fixed: lambda=3, order=2 |
+| QA plot | `qa_wavecal_residuals.png` | `qa_1dxd_qa.png` (residuals + per-order stats) |
 
 ---
 
