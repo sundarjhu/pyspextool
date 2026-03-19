@@ -502,3 +502,159 @@ class TestK3BenchmarkSmoke:
                 assert os.path.isfile(out_path), (
                     f"Expected config-named wavecal FITS at {out_path}"
                 )
+
+    # -----------------------------------------------------------------------
+    # New tests for benchmark alignment (edge-order filter, QA plots)
+    # -----------------------------------------------------------------------
+
+    def test_filter_edge_orders_unit(self):
+        """_filter_edge_orders reduces 29 raw K3 orders to 27 science orders."""
+        import warnings
+        from pyspextool.instruments.ishell.tracing import trace_orders_from_flat
+
+        driver = _import_driver()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            trace_raw = trace_orders_from_flat(_K3_FLAT_FILES)
+
+        filtered = driver._filter_edge_orders(trace_raw)
+        # K3 has 27 science orders (203–229) per the IDL Spextool manual.
+        # The filter should retain exactly those orders.
+        assert filtered.n_orders == 27, (
+            f"Expected 27 K3 science orders after edge filtering, "
+            f"got {filtered.n_orders}"
+        )
+        assert filtered.n_orders < trace_raw.n_orders, (
+            "Edge filter should remove at least one partial order"
+        )
+
+    def test_filter_edge_orders_noop_on_uniform_halfwidth(self):
+        """_filter_edge_orders is a no-op when all half-widths are equal."""
+        import numpy as np
+        from pyspextool.instruments.ishell.tracing import FlatOrderTrace
+
+        driver = _import_driver()
+
+        n = 5
+        uniform_trace = FlatOrderTrace(
+            n_orders=n,
+            sample_cols=np.arange(10),
+            center_rows=np.zeros((n, 10)),
+            center_poly_coeffs=np.zeros((n, 2)),
+            fit_rms=np.ones(n),
+            half_width_rows=np.full(n, 16.0),
+            poly_degree=1,
+            seed_col=1023,
+        )
+        result = driver._filter_edge_orders(uniform_trace)
+        assert result.n_orders == n
+
+    def test_all_qa_plots_produced(self):
+        """All expected QA plots are produced when save_plots=True."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                save_plots=True,
+                no_plots=False,
+            )
+            expected_plots = [
+                "qa_flat_orders.png",
+                "qa_arc_lines.png",
+                "qa_wavecal_residuals.png",
+                "qa_2d_coeff_fit.png",
+                "qa_rectified_order.png",
+            ]
+            for fname in expected_plots:
+                fpath = os.path.join(out_dir, fname)
+                assert os.path.isfile(fpath), (
+                    f"Expected QA plot not produced: {fpath}"
+                )
+
+    def test_arc_lines_plot_produced(self):
+        """Arc-lines QA plot is produced (tests the traced_lines accessor fix)."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                save_plots=True,
+                no_plots=False,
+            )
+            arc_plot = os.path.join(out_dir, "qa_arc_lines.png")
+            assert os.path.isfile(arc_plot), (
+                f"Arc-lines QA plot missing: {arc_plot}\n"
+                "This likely means the arc_result.traced_lines accessor is broken."
+            )
+
+    def test_rectified_order_plot_produced(self):
+        """Rectified-order QA plot is produced (tests the flux accessor fix)."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                save_plots=True,
+                no_plots=False,
+            )
+            if not completed.get("stage7_rectified_orders"):
+                pytest.skip("Stage 7 did not complete; rectified-order QA skipped")
+            rect_plot = os.path.join(out_dir, "qa_rectified_order.png")
+            assert os.path.isfile(rect_plot), (
+                f"Rectified-order QA plot missing: {rect_plot}\n"
+                "This likely means the RectifiedOrder.flux accessor is broken."
+            )
+
+    def test_2d_coeff_fit_plot_produced(self):
+        """2DCoeffFit-style QA plot is produced."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                save_plots=True,
+                no_plots=False,
+            )
+            coeff_plot = os.path.join(out_dir, "qa_2d_coeff_fit.png")
+            assert os.path.isfile(coeff_plot), (
+                f"2DCoeffFit QA plot missing: {coeff_plot}"
+            )
+
+    def test_residuals_plot_produced(self):
+        """Wavecal residuals QA plot is produced."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                save_plots=True,
+                no_plots=False,
+            )
+            res_plot = os.path.join(out_dir, "qa_wavecal_residuals.png")
+            assert os.path.isfile(res_plot), (
+                f"Wavecal residuals QA plot missing: {res_plot}"
+            )
+
+    def test_benchmark_stage1_filtered_order_count(self):
+        """Stage 1 reports 27 retained K3 science orders after edge filtering."""
+        driver = _import_driver()
+        # Use driver's filter directly on raw tracing result
+        import warnings
+        from pyspextool.instruments.ishell.tracing import trace_orders_from_flat
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            trace_raw = trace_orders_from_flat(_K3_FLAT_FILES)
+
+        trace_filtered = driver._filter_edge_orders(trace_raw)
+        assert trace_filtered.n_orders == 27, (
+            f"K3 benchmark should retain 27 science orders, "
+            f"got {trace_filtered.n_orders}"
+        )

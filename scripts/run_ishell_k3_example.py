@@ -89,6 +89,7 @@ if _repo_src not in sys.path:
 # ---------------------------------------------------------------------------
 
 from pyspextool.instruments.ishell.tracing import (  # noqa: E402
+    FlatOrderTrace,
     load_and_combine_flats,
     trace_orders_from_flat,
 )
@@ -318,6 +319,74 @@ def _skip(stage: str, reason: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Benchmark-only order-filtering helper
+# ---------------------------------------------------------------------------
+
+
+def _filter_edge_orders(
+    trace: "FlatOrderTrace",
+    min_half_width_fraction: float = 0.30,
+) -> "FlatOrderTrace":
+    """Return a copy of *trace* with partial edge orders removed.
+
+    **Benchmark-only rule (K3 calibration benchmark)**:
+
+    The iSHELL flat-field tracing algorithm occasionally detects partially
+    visible orders at the top and bottom edges of the detector.  These
+    manifest as orders whose spatial half-width (``half_width_rows``) is
+    substantially smaller than the typical half-width of the well-exposed
+    science orders — because only part of the order profile is on the
+    detector.
+
+    For the K3 benchmark, orders whose ``half_width_rows`` falls below
+    ``min_half_width_fraction`` × (median half-width across all orders)
+    are excluded.  This criterion isolates orders that are genuinely
+    clipped at the detector boundary, without requiring hard-coded index
+    offsets.
+
+    Applied to K3 data this reduces 29 detected orders to the 27 science
+    orders (203–229) described in the IDL Spextool manual's QA figures.
+
+    Parameters
+    ----------
+    trace : FlatOrderTrace
+        Full tracing result, as returned by :func:`trace_orders_from_flat`.
+    min_half_width_fraction : float
+        Orders with ``half_width_rows < min_half_width_fraction * median``
+        are excluded.  Default is 0.30 (30 % of the median half-width).
+
+    Returns
+    -------
+    FlatOrderTrace
+        A new :class:`FlatOrderTrace` containing only the retained orders,
+        in their original detector order.  The ``n_orders`` field is
+        updated accordingly.
+    """
+    import numpy as np
+
+    hw = trace.half_width_rows
+    median_hw = float(np.median(hw))
+    threshold = min_half_width_fraction * median_hw
+
+    keep = [i for i in range(trace.n_orders) if hw[i] >= threshold]
+
+    if len(keep) == trace.n_orders:
+        return trace  # nothing to filter
+
+    keep_arr = keep
+    return FlatOrderTrace(
+        n_orders=len(keep_arr),
+        sample_cols=trace.sample_cols,
+        center_rows=trace.center_rows[keep_arr],
+        center_poly_coeffs=trace.center_poly_coeffs[keep_arr],
+        fit_rms=trace.fit_rms[keep_arr],
+        half_width_rows=trace.half_width_rows[keep_arr],
+        poly_degree=trace.poly_degree,
+        seed_col=trace.seed_col,
+    )
+
+
+# ---------------------------------------------------------------------------
 # QA plotting helpers
 # ---------------------------------------------------------------------------
 
@@ -329,7 +398,13 @@ def _plot_flat_orders(
     save: bool,
     prefix: str,
 ) -> None:
-    """Python scaffold QA: traced order centres overlaid on the combined flat."""
+    """Python scaffold QA: traced order centres overlaid on the combined flat.
+
+    The overlay shows **smooth polynomial curves** evaluated continuously
+    across the full column range of each order, so the fitted trace is
+    clearly visible.  Sparse sampled points are overlaid in a lighter
+    style for reference.
+    """
     try:
         import matplotlib
         if save:
@@ -347,14 +422,28 @@ def _plot_flat_orders(
             vmin=vmin,
             vmax=vmax,
         )
-        cols = trace.sample_cols
+
+        # Evaluate each order's centre polynomial continuously across columns
+        col_range = np.arange(
+            int(trace.sample_cols[0]), int(trace.sample_cols[-1]) + 1
+        )
         for i in range(trace.n_orders):
-            centers = trace.center_rows[i]
-            ax.plot(cols, centers, lw=0.6, alpha=0.8)
+            coeffs = trace.center_poly_coeffs[i]
+            centers_smooth = np.polynomial.polynomial.polyval(col_range, coeffs)
+            ax.plot(col_range, centers_smooth, lw=0.9, alpha=0.85)
+            # Overlay sampled points in a light grey for reference
+            ax.plot(
+                trace.sample_cols,
+                trace.center_rows[i],
+                ".",
+                ms=2,
+                alpha=0.25,
+                color="white",
+            )
 
         ax.set_title(
             "Python scaffold QA — K3 flat: traced order centres\n"
-            f"({trace.n_orders} orders detected)"
+            f"({trace.n_orders} science orders, smooth polynomial curves)"
         )
         ax.set_xlabel("Column (pixels)")
         ax.set_ylabel("Row (pixels)")
@@ -396,7 +485,7 @@ def _plot_arc_lines(
             vmax=vmax,
         )
 
-        for line in arc_result.lines:
+        for line in arc_result.traced_lines:
             seed_col = line.seed_col
             # Evaluate the traced row at the seed column using the polynomial
             row = float(
@@ -431,7 +520,17 @@ def _plot_wavecal_residuals(
     save: bool,
     prefix: str,
 ) -> None:
-    """Python scaffold QA: wavelength-solution match residuals."""
+    """Python scaffold QA: wavelength-solution match residuals.
+
+    Produces a 4-panel figure analogous in spirit to the IDL manual's
+    Figure 3 (1DXD residual QA plot):
+
+    - Top-left  : signed residuals vs echelle order number
+    - Top-right : signed residuals vs detector column
+    - Bottom    : residual histogram with RMS annotation
+
+    Labelled *"Python scaffold QA"* — do not assume IDL parity.
+    """
     try:
         import matplotlib
         if save:
@@ -439,39 +538,80 @@ def _plot_wavecal_residuals(
         import matplotlib.pyplot as plt
         import numpy as np
 
+        # Collect all match data
         residuals_nm: list[float] = []
-        order_indices: list[int] = []
+        order_nums: list[int] = []
+        cols: list[float] = []
         for sol in prov_map.order_solutions:
             for m in sol.accepted_matches:
                 residuals_nm.append(m.match_residual_um * 1000.0)
-                order_indices.append(sol.order_number)
+                order_nums.append(m.order_number)
+                cols.append(float(m.centerline_col))
 
         if not residuals_nm:
             print("  [QA] No wavecal matches to plot.")
             return
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        r = np.asarray(residuals_nm)
+        o = np.asarray(order_nums)
+        c = np.asarray(cols)
+        rms = float(np.sqrt(np.mean(r ** 2)))
+        med = float(np.median(r))
 
-        axes[0].scatter(order_indices, residuals_nm, s=8, alpha=0.6)
-        axes[0].axhline(np.median(residuals_nm), color="r", lw=1.5,
-                        label=f"median = {np.median(residuals_nm):.2f} nm")
-        axes[0].set_xlabel("Echelle order number (provisional)")
-        axes[0].set_ylabel("|residual| (nm)")
-        axes[0].set_title("Residuals by order")
-        axes[0].legend(fontsize=8)
+        fig, axes = plt.subplots(2, 2, figsize=(13, 8))
 
-        axes[1].hist(residuals_nm, bins=30, edgecolor="k", linewidth=0.5)
-        axes[1].set_xlabel("|residual| (nm)")
-        axes[1].set_ylabel("Count")
-        axes[1].set_title(
-            f"Residual histogram  n={len(residuals_nm)}\n"
-            f"median={np.median(residuals_nm):.2f} nm  "
-            f"RMS={np.std(residuals_nm):.2f} nm"
+        # --- Top-left: residuals vs order number ---
+        axes[0, 0].scatter(o, r, s=10, alpha=0.6, color="steelblue")
+        axes[0, 0].axhline(0.0, color="k", lw=0.8, ls="--")
+        axes[0, 0].axhline(med, color="r", lw=1.2,
+                           label=f"median = {med:.2f} nm")
+        axes[0, 0].set_xlabel("Echelle order number (provisional)")
+        axes[0, 0].set_ylabel("Residual (nm)")
+        axes[0, 0].set_title("Residuals vs order number")
+        axes[0, 0].legend(fontsize=8)
+
+        # --- Top-right: residuals vs detector column ---
+        axes[0, 1].scatter(c, r, s=10, alpha=0.6, color="darkorange")
+        axes[0, 1].axhline(0.0, color="k", lw=0.8, ls="--")
+        axes[0, 1].axhline(med, color="r", lw=1.2,
+                           label=f"median = {med:.2f} nm")
+        axes[0, 1].set_xlabel("Detector column (pixels)")
+        axes[0, 1].set_ylabel("Residual (nm)")
+        axes[0, 1].set_title("Residuals vs detector column")
+        axes[0, 1].legend(fontsize=8)
+
+        # --- Bottom-left: histogram ---
+        axes[1, 0].hist(r, bins=30, edgecolor="k", linewidth=0.5,
+                        color="steelblue", alpha=0.7)
+        axes[1, 0].axvline(0.0, color="k", lw=0.8, ls="--")
+        axes[1, 0].set_xlabel("Residual (nm)")
+        axes[1, 0].set_ylabel("Count")
+        axes[1, 0].set_title(
+            f"Residual histogram  n={len(r)}\n"
+            f"median={med:.2f} nm   RMS={rms:.2f} nm"
         )
 
+        # --- Bottom-right: per-order matched-line count ---
+        order_counts: dict = {}
+        for oi in o:
+            order_counts[oi] = order_counts.get(oi, 0) + 1
+        order_sorted = sorted(order_counts)
+        axes[1, 1].bar(
+            order_sorted,
+            [order_counts[oi] for oi in order_sorted],
+            width=0.7,
+            color="teal",
+            alpha=0.8,
+        )
+        axes[1, 1].set_xlabel("Echelle order number (provisional)")
+        axes[1, 1].set_ylabel("Matched lines")
+        axes[1, 1].set_title("Accepted matched lines per order")
+
         fig.suptitle(
-            "Python scaffold QA — K3 provisional wavelength-solution residuals",
-            y=1.01,
+            "Python scaffold QA — K3 1DXD residuals (analogue of manual Fig. 3)\n"
+            f"Total matched: {len(r)}   RMS: {rms:.2f} nm   "
+            "NOTE: not IDL-equivalent",
+            fontsize=10,
         )
         fig.tight_layout()
 
@@ -504,11 +644,11 @@ def _plot_rectified_order(
 
         # Pick the first order that has data
         img = None
-        order_idx = None
-        for i, order in enumerate(rect_set.orders):
-            if order.image is not None and order.image.size > 0:
-                img = order.image
-                order_idx = i
+        order_num = None
+        for ro in rect_set.rectified_orders:
+            if ro.flux is not None and ro.flux.size > 0:
+                img = ro.flux
+                order_num = ro.order
                 break
 
         if img is None:
@@ -526,7 +666,7 @@ def _plot_rectified_order(
             vmax=vmax,
         )
         ax.set_title(
-            f"Python scaffold QA — K3 rectified order (index {order_idx})\n"
+            f"Python scaffold QA — K3 rectified order {order_num}\n"
             "NOTE: provisional scaffold; not science-quality"
         )
         ax.set_xlabel("Column (pixels)")
@@ -543,6 +683,169 @@ def _plot_rectified_order(
         plt.close(fig)
     except Exception as exc:
         print(f"  [QA] rectified-order plot skipped: {exc}")
+
+# ---------------------------------------------------------------------------
+# 2DCoeffFit-style QA helper (scaffold analogue of IDL Figures 4–7)
+# ---------------------------------------------------------------------------
+
+
+def _plot_2d_coeff_fit(
+    arc_result,
+    prov_map,
+    out_dir: str,
+    save: bool,
+    prefix: str,
+) -> None:
+    """Python scaffold QA: first analogue of the IDL 2DCoeffFit.pdf.
+
+    Produces a multi-panel figure covering the line-tilt / wavelength
+    calibration coefficient view.  This is an **approximate analogue** of
+    the IDL Spextool manual's Figures 4–7 (``2DCoeffFit.pdf``), limited to
+    what is available from the current Python scaffold.
+
+    Panels
+    ------
+    1. Arc-line position cloud (col vs row) — corresponds to IDL's
+       "zeroed-line" view.
+    2. Line tilt slope (``poly_coeffs[1]``) vs seed column — tilt mapping
+       across the detector.
+    3. Per-order wavelength polynomial evaluation (wavelength vs column) —
+       the scaffold's 1DXD wavelength-solution curves.
+    4. Accepted-match residuals (nm) vs (order, column) scatter.
+
+    What is missing relative to IDL Figures 4–7
+    --------------------------------------------
+    * No model surface overlay (requires full 2DCoeffFit surface).
+    * No curvature coefficient map (not yet extracted from scaffold).
+    * No per-line sigma-clip rejection indicator.
+    * No spatial calibration panels.
+
+    Labelled *"Python scaffold QA"* — not equivalent to IDL figures.
+    """
+    try:
+        import matplotlib
+        if save:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # ----------------------------------------------------------------
+        # Panel 1: Arc-line position cloud (col vs seed_row at seed_col)
+        # ----------------------------------------------------------------
+        seed_cols: list[float] = []
+        seed_rows: list[float] = []
+        tilt_slopes: list[float] = []
+        order_indices: list[int] = []
+
+        for line in arc_result.traced_lines:
+            sc = float(line.seed_col)
+            # Use the median row of traced points as the line's representative row
+            if len(line.trace_rows) > 0:
+                sr = float(np.median(line.trace_rows))
+            else:
+                sr = float(np.polynomial.polynomial.polyval(
+                    sc, line.poly_coeffs
+                ))
+            slope = line.tilt_slope()
+            seed_cols.append(sc)
+            seed_rows.append(sr)
+            tilt_slopes.append(slope)
+            order_indices.append(line.order_index)
+
+        sc_arr = np.asarray(seed_cols)
+        sr_arr = np.asarray(seed_rows)
+        ts_arr = np.asarray(tilt_slopes)
+        oi_arr = np.asarray(order_indices)
+
+        axes[0, 0].scatter(sc_arr, sr_arr, c=oi_arr, cmap="tab20",
+                           s=8, alpha=0.7)
+        axes[0, 0].set_xlabel("Seed column (pixels)")
+        axes[0, 0].set_ylabel("Traced row at seed column (pixels)")
+        axes[0, 0].set_title(
+            "Arc-line position cloud\n(col vs traced row, coloured by order index)"
+        )
+
+        # ----------------------------------------------------------------
+        # Panel 2: Tilt slope vs seed column
+        # ----------------------------------------------------------------
+        axes[0, 1].scatter(sc_arr, ts_arr, c=oi_arr, cmap="tab20",
+                           s=8, alpha=0.7)
+        axes[0, 1].axhline(0.0, color="k", lw=0.6, ls="--")
+        axes[0, 1].set_xlabel("Seed column (pixels)")
+        axes[0, 1].set_ylabel("Tilt slope (pixels / row)")
+        axes[0, 1].set_title(
+            "Arc-line tilt slope vs detector column\n"
+            "(analogue of IDL 2DCoeffFit slope panel)"
+        )
+
+        # ----------------------------------------------------------------
+        # Panel 3: Wavelength solution curves per order
+        # ----------------------------------------------------------------
+        col_eval = np.linspace(0, 2047, 200)
+        for sol in prov_map.order_solutions:
+            if sol.wave_coeffs is None or len(sol.accepted_matches) == 0:
+                continue
+            wave_nm = np.polynomial.polynomial.polyval(
+                col_eval, sol.wave_coeffs
+            ) * 1000.0  # µm → nm
+            axes[1, 0].plot(col_eval, wave_nm, lw=0.8, alpha=0.8)
+        axes[1, 0].set_xlabel("Detector column (pixels)")
+        axes[1, 0].set_ylabel("Wavelength (nm)")
+        axes[1, 0].set_title(
+            "Per-order 1DXD wavelength solutions\n"
+            "(analogue of IDL wavelength surface view)"
+        )
+
+        # ----------------------------------------------------------------
+        # Panel 4: Residuals scatter (order × column)
+        # ----------------------------------------------------------------
+        res_nm: list[float] = []
+        res_order: list[int] = []
+        res_col: list[float] = []
+        for sol in prov_map.order_solutions:
+            for m in sol.accepted_matches:
+                res_nm.append(m.match_residual_um * 1000.0)
+                res_order.append(m.order_number)
+                res_col.append(float(m.centerline_col))
+
+        if res_nm:
+            r_arr = np.asarray(res_nm)
+            c_arr = np.asarray(res_col)
+            o_arr = np.asarray(res_order)
+            sc_plot = axes[1, 1].scatter(
+                c_arr, o_arr, c=r_arr, cmap="RdYlGn_r",
+                s=18, alpha=0.8,
+                vmin=np.nanpercentile(r_arr, 5),
+                vmax=np.nanpercentile(r_arr, 95),
+            )
+            fig.colorbar(sc_plot, ax=axes[1, 1], label="Residual (nm)")
+        axes[1, 1].set_xlabel("Detector column (pixels)")
+        axes[1, 1].set_ylabel("Echelle order number")
+        axes[1, 1].set_title(
+            "Residual map (order × column)\n"
+            "(analogue of IDL 2DCoeffFit residual panel)"
+        )
+
+        fig.suptitle(
+            "Python scaffold QA — K3 2DCoeffFit analogue (Figs 4–7 spirit)\n"
+            "NOTE: partial — not equivalent to IDL 2DCoeffFit.pdf",
+            fontsize=10,
+        )
+        fig.tight_layout()
+
+        if save:
+            out_path = os.path.join(
+                out_dir, f"{prefix}_2d_coeff_fit.png"
+            )
+            fig.savefig(out_path, dpi=120, bbox_inches="tight")
+            print(f"  [QA] Saved: {out_path}")
+        else:
+            plt.show()
+        plt.close(fig)
+    except Exception as exc:
+        print(f"  [QA] 2DCoeffFit plot skipped: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -726,9 +1029,27 @@ def run_k3_example(
 
     _banner("Stage 1: Flat / order-centre tracing")
     flat_img = load_and_combine_flats(flat_files)
-    trace = trace_orders_from_flat(flat_files)
+    trace_raw = trace_orders_from_flat(flat_files)
+    print(f"  Orders detected (raw)  : {trace_raw.n_orders}")
+
+    # Apply benchmark-only edge-order filter:
+    # Exclude orders whose half-width is below 30 % of the median half-width.
+    # These are partially visible detector-edge orders that are not science
+    # orders.  For K3 this reduces 29 detected orders to the 27 science
+    # orders (203–229) described in the IDL Spextool manual's QA figures.
+    # See _filter_edge_orders() for the full criterion documentation.
+    trace = _filter_edge_orders(trace_raw)
+    n_dropped = trace_raw.n_orders - trace.n_orders
+    if n_dropped > 0:
+        print(
+            f"  Orders retained        : {trace.n_orders} "
+            f"(dropped {n_dropped} partial edge order(s), "
+            f"half_width_rows < 30% of median)"
+        )
+    else:
+        print(f"  Orders retained        : {trace.n_orders}")
+
     geom = trace.to_order_geometry_set(mode)
-    print(f"  Orders detected : {trace.n_orders}")
     print(f"  Median fit RMS  : {float(trace.fit_rms.mean()):.2f} px (mean across orders)")
     _ok("Stage 1 — flat/order tracing")
     completed["stage1_flat_tracing"] = True
@@ -769,12 +1090,29 @@ def run_k3_example(
     )
     print(f"  Orders with solutions : {prov_map.n_orders}")
     print(f"  Total matched lines   : {n_matched}")
+
+    # Per-order diagnostic report
+    print("  Per-order details:")
+    for sol in prov_map.order_solutions:
+        n_acc = len(sol.accepted_matches)
+        deg = (
+            len(sol.wave_coeffs) - 1
+            if sol.wave_coeffs is not None else "N/A"
+        )
+        print(
+            f"    order {sol.order_number:4d}: "
+            f"{n_acc:3d} accepted lines, "
+            f"poly degree={deg}"
+        )
+
     _ok("Stage 3 — provisional wavelength mapping")
     completed["stage3_provisional_wavemap"] = True
 
     if not no_plots:
         _plot_wavecal_residuals(prov_map, out_dir, save=save_plots,
                                 prefix=prefix)
+        _plot_2d_coeff_fit(arc_result, prov_map, out_dir, save=save_plots,
+                           prefix=prefix)
 
     # ------------------------------------------------------------------
     # Stage 4: Global wavelength surface
