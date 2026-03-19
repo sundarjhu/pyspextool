@@ -822,7 +822,7 @@ class TestK3BenchmarkDriverStage3b:
 
         scripts_dir = os.path.join(_REPO_ROOT, "scripts")
         spec = importlib.util.spec_from_file_location(
-            "run_ishell_k3_example2",
+            "run_ishell_k3_example_stage3b",
             os.path.join(scripts_dir, "run_ishell_k3_example.py"),
         )
         mod = importlib.util.module_from_spec(spec)
