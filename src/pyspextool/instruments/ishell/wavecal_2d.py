@@ -449,6 +449,7 @@ def fit_provisional_wavelength_map(
     dispersion_degree: int = 3,
     match_tol_um: float = 0.005,
     min_lines_per_order: int = 2,
+    min_col_separation: float = 5.0,
 ) -> ProvisionalWavelengthMap:
     """Match traced 2-D arc lines to reference wavelengths and fit per-order solutions.
 
@@ -498,6 +499,12 @@ def fit_provisional_wavelength_map(
         Minimum number of accepted matches required to attempt a polynomial
         fit.  Orders with fewer matches receive ``wave_coeffs = None`` and a
         ``RuntimeWarning``.
+    min_col_separation : float, default 5.0
+        Minimum column separation (pixels) between traced lines in the same
+        order.  When two or more detected lines fall within this distance,
+        only the one with the highest peak flux is retained.  This light-touch
+        deduplication removes spurious near-duplicate detections without
+        redesigning the arc-tracing algorithm.
 
     Returns
     -------
@@ -609,6 +616,10 @@ def fit_provisional_wavelength_map(
 
         # Build coarse col → wavelength lookup for this order
         coarse_cols, coarse_wavs = _build_coarse_lookup(wavecalinfo, i)
+
+        # Remove near-duplicate line detections clustered in column space.
+        if min_col_separation > 0:
+            traced_lines = _cluster_lines_by_column(traced_lines, min_col_separation)
 
         # Get reference lines for this echelle order
         ref_entries = ref_by_order.get(order_num, [])
@@ -870,3 +881,57 @@ def _fit_order_solution(
         centerline_cols=cols_arr,
         reference_wavs=wavs_arr,
     )
+
+
+def _cluster_lines_by_column(
+    lines: "list[TracedArcLine]",
+    min_sep: float,
+) -> "list[TracedArcLine]":
+    """Remove near-duplicate arc-line detections clustered in column space.
+
+    When two or more traced lines in the same order have seed columns within
+    *min_sep* pixels of each other, only the one with the highest peak flux
+    is retained.  This avoids degenerate polynomial fits caused by the same
+    physical emission line being detected twice at slightly different column
+    positions.
+
+    Parameters
+    ----------
+    lines : list of TracedArcLine
+        Candidate traced lines for one order (arbitrary column order).
+    min_sep : float
+        Minimum separation in pixels.  Lines whose seed columns differ by
+        less than this value are grouped together.
+
+    Returns
+    -------
+    list of TracedArcLine
+        Deduplicated line list, sorted by seed column.
+    """
+    if len(lines) <= 1:
+        return list(lines)
+
+    # Sort by seed column for greedy left-to-right sweep.
+    sorted_lines = sorted(lines, key=lambda ln: ln.seed_col)
+
+    clusters: list[list] = []
+    current_cluster: list = [sorted_lines[0]]
+
+    for ln in sorted_lines[1:]:
+        if float(ln.seed_col) - float(current_cluster[-1].seed_col) < min_sep:
+            current_cluster.append(ln)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [ln]
+    clusters.append(current_cluster)
+
+    result: list = []
+    for cluster in clusters:
+        if len(cluster) == 1:
+            result.append(cluster[0])
+        else:
+            # Keep the line with the highest peak flux.
+            best = max(cluster, key=lambda ln: ln.peak_flux)
+            result.append(best)
+
+    return result
