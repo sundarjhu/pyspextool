@@ -212,12 +212,16 @@ All plots are labelled *"Python scaffold QA"* to distinguish them from the
 IDL Spextool manual figures.  The prefix is controlled by `--qa-plot-prefix`
 (default `qa`).
 
-| File (default prefix) | Description |
-|-----------------------|-------------|
-| `qa_flat_orders.png` | Traced order centres overlaid on the combined flat |
-| `qa_arc_lines.png` | Traced arc-line seed positions overlaid on the combined arc |
-| `qa_wavecal_residuals.png` | Wavelength-solution match residuals (histogram + by-order scatter) |
-| `qa_rectified_order.png` | First available rectified order image |
+| File (default prefix) | Description | Manual analogue |
+|-----------------------|-------------|-----------------|
+| `qa_flat_orders.png` | Smooth fitted order-centre curves overlaid on the combined flat (27 science orders) | — |
+| `qa_arc_lines.png` | Traced arc-line seed positions overlaid on the combined arc | — |
+| `qa_wavecal_residuals.png` | Residuals vs order number, vs detector column, histogram, and per-order line count | **Figure 3** (1DXD QA plot) |
+| `qa_2d_coeff_fit.png` | Arc-line position cloud, tilt-slope map, wavelength solution curves, residual map | **Figures 4–7** (2DCoeffFit.pdf, partial) |
+| `qa_rectified_order.png` | First available rectified order flux image | — |
+
+See [K3 order-filtering rule](#k3-order-filtering-rule) for why only 27 orders
+appear in the flat-orders plot.
 
 ---
 
@@ -239,14 +243,43 @@ are **implemented and exercised** by the benchmark script:
 
 ### First-pass observations on K3 data
 
-- The order-tracing stage detects approximately 29 orders from the combined
-  K3 flat (vs. the ~27 orders expected for K3 mode).  The scaffold traces
-  order centres only; bottom/top edges are approximated from half-width
-  estimates.
-- Arc-line tracing recovers ~360 lines across the traced orders.
+- The order-tracing stage detects 29 orders from the combined K3 flat, of
+  which 27 are retained as science orders (203–229) after the benchmark
+  edge-order filter (see [K3 order-filtering rule](#k3-order-filtering-rule)).
+  The 2 dropped orders are partial edge orders clipped at the detector boundary.
+- Arc-line tracing recovers ~300–360 lines across the 27 science orders.
 - The provisional wavelength mapping produces per-order polynomial fits;
   some orders receive only a low-degree fit due to few matched lines.
+  Per-order accepted-line counts and polynomial degrees are printed in the
+  benchmark output.
 - These are **first-pass scaffold results**, not finalised calibrations.
+
+---
+
+## K3 order-filtering rule
+
+**Benchmark-only rule**: the flat-field tracing algorithm occasionally
+detects partially visible orders at the top and bottom edges of the detector.
+These manifest as orders with a spatial half-width (`half_width_rows`)
+substantially smaller than the typical science-order half-width.
+
+The benchmark applies the following conservative filter (implemented in
+`_filter_edge_orders`):
+
+> Exclude any order whose `half_width_rows` is below **30 % of the median
+> half-width** across all detected orders.
+
+For K3 data, this criterion removes the 2 partial edge orders (indices 0 and
+28 out of 29 detected) whose half-widths are ~2.5 px versus the typical
+~16 px for science orders.  The retained 27 orders correspond to the IDL
+Spextool manual's K3 science orders 203–229.
+
+This rule is:
+- documented and reproducible
+- grounded in the actual tracing geometry (not a hard-coded index drop)
+- conservative: only truly clipped orders are excluded
+
+---
 
 ---
 
@@ -266,6 +299,20 @@ Python iSHELL scaffold:
 
 These missing stages mean that the Python benchmark cannot yet reproduce the
 full K3 reduction flow described in the IDL Spextool manual.
+
+---
+
+## Remaining calibration mismatches vs the IDL manual
+
+The following mismatches are **known and documented** as of this benchmark
+pass.  They reflect scaffold-level limitations, not incorrect code:
+
+| Issue | Description |
+|-------|-------------|
+| Residual scale | Provisional 1DXD residuals are larger than the IDL manual's Figure 3 (RMS ~0.019 Å).  This is expected: the Python scaffold uses a coarse line-matching strategy without the full 2DXD surface fit. |
+| 2DCoeffFit analogue | The `qa_2d_coeff_fit.png` is a partial analogue only.  No model surface overlay, no curvature coefficient panel, and no per-line rejection indicator are currently available. |
+| Non-monotonic wavelength surfaces | Several orders show non-monotonic wavelength surfaces during rectification (logged as `RuntimeWarning`).  These are expected artefacts of the provisional coefficient surface and not a bug in rectification logic. |
+| Order polynomial degree reduction | Some orders use a lower polynomial degree than requested because too few arc lines were accepted.  This degrades the local wavelength solution accuracy. |
 
 ---
 
