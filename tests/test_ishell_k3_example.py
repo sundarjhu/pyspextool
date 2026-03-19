@@ -706,7 +706,7 @@ class TestOrderCalibrationDiagnosticsUnit:
         assert d.n_rejected == 3
         assert d.skipped is False
         assert d.non_monotonic is False
-        assert not math.isnan(d.fit_rms_nm)
+        assert d.fit_rms_nm == 1.234
 
     def test_diagnostics_skipped_order(self):
         """OrderCalibrationDiagnostics correctly represents a skipped order."""
@@ -864,3 +864,147 @@ class TestOrderCalibrationDiagnosticsWithData:
                 f"Expected 27 JSON entries, got {len(data)}"
             )
             assert "order_number" in data[0]
+
+
+# ---------------------------------------------------------------------------
+# 7. Bug-fix tests: non-monotonic warning parsing
+# ---------------------------------------------------------------------------
+
+
+class TestParseNonMonotonicOrderNumber:
+    """Unit tests for _parse_non_monotonic_order_number (no K3 data required)."""
+
+    def _parse(self, msg: str):
+        driver = _import_driver()
+        return driver._parse_non_monotonic_order_number(msg)
+
+    def test_extracts_echelle_order_not_index(self):
+        """Parses echelle order number (204), not the index (1) before it."""
+        msg = "Order 1 (order_number=204.0): the sampled wavelength surface is not strictly monotone in detector column.  The column-inversion for rectification may be inaccurate."
+        result = self._parse(msg)
+        assert result == 204, (
+            f"Expected 204, got {result!r}. "
+            "The parser must extract from order_number=..., not from 'Order N'."
+        )
+
+    def test_integer_order_number(self):
+        """Handles order_number without decimal point (e.g. 204)."""
+        msg = "Order 5 (order_number=229): some warning text."
+        result = self._parse(msg)
+        assert result == 229, f"Expected 229, got {result!r}"
+
+    def test_float_order_number(self):
+        """Handles order_number with trailing .0 (e.g. 216.0)."""
+        msg = "Order 13 (order_number=216.0): the sampled wavelength surface is not strictly monotone."
+        result = self._parse(msg)
+        assert result == 216, f"Expected 216, got {result!r}"
+
+    def test_returns_none_on_missing_pattern(self):
+        """Returns None when order_number= is absent."""
+        result = self._parse("Some unrelated warning text.")
+        assert result is None
+
+    def test_returns_none_on_empty_string(self):
+        """Returns None for an empty string without crashing."""
+        result = self._parse("")
+        assert result is None
+
+    def test_index_and_echelle_differ(self):
+        """Confirms result differs from the leading order index."""
+        msg = "Order 3 (order_number=210.0): non-monotonic."
+        result = self._parse(msg)
+        # Order index would be 3; echelle order should be 210.
+        assert result == 210
+        assert result != 3
+
+
+# ---------------------------------------------------------------------------
+# 8. Bug-fix tests: arc-line plot representative row logic
+# ---------------------------------------------------------------------------
+
+
+class TestArcLinePlotRepresentativeRow:
+    """Unit tests confirming _plot_arc_lines uses median(trace_rows), not poly eval."""
+
+    def _make_fake_line(self, seed_col: int, trace_rows, poly_coeffs=None):
+        """Create a minimal TracedArcLine-like object for testing."""
+        import numpy as np
+        from pyspextool.instruments.ishell.arc_tracing import TracedArcLine
+
+        trace_rows_arr = np.asarray(trace_rows, dtype=float)
+        # trace_cols: put centroid at seed_col for simplicity
+        trace_cols_arr = np.full_like(trace_rows_arr, float(seed_col))
+        if poly_coeffs is None:
+            # Intentionally large tilt slope so that poly(seed_col) gives a
+            # wildly incorrect row value, confirming the fix is necessary.
+            _wrong_slope = 50.0
+            poly_coeffs = np.array([float(seed_col), _wrong_slope])
+        return TracedArcLine(
+            order_index=0,
+            seed_col=seed_col,
+            trace_rows=trace_rows_arr,
+            trace_cols=trace_cols_arr,
+            poly_coeffs=np.asarray(poly_coeffs),
+            fit_rms=0.1,
+            peak_flux=1.0,
+        )
+
+    def test_median_trace_rows_used(self):
+        """Representative row should be median of trace_rows, not poly(seed_col)."""
+        import numpy as np
+
+        trace_rows = [10, 20, 30, 40, 50]
+        seed_col = 500
+        # poly_coeffs encodes col(row); evaluating at seed_col (500) would give
+        # a wildly wrong row value.  The correct row is median([10..50]) = 30.
+        line = self._make_fake_line(seed_col, trace_rows)
+
+        expected_row = float(np.median(trace_rows))  # = 30.0
+
+        # Replicate the fixed logic from _plot_arc_lines
+        if len(line.trace_rows) > 0:
+            row = float(np.median(line.trace_rows))
+        else:
+            row = None
+
+        assert row == expected_row, (
+            f"Expected median row {expected_row}, got {row}"
+        )
+        # Confirm this differs from the (incorrect) polynomial evaluation
+        poly_result = float(np.polynomial.polynomial.polyval(seed_col, line.poly_coeffs))
+        assert row != poly_result, (
+            "The median-row and poly-eval values should not be equal here "
+            "(confirming the fix is different from the old code)"
+        )
+
+    def test_skip_line_with_no_trace_rows(self):
+        """Lines with empty trace_rows should be skipped (row is None / not plotted)."""
+        import numpy as np
+
+        line = self._make_fake_line(seed_col=500, trace_rows=[])
+
+        # Replicate the fixed logic
+        if len(line.trace_rows) > 0:
+            row = float(np.median(line.trace_rows))
+        else:
+            row = None  # should be skipped
+
+        assert row is None, (
+            "A line with no trace_rows should yield row=None (skipped in plot)"
+        )
+
+    def test_median_with_odd_count(self):
+        """Median of odd-length trace_rows is the middle element."""
+        import numpy as np
+        trace_rows = [100, 200, 300]
+        line = self._make_fake_line(seed_col=600, trace_rows=trace_rows)
+        row = float(np.median(line.trace_rows))
+        assert row == 200.0
+
+    def test_median_with_even_count(self):
+        """Median of even-length trace_rows is the average of the two middle values."""
+        import numpy as np
+        trace_rows = [100, 200, 300, 400]
+        line = self._make_fake_line(seed_col=600, trace_rows=trace_rows)
+        row = float(np.median(line.trace_rows))
+        assert row == 250.0

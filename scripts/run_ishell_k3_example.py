@@ -328,9 +328,28 @@ def _skip(stage: str, reason: str) -> None:
     print(f"  [--]  {stage}  ({reason})")
 
 
-# ---------------------------------------------------------------------------
-# Per-order calibration diagnostics
-# ---------------------------------------------------------------------------
+def _parse_non_monotonic_order_number(warning_message: str) -> int | None:
+    """Extract the echelle order number from a non-monotonic RuntimeWarning.
+
+    The warning emitted by ``rectification_indices`` has the form::
+
+        "Order 1 (order_number=204.0): the sampled wavelength surface …"
+
+    The first integer (``1``) is the *order index*, not the echelle order
+    number.  The echelle order number is the value after ``order_number=``
+    (e.g. ``204.0`` → ``204``).  This helper extracts that value.
+
+    Returns ``None`` if the pattern is not found, so callers can safely
+    skip unparseable messages without crashing.
+    """
+    # Match  order_number=<digits>[.<digits>]  robustly for both 204 and 204.0
+    m = re.search(r"order_number=([0-9]+(?:\.[0-9]*)?)", warning_message)
+    if m is None:
+        return None
+    try:
+        return int(float(m.group(1)))
+    except (ValueError, OverflowError):
+        return None
 
 
 @dataclass
@@ -679,13 +698,16 @@ def _plot_arc_lines(
 
         for line in arc_result.traced_lines:
             seed_col = line.seed_col
-            # Evaluate the traced row at the seed column using the polynomial
-            row = float(
-                sum(
-                    c * (seed_col ** k)
-                    for k, c in enumerate(line.poly_coeffs)
-                )
-            )
+            # Use the median of the actually traced row indices as the
+            # representative row for this line.  The poly_coeffs encode
+            # col(row), not row(col), so evaluating them at seed_col would
+            # be geometrically incorrect.
+            if len(line.trace_rows) > 0:
+                row = float(np.median(line.trace_rows))
+            else:
+                # Fallback when no trace points survived quality checks —
+                # skip plotting this line rather than guessing.
+                continue
             ax.plot(seed_col, row, "cx", markersize=4, alpha=0.7)
 
         ax.set_title(
@@ -1424,9 +1446,11 @@ def run_k3_example(
                 if issubclass(w.category, RuntimeWarning):
                     msg = str(w.message)
                     # Warning format: "Order N (order_number=M): the sampled …"
-                    _match = re.search(r"Order\s+(\d+)", msg)
-                    if _match:
-                        _non_monotonic_orders.add(int(_match.group(1)))
+                    # Extract the *echelle* order number from order_number=M,
+                    # NOT the index N that appears first in the message.
+                    _echelle_order = _parse_non_monotonic_order_number(msg)
+                    if _echelle_order is not None:
+                        _non_monotonic_orders.add(_echelle_order)
                     # Re-emit so they remain visible to the caller.
                     warnings.warn_explicit(
                         w.message, w.category, w.filename, w.lineno
