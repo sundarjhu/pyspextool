@@ -658,3 +658,209 @@ class TestK3BenchmarkSmoke:
             f"K3 benchmark should retain 27 science orders, "
             f"got {trace_filtered.n_orders}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. OrderCalibrationDiagnostics: unit tests (no raw data needed)
+# ---------------------------------------------------------------------------
+
+
+class TestOrderCalibrationDiagnosticsUnit:
+    """OrderCalibrationDiagnostics dataclass API tests (no K3 data required)."""
+
+    def test_diagnostics_dataclass_exists(self):
+        """OrderCalibrationDiagnostics is importable from the driver."""
+        driver = _import_driver()
+        assert hasattr(driver, "OrderCalibrationDiagnostics"), (
+            "OrderCalibrationDiagnostics dataclass not found in run_ishell_k3_example"
+        )
+
+    def test_diagnostics_dataclass_fields(self):
+        """OrderCalibrationDiagnostics has the required fields."""
+        driver = _import_driver()
+        fields = set(driver.OrderCalibrationDiagnostics.__dataclass_fields__.keys())
+        required = {
+            "order_number", "n_candidate", "n_accepted", "n_rejected",
+            "poly_degree_requested", "poly_degree_used", "fit_rms_nm",
+            "skipped", "non_monotonic",
+        }
+        missing = required - fields
+        assert not missing, f"Missing fields: {missing}"
+
+    def test_diagnostics_construction(self):
+        """OrderCalibrationDiagnostics can be constructed with the expected fields."""
+        import math
+        driver = _import_driver()
+        d = driver.OrderCalibrationDiagnostics(
+            order_number=205,
+            n_candidate=10,
+            n_accepted=7,
+            n_rejected=3,
+            poly_degree_requested=3,
+            poly_degree_used=3,
+            fit_rms_nm=1.234,
+            skipped=False,
+            non_monotonic=False,
+        )
+        assert d.order_number == 205
+        assert d.n_rejected == 3
+        assert d.skipped is False
+        assert d.non_monotonic is False
+        assert not math.isnan(d.fit_rms_nm)
+
+    def test_diagnostics_skipped_order(self):
+        """OrderCalibrationDiagnostics correctly represents a skipped order."""
+        import math
+        driver = _import_driver()
+        d = driver.OrderCalibrationDiagnostics(
+            order_number=210,
+            n_candidate=1,
+            n_accepted=1,
+            n_rejected=0,
+            poly_degree_requested=3,
+            poly_degree_used=3,
+            fit_rms_nm=float("nan"),
+            skipped=True,
+            non_monotonic=False,
+        )
+        assert d.skipped is True
+        assert math.isnan(d.fit_rms_nm)
+
+    def test_config_export_diagnostics_field(self):
+        """K3BenchmarkConfig has export_diagnostics field defaulting to False."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert hasattr(cfg, "export_diagnostics")
+        assert cfg.export_diagnostics is False
+
+    def test_config_diagnostics_format_field(self):
+        """K3BenchmarkConfig has diagnostics_format field defaulting to 'csv'."""
+        driver = _import_driver()
+        cfg = driver.K3BenchmarkConfig()
+        assert hasattr(cfg, "diagnostics_format")
+        assert cfg.diagnostics_format == "csv"
+
+
+# ---------------------------------------------------------------------------
+# 6. OrderCalibrationDiagnostics: data-dependent tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _HAVE_K3_DATA, reason="K3 raw files not present")
+class TestOrderCalibrationDiagnosticsWithData:
+    """Diagnostics tests that require the real K3 FITS files."""
+
+    def test_diagnostics_returned_in_completed(self):
+        """run_k3_example returns _order_diagnostics in the completed dict."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                no_plots=True,
+            )
+        assert "_order_diagnostics" in completed, (
+            "run_k3_example should return '_order_diagnostics' key"
+        )
+
+    def test_diagnostics_list_has_correct_order_count(self):
+        """_order_diagnostics list has one entry per K3 science order (27)."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                no_plots=True,
+            )
+        diags = completed.get("_order_diagnostics", [])
+        assert len(diags) == 27, (
+            f"Expected 27 diagnostics entries (one per K3 science order), "
+            f"got {len(diags)}"
+        )
+
+    def test_diagnostics_entries_are_correct_type(self):
+        """All entries in _order_diagnostics are OrderCalibrationDiagnostics."""
+        driver = _import_driver()
+        DiagClass = driver.OrderCalibrationDiagnostics
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                no_plots=True,
+            )
+        diags = completed.get("_order_diagnostics", [])
+        for d in diags:
+            assert isinstance(d, DiagClass), (
+                f"Expected OrderCalibrationDiagnostics, got {type(d)}"
+            )
+
+    def test_diagnostics_rejected_count_consistent(self):
+        """n_rejected == n_candidate - n_accepted for all orders."""
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            completed = driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                no_plots=True,
+            )
+        diags = completed.get("_order_diagnostics", [])
+        for d in diags:
+            assert d.n_rejected == d.n_candidate - d.n_accepted, (
+                f"Order {d.order_number}: n_rejected ({d.n_rejected}) != "
+                f"n_candidate ({d.n_candidate}) - n_accepted ({d.n_accepted})"
+            )
+
+    def test_export_diagnostics_csv(self):
+        """export_diagnostics=True writes a CSV file with one row per order."""
+        import csv
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                no_plots=True,
+                export_diagnostics=True,
+                diagnostics_format="csv",
+            )
+            csv_path = os.path.join(out_dir, "qa_order_diagnostics.csv")
+            assert os.path.isfile(csv_path), (
+                f"Expected diagnostics CSV at {csv_path}"
+            )
+            with open(csv_path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            assert len(rows) == 27, (
+                f"Expected 27 CSV rows, got {len(rows)}"
+            )
+            assert "order_number" in rows[0]
+            assert "n_accepted" in rows[0]
+            assert "fit_rms_nm" in rows[0]
+
+    def test_export_diagnostics_json(self):
+        """export_diagnostics=True with json format writes a JSON array."""
+        import json
+        driver = _import_driver()
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "output")
+            driver.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                out_dir=out_dir,
+                no_plots=True,
+                export_diagnostics=True,
+                diagnostics_format="json",
+            )
+            json_path = os.path.join(out_dir, "qa_order_diagnostics.json")
+            assert os.path.isfile(json_path), (
+                f"Expected diagnostics JSON at {json_path}"
+            )
+            with open(json_path) as fh:
+                data = json.load(fh)
+            assert isinstance(data, list)
+            assert len(data) == 27, (
+                f"Expected 27 JSON entries, got {len(data)}"
+            )
+            assert "order_number" in data[0]

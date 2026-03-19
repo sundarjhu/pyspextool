@@ -35,6 +35,8 @@ Optional flags::
     --mode-name          MODE   iSHELL mode (default: K3).
     --save-plots                Save QA plots as PNG files (default: display them).
     --no-plots                  Skip all QA plotting.
+    --export-diagnostics        Export per-order calibration diagnostics file.
+    --diagnostics-format FMT    Format for diagnostics export: csv or json (default: csv).
 
 All input FITS files may be either ``.fits`` or ``.fits.gz``.
 Output FITS files are always written as plain ``.fits``.
@@ -68,8 +70,12 @@ Not yet implemented in Python
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import logging
+import math
 import os
+import re
 import sys
 import warnings
 from dataclasses import dataclass, field
@@ -258,6 +264,10 @@ class K3BenchmarkConfig:
     # iSHELL mode
     mode_name: str = "K3"
 
+    # Diagnostics export
+    export_diagnostics: bool = False
+    diagnostics_format: str = "csv"  # "csv" or "json"
+
 
 # ---------------------------------------------------------------------------
 # File selection helper
@@ -319,8 +329,190 @@ def _skip(stage: str, reason: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Benchmark-only order-filtering helper
+# Per-order calibration diagnostics
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class OrderCalibrationDiagnostics:
+    """Per-order calibration diagnostic record.
+
+    Collects information about the quality of the wavelength calibration for
+    one echelle order.  A list of these is built by :func:`run_k3_example`
+    and printed as a console table; optionally exported to CSV or JSON.
+
+    Parameters
+    ----------
+    order_number : int
+        Echelle order number (e.g. 203–229 for K3 mode).
+    n_candidate : int
+        Number of traced arc lines considered as match candidates.
+    n_accepted : int
+        Number of lines accepted and used in the polynomial fit.
+    n_rejected : int
+        Lines considered but not accepted (n_candidate − n_accepted).
+    poly_degree_requested : int
+        Polynomial degree that was requested.
+    poly_degree_used : int
+        Polynomial degree actually used (may be reduced due to low line count).
+    fit_rms_nm : float
+        RMS of fit residuals in nm (NaN if order was skipped).
+    skipped : bool
+        True when the order had too few accepted lines to fit.
+    non_monotonic : bool
+        True when the rectification-indices stage detected a non-monotonic
+        wavelength surface for this order.
+    """
+
+    order_number: int
+    n_candidate: int
+    n_accepted: int
+    n_rejected: int
+    poly_degree_requested: int
+    poly_degree_used: int
+    fit_rms_nm: float
+    skipped: bool
+    non_monotonic: bool
+
+
+def _build_order_diagnostics(
+    prov_map: "ProvisionalWavelengthMap",
+    non_monotonic_orders: "set[int]",
+    dispersion_degree: int,
+) -> list[OrderCalibrationDiagnostics]:
+    """Build a list of :class:`OrderCalibrationDiagnostics` from Stage 3 + 6 results.
+
+    Parameters
+    ----------
+    prov_map : ProvisionalWavelengthMap
+        Provisional wavelength solution from Stage 3.
+    non_monotonic_orders : set of int
+        Order numbers flagged as non-monotonic during Stage 6 (rectification).
+    dispersion_degree : int
+        The polynomial degree that was requested for all orders.
+
+    Returns
+    -------
+    list of OrderCalibrationDiagnostics
+    """
+    diags: list[OrderCalibrationDiagnostics] = []
+    for sol in prov_map.order_solutions:
+        fit_rms_nm = (
+            sol.fit_rms_um * 1000.0
+            if not math.isnan(sol.fit_rms_um) else float("nan")
+        )
+        diags.append(OrderCalibrationDiagnostics(
+            order_number=sol.order_number,
+            n_candidate=sol.n_candidate,
+            n_accepted=sol.n_accepted,
+            n_rejected=sol.n_candidate - sol.n_accepted,
+            poly_degree_requested=dispersion_degree,
+            poly_degree_used=sol.fit_degree,
+            fit_rms_nm=fit_rms_nm,
+            skipped=sol.wave_coeffs is None,
+            non_monotonic=sol.order_number in non_monotonic_orders,
+        ))
+    return diags
+
+
+def _print_diagnostics_table(diags: list[OrderCalibrationDiagnostics]) -> None:
+    """Print per-order calibration diagnostics as a formatted console table."""
+    # Header
+    hdr = (
+        f"  {'Order':>5}  {'Cand':>5}  {'Acc':>4}  {'Rej':>4}  "
+        f"{'DegReq':>6}  {'DegUsd':>6}  {'RMS(nm)':>8}  {'Skip':>4}  {'NMono':>5}"
+    )
+    sep = "  " + "-" * (len(hdr) - 2)
+    print(sep)
+    print(hdr)
+    print(sep)
+    for d in diags:
+        rms_str = f"{d.fit_rms_nm:8.4f}" if not math.isnan(d.fit_rms_nm) else "     NaN"
+        skip_str = "YES" if d.skipped else "no"
+        nmono_str = "YES" if d.non_monotonic else "no"
+        flag = ""
+        if d.skipped or d.non_monotonic or d.n_accepted < 3:
+            flag = " ◀"
+        print(
+            f"  {d.order_number:>5}  {d.n_candidate:>5}  {d.n_accepted:>4}  "
+            f"{d.n_rejected:>4}  {d.poly_degree_requested:>6}  "
+            f"{d.poly_degree_used:>6}  {rms_str}  {skip_str:>4}  "
+            f"{nmono_str:>5}{flag}"
+        )
+    print(sep)
+
+
+def _print_weak_order_warnings(diags: list[OrderCalibrationDiagnostics]) -> None:
+    """Print a grouped summary of problematic orders."""
+    skipped = [d for d in diags if d.skipped]
+    low_lines = [d for d in diags if not d.skipped and d.n_accepted < 3]
+    reduced_deg = [
+        d for d in diags
+        if not d.skipped and d.poly_degree_used < d.poly_degree_requested
+    ]
+    non_mono = [d for d in diags if d.non_monotonic]
+
+    any_issues = skipped or low_lines or reduced_deg or non_mono
+    if not any_issues:
+        print("  [OK]  No weak-order issues detected.")
+        return
+
+    if skipped:
+        nums = ", ".join(str(d.order_number) for d in skipped)
+        print(f"  [!!]  SKIPPED orders ({len(skipped)}): {nums}")
+    if low_lines:
+        nums = ", ".join(str(d.order_number) for d in low_lines)
+        print(f"  [!!]  Low-line orders (<3 accepted, {len(low_lines)}): {nums}")
+    if reduced_deg:
+        nums = ", ".join(str(d.order_number) for d in reduced_deg)
+        print(f"  [!!]  Reduced-degree orders ({len(reduced_deg)}): {nums}")
+    if non_mono:
+        nums = ", ".join(str(d.order_number) for d in non_mono)
+        print(f"  [!!]  Non-monotonic wavelength surface ({len(non_mono)}): {nums}")
+
+
+def _export_diagnostics(
+    diags: list[OrderCalibrationDiagnostics],
+    out_dir: str,
+    fmt: str,
+    prefix: str,
+) -> str:
+    """Write diagnostics to *out_dir* as CSV or JSON.
+
+    Returns the path of the written file.
+    """
+    rows = [
+        {
+            "order_number": d.order_number,
+            "n_candidate": d.n_candidate,
+            "n_accepted": d.n_accepted,
+            "n_rejected": d.n_rejected,
+            "poly_degree_requested": d.poly_degree_requested,
+            "poly_degree_used": d.poly_degree_used,
+            "fit_rms_nm": (
+                None if math.isnan(d.fit_rms_nm) else round(d.fit_rms_nm, 6)
+            ),
+            "skipped": d.skipped,
+            "non_monotonic": d.non_monotonic,
+        }
+        for d in diags
+    ]
+
+    if fmt == "json":
+        out_path = os.path.join(out_dir, f"{prefix}_order_diagnostics.json")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(rows, fh, indent=2)
+    else:
+        out_path = os.path.join(out_dir, f"{prefix}_order_diagnostics.csv")
+        with open(out_path, "w", newline="", encoding="utf-8") as fh:
+            if rows:
+                writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+
+    return out_path
+
+
 
 
 def _filter_edge_orders(
@@ -516,6 +708,7 @@ def _plot_arc_lines(
 
 def _plot_wavecal_residuals(
     prov_map,
+    arc_result,
     out_dir: str,
     save: bool,
     prefix: str,
@@ -526,8 +719,12 @@ def _plot_wavecal_residuals(
     Figure 3 (1DXD residual QA plot):
 
     - Top-left  : signed residuals vs echelle order number
+                  (accepted lines in blue; rejected/unmatched in red)
     - Top-right : signed residuals vs detector column
-    - Bottom    : residual histogram with RMS annotation
+                  (accepted lines in blue; rejected/unmatched in red)
+    - Bottom-left : residual histogram with RMS annotation
+    - Bottom-right: per-order accepted-line count bar chart with RMS
+                  annotations
 
     Labelled *"Python scaffold QA"* — do not assume IDL parity.
     """
@@ -538,7 +735,7 @@ def _plot_wavecal_residuals(
         import matplotlib.pyplot as plt
         import numpy as np
 
-        # Collect all match data
+        # ---- collect accepted-match data ----
         residuals_nm: list[float] = []
         order_nums: list[int] = []
         cols: list[float] = []
@@ -547,6 +744,23 @@ def _plot_wavecal_residuals(
                 residuals_nm.append(m.match_residual_um * 1000.0)
                 order_nums.append(m.order_number)
                 cols.append(float(m.centerline_col))
+
+        # ---- collect rejected-line data ----
+        # "Rejected" = traced lines that were not among the accepted matches.
+        # We infer them by comparing all traced lines for each order against the
+        # accepted set (matched by seed_col equality).
+        rej_cols: list[float] = []
+        rej_order_nums: list[int] = []
+        for sol in prov_map.order_solutions:
+            accepted_seed_cols: set[float] = {
+                float(m.centerline_col) for m in sol.accepted_matches
+            }
+            order_lines = arc_result.lines_for_order(sol.order_index)
+            for line in order_lines:
+                sc = float(line.seed_col)
+                if sc not in accepted_seed_cols:
+                    rej_cols.append(sc)
+                    rej_order_nums.append(sol.order_number)
 
         if not residuals_nm:
             print("  [QA] No wavecal matches to plot.")
@@ -558,27 +772,57 @@ def _plot_wavecal_residuals(
         rms = float(np.sqrt(np.mean(r ** 2)))
         med = float(np.median(r))
 
+        rej_c = np.asarray(rej_cols)
+        rej_o = np.asarray(rej_order_nums)
+
         fig, axes = plt.subplots(2, 2, figsize=(13, 8))
 
-        # --- Top-left: residuals vs order number ---
-        axes[0, 0].scatter(o, r, s=10, alpha=0.6, color="steelblue")
+        # ---- per-order RMS ----
+        per_order_rms: dict[int, float] = {}
+        per_order_med: dict[int, float] = {}
+        for sol in prov_map.order_solutions:
+            if sol.n_accepted > 0:
+                res_arr = np.array(
+                    [m.match_residual_um * 1000.0 for m in sol.accepted_matches]
+                )
+                per_order_rms[sol.order_number] = float(
+                    np.sqrt(np.mean(res_arr ** 2))
+                )
+                per_order_med[sol.order_number] = float(np.median(res_arr))
+
+        # --- Top-left: residuals vs order number (accepted + rejected) ---
+        axes[0, 0].scatter(o, r, s=10, alpha=0.7, color="steelblue",
+                           label=f"Accepted ({len(r)})", zorder=3)
+        if len(rej_o) > 0:
+            axes[0, 0].scatter(
+                rej_o, np.zeros(len(rej_o)), s=10, alpha=0.4,
+                color="tomato", marker="x",
+                label=f"Rejected/unmatched ({len(rej_o)})", zorder=2,
+            )
         axes[0, 0].axhline(0.0, color="k", lw=0.8, ls="--")
         axes[0, 0].axhline(med, color="r", lw=1.2,
-                           label=f"median = {med:.2f} nm")
+                           label=f"median = {med:.3f} nm")
         axes[0, 0].set_xlabel("Echelle order number (provisional)")
         axes[0, 0].set_ylabel("Residual (nm)")
-        axes[0, 0].set_title("Residuals vs order number")
-        axes[0, 0].legend(fontsize=8)
+        axes[0, 0].set_title("Residuals vs order number\n(accepted=blue, rejected=red×)")
+        axes[0, 0].legend(fontsize=7)
 
-        # --- Top-right: residuals vs detector column ---
-        axes[0, 1].scatter(c, r, s=10, alpha=0.6, color="darkorange")
+        # --- Top-right: residuals vs detector column (accepted + rejected) ---
+        axes[0, 1].scatter(c, r, s=10, alpha=0.7, color="steelblue",
+                           label=f"Accepted ({len(r)})", zorder=3)
+        if len(rej_c) > 0:
+            axes[0, 1].scatter(
+                rej_c, np.zeros(len(rej_c)), s=10, alpha=0.4,
+                color="tomato", marker="x",
+                label=f"Rejected/unmatched ({len(rej_c)})", zorder=2,
+            )
         axes[0, 1].axhline(0.0, color="k", lw=0.8, ls="--")
         axes[0, 1].axhline(med, color="r", lw=1.2,
-                           label=f"median = {med:.2f} nm")
+                           label=f"median = {med:.3f} nm")
         axes[0, 1].set_xlabel("Detector column (pixels)")
         axes[0, 1].set_ylabel("Residual (nm)")
-        axes[0, 1].set_title("Residuals vs detector column")
-        axes[0, 1].legend(fontsize=8)
+        axes[0, 1].set_title("Residuals vs detector column\n(accepted=blue, rejected=red×)")
+        axes[0, 1].legend(fontsize=7)
 
         # --- Bottom-left: histogram ---
         axes[1, 0].hist(r, bins=30, edgecolor="k", linewidth=0.5,
@@ -587,30 +831,43 @@ def _plot_wavecal_residuals(
         axes[1, 0].set_xlabel("Residual (nm)")
         axes[1, 0].set_ylabel("Count")
         axes[1, 0].set_title(
-            f"Residual histogram  n={len(r)}\n"
-            f"median={med:.2f} nm   RMS={rms:.2f} nm"
+            f"Accepted residual histogram  n={len(r)}\n"
+            f"median={med:.3f} nm   RMS={rms:.3f} nm"
         )
 
-        # --- Bottom-right: per-order matched-line count ---
+        # --- Bottom-right: per-order accepted-line count + RMS annotation ---
         order_counts: dict = {}
         for oi in o:
             order_counts[oi] = order_counts.get(oi, 0) + 1
         order_sorted = sorted(order_counts)
-        axes[1, 1].bar(
+        bar_vals = [order_counts[oi] for oi in order_sorted]
+        bars = axes[1, 1].bar(
             order_sorted,
-            [order_counts[oi] for oi in order_sorted],
+            bar_vals,
             width=0.7,
             color="teal",
             alpha=0.8,
         )
+        # Annotate bars with per-order RMS (nm)
+        for bar, oi in zip(bars, order_sorted):
+            if oi in per_order_rms:
+                axes[1, 1].text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    bar.get_height() + 0.05,
+                    f"{per_order_rms[oi]:.2f}",
+                    ha="center", va="bottom", fontsize=5, rotation=90,
+                    color="darkslategray",
+                )
         axes[1, 1].set_xlabel("Echelle order number (provisional)")
         axes[1, 1].set_ylabel("Matched lines")
-        axes[1, 1].set_title("Accepted matched lines per order")
+        axes[1, 1].set_title(
+            "Accepted lines per order\n(bar labels = RMS nm)"
+        )
 
         fig.suptitle(
             "Python scaffold QA — K3 1DXD residuals (analogue of manual Fig. 3)\n"
-            f"Total matched: {len(r)}   RMS: {rms:.2f} nm   "
-            "NOTE: not IDL-equivalent",
+            f"Accepted: {len(r)}  Rejected/unmatched: {len(rej_cols)}  "
+            f"RMS: {rms:.3f} nm   NOTE: not IDL-equivalent",
             fontsize=10,
         )
         fig.tight_layout()
@@ -1091,7 +1348,8 @@ def run_k3_example(
     print(f"  Orders with solutions : {prov_map.n_orders}")
     print(f"  Total matched lines   : {n_matched}")
 
-    # Per-order diagnostic report
+    # Per-order structured diagnostics table (non-monotonic info added after Stage 6)
+    _dispersion_degree = 3  # default; matches fit_provisional_wavelength_map
     print("  Per-order details:")
     for sol in prov_map.order_solutions:
         n_acc = len(sol.accepted_matches)
@@ -1109,8 +1367,8 @@ def run_k3_example(
     completed["stage3_provisional_wavemap"] = True
 
     if not no_plots:
-        _plot_wavecal_residuals(prov_map, out_dir, save=save_plots,
-                                prefix=prefix)
+        _plot_wavecal_residuals(prov_map, arc_result, out_dir,
+                                save=save_plots, prefix=prefix)
         _plot_2d_coeff_fit(arc_result, prov_map, out_dir, save=save_plots,
                            prefix=prefix)
 
@@ -1150,13 +1408,35 @@ def run_k3_example(
     # Stage 6: Rectification indices
     # ------------------------------------------------------------------
 
+    # Capture non-monotonic warnings so they can feed into the diagnostics.
+    _non_monotonic_orders: set[int] = set()
+
     _banner("Stage 6: Rectification indices")
     if refined is not None:
         try:
-            rect_idx = build_rectification_indices(
-                geom, refined, wav_map=prov_map
-            )
+            with warnings.catch_warnings(record=True) as _caught_warns:
+                warnings.simplefilter("always")
+                rect_idx = build_rectification_indices(
+                    geom, refined, wav_map=prov_map
+                )
+            # Extract order numbers from non-monotonic RuntimeWarnings.
+            for w in _caught_warns:
+                if issubclass(w.category, RuntimeWarning):
+                    msg = str(w.message)
+                    # Warning format: "Order N (order_number=M): the sampled …"
+                    _match = re.search(r"Order\s+(\d+)", msg)
+                    if _match:
+                        _non_monotonic_orders.add(int(_match.group(1)))
+                    # Re-emit so they remain visible to the caller.
+                    warnings.warn_explicit(
+                        w.message, w.category, w.filename, w.lineno
+                    )
             print(f"  Rectification index orders: {rect_idx.n_orders}")
+            if _non_monotonic_orders:
+                print(
+                    f"  Non-monotonic orders detected: "
+                    f"{sorted(_non_monotonic_orders)}"
+                )
             _ok("Stage 6 — rectification indices")
             completed["stage6_rect_indices"] = True
         except Exception as exc:  # noqa: BLE001
@@ -1240,15 +1520,42 @@ def run_k3_example(
         completed[s] = False
 
     # ------------------------------------------------------------------
+    # Calibration diagnostics
+    # ------------------------------------------------------------------
+
+    _banner("Per-order calibration diagnostics")
+    order_diags = _build_order_diagnostics(
+        prov_map, _non_monotonic_orders, _dispersion_degree
+    )
+    _print_diagnostics_table(order_diags)
+
+    _banner("Weak-order summary")
+    _print_weak_order_warnings(order_diags)
+
+    if cfg.export_diagnostics:
+        diag_path = _export_diagnostics(
+            order_diags, out_dir, cfg.diagnostics_format, prefix
+        )
+        print(f"\n  [DIAG] Diagnostics exported to: {diag_path}")
+        completed["diagnostics_export"] = True
+    else:
+        completed["diagnostics_export"] = False
+
+    # Expose diagnostics on the returned mapping for programmatic access.
+    completed["_order_diagnostics"] = order_diags  # type: ignore[assignment]
+
+    # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
 
     _banner("K3 Benchmark Summary")
-    total = len(completed)
-    done = sum(v for v in completed.values())
+    _display_keys = {k: v for k, v in completed.items()
+                     if not k.startswith("_")}
+    total = len(_display_keys)
+    done = sum(v for v in _display_keys.values())
     print(f"  Completed stages : {done} / {total}")
     print()
-    for stage, ok in completed.items():
+    for stage, ok in _display_keys.items():
         mark = "OK" if ok else "--"
         print(f"  [{mark}]  {stage}")
 
@@ -1367,6 +1674,21 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Skip all QA plotting.",
     )
+
+    # --- diagnostics export ---
+    parser.add_argument(
+        "--export-diagnostics",
+        action="store_true",
+        default=False,
+        help="Export per-order calibration diagnostics to a CSV or JSON file.",
+    )
+    parser.add_argument(
+        "--diagnostics-format",
+        default=None,
+        metavar="FMT",
+        choices=["csv", "json"],
+        help="Format for the diagnostics export file: csv or json (default: csv).",
+    )
     return parser.parse_args()
 
 
@@ -1404,6 +1726,10 @@ def main() -> None:
         overrides["save_plots"] = True
     if args.no_plots:
         overrides["no_plots"] = True
+    if args.export_diagnostics:
+        overrides["export_diagnostics"] = True
+    if args.diagnostics_format is not None:
+        overrides["diagnostics_format"] = args.diagnostics_format
 
     try:
         run_k3_example(**overrides)

@@ -124,6 +124,8 @@ completed = run_k3_example(cfg)
 | `save_plots` | bool | `False` | Save plots as PNG instead of displaying |
 | `no_plots` | bool | `False` | Skip all QA plotting |
 | `mode_name` | str | `"K3"` | iSHELL mode for calibration resource lookup |
+| `export_diagnostics` | bool | `False` | Export per-order diagnostics to CSV/JSON |
+| `diagnostics_format` | str | `"csv"` | Format for diagnostics export: `"csv"` or `"json"` |
 
 ---
 
@@ -153,6 +155,8 @@ python scripts/run_ishell_k3_example.py
 | `--mode-name MODE` | iSHELL mode (default: `K3`) |
 | `--save-plots` | Save QA plots as PNG files instead of displaying them |
 | `--no-plots` | Skip all QA plotting |
+| `--export-diagnostics` | Export per-order calibration diagnostics to file |
+| `--diagnostics-format FMT` | Format for export: `csv` or `json` (default: `csv`) |
 
 ### Examples
 
@@ -216,7 +220,7 @@ IDL Spextool manual figures.  The prefix is controlled by `--qa-plot-prefix`
 |-----------------------|-------------|-----------------|
 | `qa_flat_orders.png` | Smooth fitted order-centre curves overlaid on the combined flat (27 science orders) | — |
 | `qa_arc_lines.png` | Traced arc-line seed positions overlaid on the combined arc | — |
-| `qa_wavecal_residuals.png` | Residuals vs order number, vs detector column, histogram, and per-order line count | **Figure 3** (1DXD QA plot) |
+| `qa_wavecal_residuals.png` | Residuals vs order/column (accepted=blue, rejected=red×), histogram, per-order line count with RMS labels | **Figure 3** (1DXD QA plot) |
 | `qa_2d_coeff_fit.png` | Arc-line position cloud, tilt-slope map, wavelength solution curves, residual map | **Figures 4–7** (2DCoeffFit.pdf, partial) |
 | `qa_rectified_order.png` | First available rectified order flux image | — |
 
@@ -283,7 +287,118 @@ This rule is:
 
 ---
 
-## What is still missing
+## Calibration diagnostics and failure modes
+
+The K3 benchmark driver produces a **structured per-order diagnostics report**
+during each run.  This section explains what the diagnostics capture, how to
+interpret them, and what the known failure modes mean.
+
+### Running with diagnostics export
+
+To export the per-order diagnostics as a CSV or JSON file:
+
+```bash
+python scripts/run_ishell_k3_example.py \
+    --no-plots \
+    --export-diagnostics \
+    --diagnostics-format csv
+```
+
+This writes `<output_dir>/qa_order_diagnostics.csv` (or `.json`).  The default
+prefix `qa` is controlled by `--qa-plot-prefix`.
+
+### Diagnostics table fields
+
+The console table printed at the end of every run contains the following
+columns:
+
+| Column | Description |
+|--------|-------------|
+| `Order` | Echelle order number (e.g. 203–229 for K3) |
+| `Cand` | Candidate traced arc lines considered for matching |
+| `Acc` | Accepted matches used in the polynomial fit |
+| `Rej` | Rejected/unmatched lines (`Cand − Acc`) |
+| `DegReq` | Polynomial degree that was requested |
+| `DegUsd` | Polynomial degree actually used (may be reduced) |
+| `RMS(nm)` | Fit RMS in nm (`NaN` when the order was skipped) |
+| `Skip` | `YES` when the order had too few lines to fit |
+| `NMono` | `YES` when rectification found a non-monotonic wavelength surface |
+
+Orders flagged with `◀` in the table are problematic and listed in the
+**Weak-order summary** section below the table.
+
+### Interpreting low line counts
+
+A **low accepted-line count** (`Acc < 3`) means the coarse wavelength
+reference from `WaveCalInfo` plane 0 did not predict the correct wavelength
+for most traced lines within the matching tolerance (`match_tol_um = 0.005 µm`
+by default).
+
+Common causes:
+- The coarse reference grid is locally offset from the true dispersion relation
+  (especially at the bluemost/redmost orders where the reference is less reliable).
+- Arc lines in that order are blended or very faint.
+- The traced line positions are shifted (e.g. due to detector flexure).
+
+**Effect**: orders with fewer than `min_lines_per_order = 2` accepted matches
+are *skipped* (`wave_coeffs = None`); orders with exactly 2–3 matches receive
+a low-degree polynomial fit.
+
+### Interpreting polynomial degree reduction
+
+When fewer than `dispersion_degree + 1` matches are accepted, the polynomial
+degree is automatically reduced to `n_accepted − 1`.  For example, with
+3 accepted matches and `dispersion_degree = 3`, the fit is reduced to degree 2.
+
+**Effect**: A lower-degree polynomial has fewer degrees of freedom, so it
+captures only the gross wavelength trend and not any curvature in the
+dispersion relation.  This degrades wavelength accuracy across the order.
+
+### Interpreting non-monotonic wavelength surfaces
+
+A **non-monotonic wavelength surface** is flagged when the global coefficient
+surface (computed during Stage 5) predicts wavelengths that are not strictly
+increasing (or decreasing) across the detector columns for a given order.
+
+The `rectification_indices` module emits a `RuntimeWarning` for each such
+order, and the benchmark driver captures and records these.
+
+Common causes:
+- Too few accepted lines in affected orders → the global surface fit
+  extrapolates poorly into poorly-constrained orders.
+- The per-order polynomial degree was reduced, leaving the global surface
+  under-constrained locally.
+
+**Effect**: The column-inversion for rectification (converting from column
+space to wavelength space) may be inaccurate for these orders.  Rectified
+spectra from non-monotonic orders should be treated as unreliable.
+
+### Interpreting the improved residuals QA plot (`qa_wavecal_residuals.png`)
+
+The residuals plot has been enhanced to show:
+
+- **Blue dots** — accepted matched lines (used in the polynomial fit).
+- **Red × markers** at `residual = 0` — rejected or unmatched lines.
+- **Bar labels** on the per-order count chart — per-order RMS in nm.
+
+The top two panels (residuals vs order number; residuals vs column) show the
+full picture of accepted vs rejected lines.  A large number of red markers
+relative to blue markers indicates a poorly-calibrated order.
+
+### Light-touch deduplication of arc lines
+
+The provisional wavelength mapper (`wavecal_2d.py`) now applies a
+**minimum column separation filter** (`min_col_separation = 5.0 pixels` by
+default) before matching.  When two detected lines in the same order have seed
+columns within this threshold, only the one with the higher peak flux is kept.
+
+This removes spurious near-duplicate detections (e.g. from split or blended
+emission lines) that would otherwise consume reference wavelength slots and
+prevent genuine distinct lines from matching.
+
+---
+
+
 
 The following IDL Spextool manual stages are **not yet implemented** in the
 Python iSHELL scaffold:
