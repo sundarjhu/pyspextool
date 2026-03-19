@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import numpy.typing as npt
+from scipy.signal import correlate as _scipy_correlate
 from scipy.signal import find_peaks as _scipy_find_peaks
 
 if TYPE_CHECKING:
@@ -67,6 +68,7 @@ if TYPE_CHECKING:
 __all__ = [
     "OrderArcSpectrum",
     "OrderArcSpectraSet",
+    "OrderMatchStats",
     "IdlStyle1DXDModel",
     "extract_order_arc_spectra",
     "fit_1dxd_wavelength_model",
@@ -173,6 +175,49 @@ class OrderArcSpectraSet:
 
 
 @dataclass
+class OrderMatchStats:
+    """Per-order match statistics from the K3 1DXD fitting pipeline.
+
+    Collected during :func:`fit_1dxd_wavelength_model` and stored inside
+    :attr:`IdlStyle1DXDModel.per_order_stats`.
+
+    Parameters
+    ----------
+    order_number : int
+        Echelle order number.
+    xcorr_shift_px : float
+        Cross-correlation shift (in pixels) applied before peak centroiding
+        to align the extracted spectrum with the reference comb.  ``0.0``
+        if cross-correlation could not be computed for this order.
+    n_candidate : int
+        Number of arc-line peaks detected in the 1-D spectrum before
+        matching.
+    n_matched : int
+        Number of peaks that matched a reference line within the tolerance
+        window (before global sigma clipping).
+    n_accepted : int
+        Number of matches retained after global iterative sigma clipping.
+    n_rejected : int
+        Number of matches rejected by sigma clipping.
+    rms_resid_um : float
+        Per-order RMS of the global-fit residuals for the *accepted* points
+        (µm).  ``NaN`` if no accepted points remain for this order.
+    participated : bool
+        ``True`` if this order contributed at least one accepted point to
+        the global fit.
+    """
+
+    order_number: int
+    xcorr_shift_px: float
+    n_candidate: int
+    n_matched: int
+    n_accepted: int
+    n_rejected: int
+    rms_resid_um: float
+    participated: bool
+
+
+@dataclass
 class IdlStyle1DXDModel:
     """Global IDL-style 1DXD wavelength model.
 
@@ -200,13 +245,26 @@ class IdlStyle1DXDModel:
         Coefficient matrix.  ``coeffs[i, j]`` is the coefficient of
         ``col**i * v**j``.
     fitted_order_numbers : list of int
-        Echelle order numbers included in the fit.
+        Echelle order numbers that contributed at least one accepted point.
     fit_rms_um : float
-        RMS residual of the global fit (µm).
+        RMS residual of the global fit after sigma clipping (µm).
     n_lines : int
-        Number of arc-line matches used in the fit.
+        Number of arc-line matches *accepted* in the final fit (after sigma
+        clipping).
+    n_lines_total : int
+        Total arc-line matches before sigma clipping.
+    n_lines_rejected : int
+        Number of arc-line matches rejected by sigma clipping
+        (``n_lines_total - n_lines``).
+    accepted_mask : ndarray of bool, shape (n_lines_total,)
+        Boolean mask: ``True`` for accepted points, ``False`` for rejected.
+    median_residual_um : float
+        Median residual of the accepted points (µm).  Zero for a perfectly
+        symmetric residual distribution.
     n_orders_fit : int
-        Number of orders that contributed at least one match.
+        Number of orders that contributed at least one accepted match.
+    per_order_stats : list of :class:`OrderMatchStats`
+        Per-order match statistics (one entry per order in *spectra_set*).
 
     Notes
     -----
@@ -222,7 +280,12 @@ class IdlStyle1DXDModel:
     fitted_order_numbers: list[int]
     fit_rms_um: float
     n_lines: int
+    n_lines_total: int
+    n_lines_rejected: int
+    accepted_mask: npt.NDArray  # bool, shape (n_lines_total,)
+    median_residual_um: float
     n_orders_fit: int
+    per_order_stats: list[OrderMatchStats] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Coordinate helper
@@ -466,19 +529,24 @@ def fit_1dxd_wavelength_model(
     min_distance: int = 5,
     match_tol_um: float = 0.002,
     min_lines_total: int = 10,
+    sigma_thresh: float = 3.0,
+    max_sigma_iter: int = 5,
+    xcorr_max_shift_px: int = 50,
 ) -> IdlStyle1DXDModel:
     """Fit a global IDL-style 1DXD wavelength model across all echelle orders.
 
     For each order in *spectra_set*:
 
-    1. Detect arc-line peaks in the 1-D arc spectrum using
+    1. **Cross-correlate** the extracted 1-D arc spectrum against a synthetic
+       reference comb (Gaussians placed at each reference-line column position
+       predicted by the coarse wavelength grid) to determine a per-order
+       column shift.
+    2. **Detect peaks** in the shift-corrected arc spectrum using
        :func:`scipy.signal.find_peaks`.
-    2. For each peak, predict a wavelength from the packaged
-       ``WaveCalInfo`` plane-0 coarse grid.
-    3. Match the predicted wavelength to the nearest entry in *line_list*,
-       accepting only matches within *match_tol_um*.
+    3. **Match peaks** to the nearest reference line within *match_tol_um*,
+       using the shifted coarse grid for wavelength prediction.
 
-    Then fit a single global 2-D polynomial across all accepted matches:
+    Then fit a single global 2-D polynomial across all matched points:
 
     .. math::
 
@@ -488,6 +556,10 @@ def fit_1dxd_wavelength_model(
 
     where ``v = order_ref / order``, ``order_ref`` is the minimum echelle
     order number, ``w = wdeg``, and ``p = odeg``.
+
+    After the initial fit, **iterative sigma clipping** rejects points whose
+    residual exceeds ``sigma_thresh × rms_residual``.  The fit is repeated
+    on the surviving points until convergence or *max_sigma_iter* iterations.
 
     Parameters
     ----------
@@ -512,26 +584,32 @@ def fit_1dxd_wavelength_model(
     min_lines_total : int, default 10
         Minimum total number of matched arc lines required across all orders.
         Raises :exc:`ValueError` if this threshold is not met.
+    sigma_thresh : float, default 3.0
+        Sigma-clipping threshold.  Points whose residual exceeds
+        ``sigma_thresh × rms`` are rejected from the global fit.
+    max_sigma_iter : int, default 5
+        Maximum number of sigma-clipping iterations.  Iteration stops
+        earlier if no new points are rejected.
+    xcorr_max_shift_px : int, default 50
+        Maximum absolute column shift (pixels) allowed by the
+        cross-correlation.  Shifts larger than this are clipped to ±50.
 
     Returns
     -------
     :class:`IdlStyle1DXDModel`
-        Fitted global model.
+        Fitted global model with sigma-clipping statistics and per-order
+        match metadata.
 
     Raises
     ------
     ValueError
         If *wdeg* or *odeg* is negative, or if fewer than *min_lines_total*
-        arc lines are matched.
+        arc lines are matched (before sigma clipping).
 
     Warns
     -----
     RuntimeWarning
         If an order has no valid coarse reference grid and is skipped.
-    RuntimeWarning
-        If the total number of matched lines is below *min_lines_total*
-        but the fit is still attempted with however many points are
-        available.
     """
     if wdeg < 0:
         raise ValueError(f"wdeg must be >= 0; got {wdeg}")
@@ -545,6 +623,7 @@ def fit_1dxd_wavelength_model(
     all_orders: list[float] = []
     all_wavs: list[float] = []
     orders_with_matches: set[int] = set()
+    per_order_stats: list[OrderMatchStats] = []
 
     for spec in spectra_set.spectra:
         order_num = spec.order_number
@@ -561,6 +640,11 @@ def fit_1dxd_wavelength_model(
                 RuntimeWarning,
                 stacklevel=2,
             )
+            per_order_stats.append(OrderMatchStats(
+                order_number=order_num, xcorr_shift_px=0.0,
+                n_candidate=0, n_matched=0, n_accepted=0, n_rejected=0,
+                rms_resid_um=float("nan"), participated=False,
+            ))
             continue
 
         # Reference line wavelengths for this order
@@ -570,10 +654,32 @@ def fit_1dxd_wavelength_model(
         flux = spec.flux
         valid_mask = np.isfinite(flux)
         if not valid_mask.any():
+            per_order_stats.append(OrderMatchStats(
+                order_number=order_num, xcorr_shift_px=0.0,
+                n_candidate=0, n_matched=0, n_accepted=0, n_rejected=0,
+                rms_resid_um=float("nan"), participated=False,
+            ))
             continue
 
-        # Replace NaNs with zero for peak finding (NaN positions won't be
-        # selected because prominence requires finite neighbours)
+        # ------------------------------------------------------------------
+        # Step 1: Cross-correlate extracted spectrum against reference comb
+        # to find the per-order column shift.
+        # ------------------------------------------------------------------
+        xcorr_shift = _xcorr_order_shift(
+            flux, coarse_cols, coarse_wavs, ref_entries,
+            spec.col_start, max_shift_px=xcorr_max_shift_px,
+        )
+        logger.debug(
+            "Order %d: xcorr shift = %.2f px", order_num, xcorr_shift
+        )
+
+        # Shift the coarse column grid to align with the extracted spectrum.
+        # A positive shift means the extracted spectrum is shifted right
+        # relative to the reference; we subtract the shift from predicted
+        # columns to compensate.
+        shifted_coarse_cols = coarse_cols + xcorr_shift
+
+        # Replace NaNs with zero for peak finding
         flux_for_peaks = np.where(valid_mask, flux, 0.0)
 
         peak_idxs, _ = _scipy_find_peaks(
@@ -582,24 +688,36 @@ def fit_1dxd_wavelength_model(
             distance=min_distance,
         )
 
-        if len(peak_idxs) == 0:
+        n_candidate = len(peak_idxs)
+        if n_candidate == 0:
             logger.debug("Order %d: no peaks found in 1D arc spectrum", order_num)
+            per_order_stats.append(OrderMatchStats(
+                order_number=order_num, xcorr_shift_px=xcorr_shift,
+                n_candidate=0, n_matched=0, n_accepted=0, n_rejected=0,
+                rms_resid_um=float("nan"), participated=False,
+            ))
             continue
 
         # Convert peak indices to detector columns
         peak_cols = spec.col_start + peak_idxs.astype(float)
 
-        # Match peaks to reference lines
+        # Match peaks to reference lines using the shift-corrected coarse grid
         matches = _match_1d_peaks(
             peak_cols,
-            coarse_cols,
+            shifted_coarse_cols,
             coarse_wavs,
             ref_entries,
             match_tol_um,
         )
 
+        n_matched = len(matches)
         if not matches:
             logger.debug("Order %d: no arc lines matched", order_num)
+            per_order_stats.append(OrderMatchStats(
+                order_number=order_num, xcorr_shift_px=xcorr_shift,
+                n_candidate=n_candidate, n_matched=0, n_accepted=0, n_rejected=0,
+                rms_resid_um=float("nan"), participated=False,
+            ))
             continue
 
         for col_m, wav_m in matches:
@@ -608,25 +726,32 @@ def fit_1dxd_wavelength_model(
             all_wavs.append(wav_m)
 
         orders_with_matches.add(order_num)
+
+        # Store preliminary stats (n_accepted / n_rejected updated after sigma clip)
+        per_order_stats.append(OrderMatchStats(
+            order_number=order_num, xcorr_shift_px=xcorr_shift,
+            n_candidate=n_candidate, n_matched=n_matched,
+            n_accepted=n_matched, n_rejected=0,
+            rms_resid_um=float("nan"), participated=True,
+        ))
+
         logger.debug(
-            "Order %d: %d peaks detected, %d lines matched",
-            order_num,
-            len(peak_idxs),
-            len(matches),
+            "Order %d: xcorr=%.1fpx, %d peaks, %d matched",
+            order_num, xcorr_shift, n_candidate, n_matched,
         )
 
-    n_lines = len(all_cols)
+    n_lines_total = len(all_cols)
     n_orders_fit = len(orders_with_matches)
 
     logger.info(
-        "fit_1dxd_wavelength_model: %d lines from %d orders",
-        n_lines,
+        "fit_1dxd_wavelength_model: %d lines from %d orders (before sigma clip)",
+        n_lines_total,
         n_orders_fit,
     )
 
-    if n_lines < min_lines_total:
+    if n_lines_total < min_lines_total:
         raise ValueError(
-            f"Only {n_lines} arc lines matched (minimum is {min_lines_total}).  "
+            f"Only {n_lines_total} arc lines matched (minimum is {min_lines_total}).  "
             "Try reducing match_tol_um or min_prominence."
         )
 
@@ -635,36 +760,95 @@ def fit_1dxd_wavelength_model(
     wavs_arr = np.array(all_wavs, dtype=float)
 
     # ------------------------------------------------------------------
-    # Build design matrix and fit
+    # Build design matrix
     # ------------------------------------------------------------------
     order_ref = float(np.min(orders_arr))
     vs = order_ref / orders_arr  # normalised inverse-order coordinate
 
-    # Design matrix: columns are col^i * v^j for i in 0..wdeg, j in 0..odeg
     n_terms = (wdeg + 1) * (odeg + 1)
-    X = np.empty((n_lines, n_terms), dtype=float)
-    term_idx = 0
-    for i in range(wdeg + 1):
-        for j in range(odeg + 1):
-            X[:, term_idx] = (cols_arr ** i) * (vs ** j)
-            term_idx += 1
 
-    # Least-squares fit
-    c_flat, _, _, _ = np.linalg.lstsq(X, wavs_arr, rcond=None)
-    coeffs = c_flat.reshape(wdeg + 1, odeg + 1)
+    def _build_design(c_arr, v_arr):
+        X = np.empty((len(c_arr), n_terms), dtype=float)
+        idx = 0
+        for ii in range(wdeg + 1):
+            for jj in range(odeg + 1):
+                X[:, idx] = (c_arr ** ii) * (v_arr ** jj)
+                idx += 1
+        return X
 
-    # Compute fit RMS
-    wavs_pred = X @ c_flat
-    residuals = wavs_arr - wavs_pred
-    fit_rms_um = float(np.sqrt(np.mean(residuals ** 2)))
+    # ------------------------------------------------------------------
+    # Iterative sigma clipping
+    # ------------------------------------------------------------------
+    accepted_mask = np.ones(n_lines_total, dtype=bool)
+
+    for _iter in range(max_sigma_iter):
+        X_sub = _build_design(cols_arr[accepted_mask], vs[accepted_mask])
+        c_flat, _, _, _ = np.linalg.lstsq(X_sub, wavs_arr[accepted_mask], rcond=None)
+        residuals_all = wavs_arr - (_build_design(cols_arr, vs) @ c_flat)
+        rms_acc = float(np.sqrt(np.mean(residuals_all[accepted_mask] ** 2)))
+        if rms_acc == 0.0:
+            break
+        new_mask = accepted_mask & (np.abs(residuals_all) <= sigma_thresh * rms_acc)
+        n_newly_rejected = int(np.sum(accepted_mask) - np.sum(new_mask))
+        accepted_mask = new_mask
+        logger.debug(
+            "Sigma clip iter %d: rms=%.4f nm, rejected %d new points (%d total)",
+            _iter + 1, rms_acc * 1e3, n_newly_rejected,
+            int(np.sum(~accepted_mask)),
+        )
+        if n_newly_rejected == 0:
+            break
+
+    # Final fit on accepted points
+    X_final = _build_design(cols_arr[accepted_mask], vs[accepted_mask])
+    c_flat_final, _, _, _ = np.linalg.lstsq(
+        X_final, wavs_arr[accepted_mask], rcond=None
+    )
+    coeffs = c_flat_final.reshape(wdeg + 1, odeg + 1)
+
+    # Final residuals (for accepted points only)
+    residuals_final = wavs_arr[accepted_mask] - (X_final @ c_flat_final)
+    fit_rms_um = float(np.sqrt(np.mean(residuals_final ** 2)))
+    median_residual_um = float(np.median(residuals_final))
+
+    n_lines_accepted = int(np.sum(accepted_mask))
+    n_lines_rejected = n_lines_total - n_lines_accepted
+
+    # ------------------------------------------------------------------
+    # Update per-order stats with final residuals and sigma-clip counts
+    # ------------------------------------------------------------------
+    orders_arr_all = orders_arr  # shape (n_lines_total,)
+    residuals_all_final = wavs_arr - (_build_design(cols_arr, vs) @ c_flat_final)
+
+    for stat in per_order_stats:
+        if not stat.participated:
+            continue
+        order_mask = orders_arr_all == float(stat.order_number)
+        accepted_order = accepted_mask & order_mask
+        rejected_order = (~accepted_mask) & order_mask
+        n_acc = int(np.sum(accepted_order))
+        n_rej = int(np.sum(rejected_order))
+        rms_order = (
+            float(np.sqrt(np.mean(residuals_all_final[accepted_order] ** 2)))
+            if n_acc > 0 else float("nan")
+        )
+        # Mutate (OrderMatchStats is a dataclass, not frozen)
+        stat.n_accepted = n_acc
+        stat.n_rejected = n_rej
+        stat.rms_resid_um = rms_order
+        stat.participated = n_acc > 0
+
+    # Rebuild orders_with_matches from accepted points only
+    fitted_orders_final = sorted(
+        int(o) for o in set(orders_arr[accepted_mask].tolist())
+    )
+    n_orders_fit_final = len(fitted_orders_final)
 
     logger.info(
         "fit_1dxd_wavelength_model: wdeg=%d, odeg=%d, "
-        "n_lines=%d, fit_rms=%.4f nm",
-        wdeg,
-        odeg,
-        n_lines,
-        fit_rms_um * 1e3,
+        "total=%d acc=%d rej=%d rms=%.4f nm",
+        wdeg, odeg, n_lines_total, n_lines_accepted,
+        n_lines_rejected, fit_rms_um * 1e3,
     )
 
     return IdlStyle1DXDModel(
@@ -673,16 +857,133 @@ def fit_1dxd_wavelength_model(
         odeg=odeg,
         order_ref=order_ref,
         coeffs=coeffs,
-        fitted_order_numbers=sorted(orders_with_matches),
+        fitted_order_numbers=fitted_orders_final,
         fit_rms_um=fit_rms_um,
-        n_lines=n_lines,
-        n_orders_fit=n_orders_fit,
+        n_lines=n_lines_accepted,
+        n_lines_total=n_lines_total,
+        n_lines_rejected=n_lines_rejected,
+        accepted_mask=accepted_mask,
+        median_residual_um=median_residual_um,
+        n_orders_fit=n_orders_fit_final,
+        per_order_stats=per_order_stats,
     )
 
 
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _xcorr_order_shift(
+    flux: npt.NDArray,
+    coarse_cols: npt.NDArray,
+    coarse_wavs: npt.NDArray,
+    ref_entries: list[tuple[float, str]],
+    col_start: int,
+    *,
+    max_shift_px: int = 50,
+    fwhm_px: float = 3.0,
+) -> float:
+    """Compute the per-order column shift via cross-correlation.
+
+    Builds a synthetic reference comb from the expected arc-line column
+    positions (Gaussians of width *fwhm_px* at each reference-line column
+    predicted by the coarse wavelength grid) and cross-correlates it
+    against the extracted 1-D arc spectrum.
+
+    The shift is found from the peak of the cross-correlation within
+    ``±max_shift_px`` pixels.  Sub-pixel accuracy is obtained by
+    fitting a parabola through the three points around the peak.
+
+    Parameters
+    ----------
+    flux : ndarray, shape (n_cols,)
+        Extracted 1-D arc spectrum for this order.
+    coarse_cols, coarse_wavs : ndarray
+        Coarse column→wavelength lookup from the packaged ``WaveCalInfo``.
+    ref_entries : list of (float, str)
+        Reference line ``(wavelength_um, species)`` pairs for this order.
+    col_start : int
+        Detector column corresponding to ``flux[0]``.
+    max_shift_px : int, default 50
+        Maximum absolute shift in pixels to search.
+    fwhm_px : float, default 3.0
+        FWHM of the Gaussian used for each reference line in the comb.
+
+    Returns
+    -------
+    float
+        Cross-correlation shift in pixels.  A positive value means the
+        extracted spectrum is shifted *right* relative to the reference.
+        Returns ``0.0`` if no reference lines are available, the coarse
+        grid is empty, or correlation fails.
+    """
+    if len(ref_entries) == 0 or len(coarse_cols) == 0:
+        return 0.0
+
+    n = len(flux)
+    if n == 0:
+        return 0.0
+
+    # Replace NaNs with zero for correlation
+    flux_clean = np.where(np.isfinite(flux), flux, 0.0)
+    # Remove DC offset
+    flux_clean = flux_clean - float(np.mean(flux_clean))
+
+    # Build synthetic reference comb: Gaussian at each expected line column
+    ref_wavs = np.array([e[0] for e in ref_entries], dtype=float)
+    sigma = fwhm_px / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+
+    col_min = float(coarse_cols[0])
+    col_max = float(coarse_cols[-1])
+
+    cols_abs = col_start + np.arange(n, dtype=float)  # absolute detector columns
+    comb = np.zeros(n, dtype=float)
+    n_lines_in_comb = 0
+    for wav in ref_wavs:
+        # Predicted column for this reference line
+        if wav < float(coarse_wavs[0]) or wav > float(coarse_wavs[-1]):
+            continue
+        pred_col = float(np.interp(wav, coarse_wavs, coarse_cols))
+        if pred_col < col_min or pred_col > col_max:
+            continue
+        # Add Gaussian at that column (in local index space)
+        pred_idx = pred_col - col_start
+        comb += np.exp(-0.5 * ((cols_abs - col_start - pred_idx) / sigma) ** 2)
+        n_lines_in_comb += 1
+
+    if n_lines_in_comb == 0:
+        return 0.0
+
+    # Full cross-correlation (mode="full") gives a (2n-1,)-length result.
+    # The zero-lag is at index n-1.
+    xcorr = _scipy_correlate(flux_clean, comb, mode="full")
+    zero_lag = n - 1
+    lo = max(0, zero_lag - max_shift_px)
+    hi = min(len(xcorr) - 1, zero_lag + max_shift_px)
+    xcorr_window = xcorr[lo: hi + 1]
+
+    peak_idx_local = int(np.argmax(xcorr_window))
+    peak_idx_global = lo + peak_idx_local
+
+    # Sub-pixel refinement via parabolic fit through three points
+    if 0 < peak_idx_global < len(xcorr) - 1:
+        y0 = xcorr[peak_idx_global - 1]
+        y1 = xcorr[peak_idx_global]
+        y2 = xcorr[peak_idx_global + 1]
+        denom = 2.0 * y1 - y0 - y2
+        if denom != 0.0:
+            sub_shift = 0.5 * (y2 - y0) / denom
+        else:
+            sub_shift = 0.0
+    else:
+        sub_shift = 0.0
+
+    # Shift relative to zero lag
+    shift = float(peak_idx_global - zero_lag) + sub_shift
+    # Clip to max_shift
+    shift = float(np.clip(shift, -max_shift_px, max_shift_px))
+    return shift
 
 
 def _build_coarse_lookup_1d(

@@ -308,6 +308,7 @@ def build_rectification_indices(
     wavelength_func: Optional[Callable[[npt.ArrayLike, float], npt.NDArray]] = None,
     fitted_order_numbers: Optional[list[int]] = None,
     wav_map: Optional["ProvisionalWavelengthMap"] = None,
+    geom_order_map: Optional[dict[int, int]] = None,
     n_spectral: int = 256,
     n_spatial: int = 64,
     n_col_samples: int = 1024,
@@ -361,16 +362,21 @@ def build_rectification_indices(
     fitted_order_numbers : list of int, optional
         **K3 1DXD path only.**  Echelle order numbers covered by
         *wavelength_func*.  Orders in *geometry* whose echelle order number
-        (or whose placeholder index resolved via *wav_map*) is not in this
-        list are silently skipped.  If ``None`` when *wavelength_func* is
-        given, all geometry orders are attempted.
+        (or whose placeholder index resolved via *wav_map* or *geom_order_map*)
+        is not in this list are silently skipped.  If ``None`` when
+        *wavelength_func* is given, all geometry orders are attempted.
     wav_map : :class:`~pyspextool.instruments.ishell.wavecal_2d.ProvisionalWavelengthMap`, optional
         Provisional wavelength map from Stage 3.  When provided, its
         solution list is used to resolve placeholder geometry order
-        indices to real echelle order numbers.  Required when *geometry*
-        contains 0-indexed placeholder order numbers (as produced by
-        :meth:`~pyspextool.instruments.ishell.tracing.FlatOrderTrace.to_order_geometry_set`).
-        Valid for both paths.
+        indices to real echelle order numbers.  Valid for both paths.
+        Mutually exclusive with *geom_order_map*; *geom_order_map* takes
+        precedence if both are given.
+    geom_order_map : dict[int, int], optional
+        **K3 1DXD path.**  A direct mapping from geometry placeholder order
+        index (i.e. ``geom.order``) to real echelle order number.  When
+        provided, this is used *instead of* ``wav_map`` for the K3 path,
+        eliminating any dependency on the scaffold prov_map.  Ignored when
+        *surface* (scaffold path) is used.
     n_spectral : int, default 256
         Number of spectral (wavelength) pixels in the output rectified
         grid.  Must be >= 2.
@@ -386,6 +392,8 @@ def build_rectification_indices(
     -------
     :class:`RectificationIndexSet`
         One :class:`RectificationIndexOrder` per matched echelle order.
+        **Order labels** (``RectificationIndexOrder.order``) are always
+        the real echelle order numbers, not placeholder indices.
 
     Raises
     ------
@@ -506,11 +514,14 @@ def build_rectification_indices(
     # ------------------------------------------------------------------
     # Build geometry-order → echelle-order-number mapping
     # ------------------------------------------------------------------
-    # When wav_map is provided, use its solutions to map geometry
-    # placeholder indices to real echelle order numbers.  Otherwise,
-    # treat geometry.order directly as the echelle order number.
-    if wav_map is not None:
+    # Priority: geom_order_map > wav_map > identity (use geometry.order directly).
+    if geom_order_map is not None:
+        # Direct map provided (K3 primary path — no scaffold prov_map needed)
         geom_order_to_echelle: dict[int, int] = {
+            int(k): int(v) for k, v in geom_order_map.items()
+        }
+    elif wav_map is not None:
+        geom_order_to_echelle = {
             sol.order_index: int(round(float(sol.order_number)))
             for sol in wav_map.order_solutions
         }
@@ -527,7 +538,7 @@ def build_rectification_indices(
     for geom in geometry.geometries:
         echelle_order = geom_order_to_echelle.get(int(geom.order))
         if echelle_order is None:
-            # No wav_map entry for this geometry order; skip.
+            # No mapping entry for this geometry order; skip.
             continue
 
         # ---- Select wavelength evaluation method ----
@@ -597,7 +608,7 @@ def build_rectification_indices(
 
         index_orders.append(
             RectificationIndexOrder(
-                order=geom.order,
+                order=echelle_order,  # real echelle order, not placeholder index
                 order_index=order_index,
                 output_wavelengths_um=output_wavs,
                 output_spatial_frac=output_spatial_frac,
