@@ -48,15 +48,27 @@ Data location (defaults)
 
 Implemented stages
 ------------------
-  Stage 1  – Flat/order-centre tracing  (tracing.py)
-  Stage 2  – Arc-line tracing           (arc_tracing.py)
-  Stage 3  – Provisional wavelength map (wavecal_2d.py)
-  Stage 4  – Global wavelength surface  (wavecal_2d_surface.py)
-  Stage 5  – Coefficient refinement     (wavecal_2d_refine.py)
-  Stage 6  – Rectification indices      (rectification_indices.py)
-  Stage 7  – Rectified order images     (rectified_orders.py)
-  Stage 8  – Calibration FITS products  (calibration_fits.py)
-  QA plots – Python scaffold QA figures (matplotlib)
+  Stage 1  – Flat/order-centre tracing    (tracing.py)
+  Stage 2  – Arc-line tracing             (arc_tracing.py)
+  Stage 3  – Provisional wavelength map   (wavecal_2d.py)          [scaffold]
+  Stage 3b – K3 1DXD wavelength model     (wavecal_k3_idlstyle.py) [K3 primary path]
+  Stage 4  – Global wavelength surface    (wavecal_2d_surface.py)  [scaffold]
+  Stage 5  – Coefficient refinement       (wavecal_2d_refine.py)   [scaffold]
+  Stage 6  – Rectification indices        (rectification_indices.py)
+             (driven by Stage 3b K3 1DXD model; falls back to Stage 5 if 3b fails)
+  Stage 7  – Rectified order images       (rectified_orders.py)
+  Stage 8  – Calibration FITS products    (calibration_fits.py)
+  QA plots – Python scaffold QA figures   (matplotlib)
+
+K3 calibration path
+-------------------
+  For the K3 benchmark, Stage 3b (wavecal_k3_idlstyle.py) is the PRIMARY
+  source of truth for wavelength calibration.  It:
+    1. Extracts 1-D arc spectra using the traced flat-field order geometry.
+    2. Fits a global (wdeg=3, odeg=2) 1DXD polynomial across all orders.
+  The Stage 3b model drives Stage 6 rectification and all downstream outputs.
+  Stages 3–5 (scaffold) run for reference and diagnostics but do NOT drive
+  K3 results.
 
 Not yet implemented in Python
 ------------------------------
@@ -111,6 +123,10 @@ from pyspextool.instruments.ishell.wavecal_2d_surface import (  # noqa: E402
 )
 from pyspextool.instruments.ishell.wavecal_2d_refine import (  # noqa: E402
     fit_refined_coefficient_surface,
+)
+from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (  # noqa: E402
+    extract_order_arc_spectra,
+    fit_1dxd_wavelength_model,
 )
 from pyspextool.instruments.ishell.rectification_indices import (  # noqa: E402
     build_rectification_indices,
@@ -1355,10 +1371,10 @@ def run_k3_example(
                         prefix=prefix)
 
     # ------------------------------------------------------------------
-    # Stage 3: Provisional wavelength map
+    # Stage 3: Provisional wavelength map (scaffold — used for diagnostics)
     # ------------------------------------------------------------------
 
-    _banner("Stage 3: Provisional per-order wavelength mapping")
+    _banner("Stage 3: Provisional per-order wavelength mapping (scaffold)")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         prov_map = fit_provisional_wavelength_map(
@@ -1385,7 +1401,7 @@ def run_k3_example(
             f"poly degree={deg}"
         )
 
-    _ok("Stage 3 — provisional wavelength mapping")
+    _ok("Stage 3 — provisional wavelength mapping (scaffold)")
     completed["stage3_provisional_wavemap"] = True
 
     if not no_plots:
@@ -1395,52 +1411,98 @@ def run_k3_example(
                            prefix=prefix)
 
     # ------------------------------------------------------------------
-    # Stage 4: Global wavelength surface
+    # Stage 3b: K3 1DXD wavelength calibration (IDL-style — primary path)
     # ------------------------------------------------------------------
 
-    _banner("Stage 4: Global wavelength surface")
+    _banner("Stage 3b: K3 1DXD wavelength calibration (IDL-style — primary path)")
+    k3_model = None
+    try:
+        arc_spectra = extract_order_arc_spectra(
+            arc_img, trace, wavecalinfo, aperture_half_width=3
+        )
+        print(f"  1D arc spectra extracted : {arc_spectra.n_orders} orders")
+
+        k3_model = fit_1dxd_wavelength_model(
+            arc_spectra, wavecalinfo, line_list, wdeg=3, odeg=2
+        )
+        print(f"  1DXD fit: {k3_model.n_orders_fit} orders, "
+              f"{k3_model.n_lines} lines, "
+              f"RMS = {k3_model.fit_rms_um * 1e3:.3f} nm")
+        print(f"  Fitted orders: {k3_model.fitted_order_numbers}")
+        _ok("Stage 3b — K3 1DXD wavelength calibration")
+        completed["stage3b_k3_1dxd"] = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Stage 3b raised: {exc}")
+        _skip("Stage 3b — K3 1DXD wavelength calibration", "exception (see above)")
+        completed["stage3b_k3_1dxd"] = False
+
+    # ------------------------------------------------------------------
+    # Stage 4: Global wavelength surface (scaffold — kept for reference)
+    # ------------------------------------------------------------------
+
+    _banner("Stage 4: Global wavelength surface (scaffold)")
     try:
         surface_result = fit_global_wavelength_surface(prov_map)
         print(f"  Surface fit converged: {getattr(surface_result, 'converged', 'N/A')}")
-        _ok("Stage 4 — global wavelength surface")
+        _ok("Stage 4 — global wavelength surface (scaffold)")
         completed["stage4_global_surface"] = True
     except Exception as exc:  # noqa: BLE001
         print(f"  Stage 4 raised: {exc}")
-        _skip("Stage 4 — global wavelength surface", "exception (see above)")
+        _skip("Stage 4 — global wavelength surface (scaffold)", "exception (see above)")
         completed["stage4_global_surface"] = False
         surface_result = None
 
     # ------------------------------------------------------------------
-    # Stage 5: Coefficient refinement
+    # Stage 5: Coefficient refinement (scaffold — kept for reference)
     # ------------------------------------------------------------------
 
-    _banner("Stage 5: Coefficient-surface refinement")
+    _banner("Stage 5: Coefficient-surface refinement (scaffold)")
     try:
         refined = fit_refined_coefficient_surface(prov_map)
         print(f"  Refined surface n_orders: {getattr(refined, 'n_orders', 'N/A')}")
-        _ok("Stage 5 — coefficient refinement")
+        _ok("Stage 5 — coefficient refinement (scaffold)")
         completed["stage5_refinement"] = True
     except Exception as exc:  # noqa: BLE001
         print(f"  Stage 5 raised: {exc}")
-        _skip("Stage 5 — coefficient refinement", "exception (see above)")
+        _skip("Stage 5 — coefficient refinement (scaffold)", "exception (see above)")
         completed["stage5_refinement"] = False
         refined = None
 
     # ------------------------------------------------------------------
     # Stage 6: Rectification indices
+    #
+    # K3 benchmark path: uses the 1DXD model (Stage 3b) as the source of
+    # truth for wavelengths.  Falls back to the scaffold surface (Stage 5)
+    # only if the 1DXD model is unavailable.
     # ------------------------------------------------------------------
 
     # Capture non-monotonic warnings so they can feed into the diagnostics.
     _non_monotonic_orders: set[int] = set()
 
     _banner("Stage 6: Rectification indices")
-    if refined is not None:
+    # Decide which wavelength model drives rectification.
+    _use_k3_path = k3_model is not None
+    _rect_prereq_ok = _use_k3_path or (refined is not None)
+
+    if _rect_prereq_ok:
         try:
             with warnings.catch_warnings(record=True) as _caught_warns:
                 warnings.simplefilter("always")
-                rect_idx = build_rectification_indices(
-                    geom, refined, wav_map=prov_map
-                )
+                if _use_k3_path:
+                    # K3 benchmark path: 1DXD model drives rectification.
+                    print("  Wavelength source: K3 1DXD model (Stage 3b)")
+                    rect_idx = build_rectification_indices(
+                        geom,
+                        wavelength_func=k3_model.as_wavelength_func(),
+                        fitted_order_numbers=k3_model.fitted_order_numbers,
+                        wav_map=prov_map,
+                    )
+                else:
+                    # Scaffold fallback (K3 1DXD unavailable).
+                    print("  Wavelength source: scaffold surface (Stage 5 fallback)")
+                    rect_idx = build_rectification_indices(
+                        geom, refined, wav_map=prov_map
+                    )
             # Extract order numbers from non-monotonic RuntimeWarnings.
             for w in _caught_warns:
                 if issubclass(w.category, RuntimeWarning):
@@ -1469,7 +1531,8 @@ def run_k3_example(
             completed["stage6_rect_indices"] = False
             rect_idx = None
     else:
-        _skip("Stage 6 — rectification indices", "Stage 5 did not complete")
+        _skip("Stage 6 — rectification indices",
+              "neither Stage 3b (K3 1DXD) nor Stage 5 (scaffold) completed")
         completed["stage6_rect_indices"] = False
         rect_idx = None
 

@@ -234,16 +234,48 @@ appear in the flat-orders plot.
 The following stages map to the IDL Spextool manual's K3 walkthrough and
 are **implemented and exercised** by the benchmark script:
 
-| Stage | Module | Description |
-|-------|--------|-------------|
-| 1 | `tracing.py` | Flat/order-centre tracing from QTH flat frames |
-| 2 | `arc_tracing.py` | 2-D arc-line tracing |
-| 3 | `wavecal_2d.py` | Provisional per-order wavelength mapping |
-| 4 | `wavecal_2d_surface.py` | Global wavelength surface fit |
-| 5 | `wavecal_2d_refine.py` | Coefficient-surface refinement |
-| 6 | `rectification_indices.py` | Rectification-index generation |
-| 7 | `rectified_orders.py` | Rectified order images |
-| 8 | `calibration_fits.py` | Write calibration FITS products |
+| Stage | Module | Description | Role |
+|-------|--------|-------------|------|
+| 1 | `tracing.py` | Flat/order-centre tracing from QTH flat frames | Both paths |
+| 2 | `arc_tracing.py` | 2-D arc-line tracing | Both paths |
+| 3 | `wavecal_2d.py` | Provisional per-order wavelength mapping | Scaffold (reference) |
+| 3b | `wavecal_k3_idlstyle.py` | K3 1DXD 1D extraction + global polynomial fit | **K3 primary** |
+| 4 | `wavecal_2d_surface.py` | Global wavelength surface fit | Scaffold (reference) |
+| 5 | `wavecal_2d_refine.py` | Coefficient-surface refinement | Scaffold (reference) |
+| 6 | `rectification_indices.py` | Rectification-index generation | Driven by Stage 3b |
+| 7 | `rectified_orders.py` | Rectified order images | Downstream of Stage 6 |
+| 8 | `calibration_fits.py` | Write calibration FITS products | Downstream of Stage 6 |
+
+### K3 wavelength calibration path (Stage 3b)
+
+**Stage 3b is the PRIMARY source of truth for wavelength calibration** in the
+K3 benchmark.  Stages 3–5 (scaffold) still execute but their results are used
+for diagnostics and comparison only — they do **not** drive K3 rectification
+or FITS output.
+
+Stage 3b operates as follows:
+
+1. **1D extraction** (`extract_order_arc_spectra`): for each echelle order, the
+   traced centre-line polynomial from Stage 1 (`FlatOrderTrace.center_poly_coeffs`)
+   is evaluated at every detector column.  A symmetric aperture of ±3 pixels is
+   averaged at each column.  This uses **only flat-field geometry** — the arc
+   image is NOT used to estimate the centre row.
+
+2. **Global 1DXD fit** (`fit_1dxd_wavelength_model`): arc-line peaks are
+   detected in the 1D spectra, matched to the reference line list, and a global
+   2D polynomial is fit:
+
+   ```
+   λ(col, order) = Σ_{i=0}^{3} Σ_{j=0}^{2}  C_{i,j} · col^i · v^j
+   ```
+
+   where `v = order_ref / order` is the normalised inverse-order coordinate.
+
+3. **Rectification** (`build_rectification_indices` with `wavelength_func`): the
+   Stage 3b model is passed as a callable `wavelength_func(cols, order_number)`
+   to drive rectification.  The scaffold surface is NOT used when Stage 3b succeeds.
+
+See `docs/ishell_k3_1dxd_design.md` for full design documentation.
 
 ### First-pass observations on K3 data
 
@@ -252,11 +284,9 @@ are **implemented and exercised** by the benchmark script:
   edge-order filter (see [K3 order-filtering rule](#k3-order-filtering-rule)).
   The 2 dropped orders are partial edge orders clipped at the detector boundary.
 - Arc-line tracing recovers ~300–360 lines across the 27 science orders.
-- The provisional wavelength mapping produces per-order polynomial fits;
-  some orders receive only a low-degree fit due to few matched lines.
-  Per-order accepted-line counts and polynomial degrees are printed in the
-  benchmark output.
-- These are **first-pass scaffold results**, not finalised calibrations.
+- Stage 3b (K3 1DXD) extracts 27 1D arc spectra and fits a global (3,2) polynomial.
+- The Stage 3b model drives Stage 6 rectification and Stages 7–8 FITS outputs.
+- Scaffold stages 3–5 still run and print diagnostics for comparison.
 
 ---
 

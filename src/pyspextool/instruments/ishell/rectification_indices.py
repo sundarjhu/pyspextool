@@ -133,7 +133,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -303,8 +303,10 @@ class RectificationIndexSet:
 
 def build_rectification_indices(
     geometry: OrderGeometrySet,
-    surface: "RefinedCoefficientSurface",
+    surface: Optional["RefinedCoefficientSurface"] = None,
     *,
+    wavelength_func: Optional[Callable[[npt.ArrayLike, float], npt.NDArray]] = None,
+    fitted_order_numbers: Optional[list[int]] = None,
     wav_map: Optional["ProvisionalWavelengthMap"] = None,
     n_spectral: int = 256,
     n_spatial: int = 64,
@@ -314,8 +316,23 @@ def build_rectification_indices(
 
     For each echelle order in *geometry*, constructs a mapping from a
     provisional rectified (wavelength × spatial) grid to approximate
-    detector (row, column) coordinates using the refined coefficient
-    surface from Stage 5.
+    detector (row, column) coordinates.
+
+    Two wavelength-evaluation paths are supported:
+
+    **Scaffold path** (``surface`` is provided):
+        Uses the :class:`~pyspextool.instruments.ishell.wavecal_2d_refine.RefinedCoefficientSurface`
+        from Stage 5 to predict wavelength at each column.  Orders are
+        matched between *geometry* and *surface* by echelle order number.
+
+    **K3 1DXD path** (``wavelength_func`` is provided):
+        Uses a callable ``wavelength_func(cols, order_number)`` to predict
+        wavelength.  The callable must accept a 1-D column array and a
+        scalar order number, and return a 1-D wavelength array.  Pass
+        ``fitted_order_numbers`` to specify which orders the function covers;
+        only those geometry orders are processed.  This path is intended for
+        the IDL-style 1DXD model from
+        :mod:`~pyspextool.instruments.ishell.wavecal_k3_idlstyle`.
 
     Parameters
     ----------
@@ -327,16 +344,33 @@ def build_rectification_indices(
         If the geometry was produced by
         :meth:`~pyspextool.instruments.ishell.tracing.FlatOrderTrace.to_order_geometry_set`
         it uses placeholder 0-indexed order numbers; in that case pass
-        *wav_map* to supply the real order-number correspondence.
-    surface : :class:`~pyspextool.instruments.ishell.wavecal_2d_refine.RefinedCoefficientSurface`
-        Refined coefficient surface from Stage 5, used to evaluate
-        wavelength as a function of ``(order_number, col)``.
+        *wav_map* (scaffold path) or *fitted_order_numbers* (1DXD path) to
+        supply the real order-number correspondence.
+    surface : :class:`~pyspextool.instruments.ishell.wavecal_2d_refine.RefinedCoefficientSurface`, optional
+        Refined coefficient surface from Stage 5 (**scaffold path**).
+        Mutually exclusive with *wavelength_func*.
+    wavelength_func : callable, optional
+        **K3 1DXD path.**  A callable with signature::
+
+            wavelength_func(cols: array_like, order_number: float) -> ndarray
+
+        where *cols* is a 1-D array of detector columns and *order_number*
+        is a scalar echelle order number.  The return value must be a 1-D
+        array of wavelengths in µm with the same length as *cols*.
+        Mutually exclusive with *surface*.
+    fitted_order_numbers : list of int, optional
+        **K3 1DXD path only.**  Echelle order numbers covered by
+        *wavelength_func*.  Orders in *geometry* whose echelle order number
+        (or whose placeholder index resolved via *wav_map*) is not in this
+        list are silently skipped.  If ``None`` when *wavelength_func* is
+        given, all geometry orders are attempted.
     wav_map : :class:`~pyspextool.instruments.ishell.wavecal_2d.ProvisionalWavelengthMap`, optional
         Provisional wavelength map from Stage 3.  When provided, its
         solution list is used to resolve placeholder geometry order
         indices to real echelle order numbers.  Required when *geometry*
         contains 0-indexed placeholder order numbers (as produced by
         :meth:`~pyspextool.instruments.ishell.tracing.FlatOrderTrace.to_order_geometry_set`).
+        Valid for both paths.
     n_spectral : int, default 256
         Number of spectral (wavelength) pixels in the output rectified
         grid.  Must be >= 2.
@@ -345,7 +379,7 @@ def build_rectification_indices(
         >= 2.
     n_col_samples : int, default 1024
         Number of detector columns sampled when inverting the wavelength
-        surface to obtain ``src_cols``.  Higher values give a more
+        function to obtain ``src_cols``.  Higher values give a more
         accurate inversion.  Must be >= *n_spectral*.
 
     Returns
@@ -356,14 +390,16 @@ def build_rectification_indices(
     Raises
     ------
     ValueError
-        If *geometry* is empty, *surface* has no fitted orders, no orders
-        are found in common between *geometry* and *surface*, or
+        If both *surface* and *wavelength_func* are provided, or neither
+        is provided.
+    ValueError
+        If *geometry* is empty, no orders are found in common, or
         *n_spectral* < 2, *n_spatial* < 2, or *n_col_samples* < *n_spectral*.
 
     Warns
     -----
     RuntimeWarning
-        If the sampled wavelength surface for any order is not
+        If the sampled wavelength grid for any order is not
         monotone in detector column.  The column inversion may be
         inaccurate in that case.
 
@@ -373,12 +409,9 @@ def build_rectification_indices(
 
     For each order *i*:
 
-    1. Sample the refined surface at ``n_col_samples`` detector columns
+    1. Sample the wavelength function at ``n_col_samples`` detector columns
        spanning ``[x_start, x_end]`` to obtain a dense
-       ``(col, wavelength)`` curve::
-
-           cols  = np.linspace(x_start, x_end, n_col_samples)
-           wavs  = surface.eval_array(order_numbers, cols)
+       ``(col, wavelength)`` curve.
 
     2. Sort by wavelength and build a uniform output wavelength axis::
 
@@ -400,7 +433,7 @@ def build_rectification_indices(
                                     - bottom_edge(src_cols[i]))
            )
 
-    **Order matching**
+    **Order matching (scaffold path)**
 
     Orders are matched by echelle order number.  If *wav_map* is provided,
     it is used to build a mapping from geometry placeholder index to real
@@ -412,10 +445,28 @@ def build_rectification_indices(
     this is expected for real data where some orders lack enough arc-line
     matches.  A :exc:`ValueError` is raised only if *no* orders are found
     in common.
+
+    **Order matching (K3 1DXD path)**
+
+    Same placeholder-index resolution as the scaffold path (via *wav_map*
+    if provided).  If *fitted_order_numbers* is given, only orders whose
+    echelle order number appears in that list are processed; others are
+    skipped silently.
     """
     # ------------------------------------------------------------------
     # Input validation
     # ------------------------------------------------------------------
+    if surface is not None and wavelength_func is not None:
+        raise ValueError(
+            "Provide either 'surface' (scaffold path) or 'wavelength_func' "
+            "(K3 1DXD path), not both."
+        )
+    if surface is None and wavelength_func is None:
+        raise ValueError(
+            "Either 'surface' (scaffold path) or 'wavelength_func' "
+            "(K3 1DXD path) must be provided."
+        )
+
     if n_spectral < 2:
         raise ValueError(f"n_spectral must be >= 2; got {n_spectral}")
     if n_spatial < 2:
@@ -426,24 +477,31 @@ def build_rectification_indices(
         )
 
     n_geom = geometry.n_orders
-    n_surf = len(surface.per_order_order_numbers)
 
     if n_geom == 0:
         raise ValueError("geometry contains no orders")
-    if n_surf == 0:
-        raise ValueError(
-            "surface has no fitted orders (per_order_order_numbers is empty)"
-        )
 
     # ------------------------------------------------------------------
-    # Build order-number → surface-index lookup
+    # Scaffold path: validate surface
     # ------------------------------------------------------------------
-    # Order numbers are treated as integers; floating-point representation
-    # differences are rounded away.
-    surf_order_lookup: dict[int, int] = {
-        int(round(float(on))): i
-        for i, on in enumerate(surface.per_order_order_numbers)
-    }
+    surf_order_lookup: dict[int, int] = {}
+    if surface is not None:
+        n_surf = len(surface.per_order_order_numbers)
+        if n_surf == 0:
+            raise ValueError(
+                "surface has no fitted orders (per_order_order_numbers is empty)"
+            )
+        surf_order_lookup = {
+            int(round(float(on))): i
+            for i, on in enumerate(surface.per_order_order_numbers)
+        }
+
+    # ------------------------------------------------------------------
+    # 1DXD path: build the set of covered order numbers
+    # ------------------------------------------------------------------
+    func_order_set: Optional[set[int]] = None
+    if wavelength_func is not None and fitted_order_numbers is not None:
+        func_order_set = set(int(o) for o in fitted_order_numbers)
 
     # ------------------------------------------------------------------
     # Build geometry-order → echelle-order-number mapping
@@ -464,9 +522,6 @@ def build_rectification_indices(
     # ------------------------------------------------------------------
     # Build per-order indices
     # ------------------------------------------------------------------
-    # Iterate over geometry orders; skip those without a surface fit.
-    # This naturally handles real data where some orders have too few arc
-    # lines to be included in the surface fit.
     index_orders: list[RectificationIndexOrder] = []
 
     for geom in geometry.geometries:
@@ -474,17 +529,35 @@ def build_rectification_indices(
         if echelle_order is None:
             # No wav_map entry for this geometry order; skip.
             continue
-        surf_i = surf_order_lookup.get(echelle_order)
-        if surf_i is None:
-            # No surface fit for this echelle order; skip silently.
-            continue
-        order_index = len(index_orders)  # position in the output set
-        order_number = float(surface.per_order_order_numbers[surf_i])
 
-        # Step 1: sample the wavelength surface across the column range.
+        # ---- Select wavelength evaluation method ----
+        if wavelength_func is not None:
+            # K3 1DXD path: check order is covered
+            if func_order_set is not None and echelle_order not in func_order_set:
+                continue
+            order_number = float(echelle_order)
+
+            def _eval_wav(col_grid, _order_number=order_number):  # noqa: E731
+                return wavelength_func(col_grid, _order_number)
+
+        else:
+            # Scaffold path: look up in surface
+            surf_i = surf_order_lookup.get(echelle_order)
+            if surf_i is None:
+                # No surface fit for this echelle order; skip silently.
+                continue
+            order_number = float(surface.per_order_order_numbers[surf_i])  # type: ignore[union-attr]
+
+            def _eval_wav(col_grid, _order_number=order_number):  # noqa: E731
+                return surface.eval_array(  # type: ignore[union-attr]
+                    np.full(len(col_grid), _order_number), col_grid
+                )
+
+        order_index = len(index_orders)  # position in the output set
+
+        # Step 1: sample the wavelength function across the column range.
         col_grid = np.linspace(float(geom.x_start), float(geom.x_end), n_col_samples)
-        order_grid = np.full(n_col_samples, order_number)
-        wav_grid = surface.eval_array(order_grid, col_grid)
+        wav_grid = _eval_wav(col_grid)
 
         # Check for non-monotonicity and warn.
         diffs = np.diff(wav_grid)
@@ -534,10 +607,19 @@ def build_rectification_indices(
         )
 
     if len(index_orders) == 0:
+        if wavelength_func is not None:
+            raise ValueError(
+                "No orders matched between geometry and wavelength_func.  "
+                f"Geometry orders: {geometry.orders}.  "
+                f"fitted_order_numbers: {fitted_order_numbers}.  "
+                "If the geometry uses placeholder 0-indexed order numbers, pass "
+                "the ProvisionalWavelengthMap as wav_map to supply the real "
+                "order-number correspondence."
+            )
         raise ValueError(
             "No orders matched between geometry and surface.  "
             f"Geometry orders: {geometry.orders}.  "
-            f"Surface order numbers: {list(surface.per_order_order_numbers)}.  "
+            f"Surface order numbers: {list(surface.per_order_order_numbers)}.  "  # type: ignore[union-attr]
             "If the geometry uses placeholder 0-indexed order numbers, pass "
             "the ProvisionalWavelengthMap as wav_map to supply the real "
             "order-number correspondence."
