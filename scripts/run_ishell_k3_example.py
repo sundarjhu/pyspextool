@@ -1366,6 +1366,202 @@ def _plot_k3_1dxd_qa(
 
 
 # ---------------------------------------------------------------------------
+# K3 1DXD residual QA plot — point-based (primary 1DXD QA artifact)
+# ---------------------------------------------------------------------------
+
+
+def _plot_k3_1dxd_residuals(
+    k3_model: "IdlStyle1DXDModel",
+    out_dir: str,
+    save: bool,
+    prefix: str,
+) -> Optional[str]:
+    """Point-based K3 1DXD residual QA plot.
+
+    Uses the explicit matched-point arrays stored on the model to produce the
+    primary K3 1DXD QA figure.  The output file is named::
+
+        {prefix}_k3_1dxd_residuals.png
+
+    Panels
+    ------
+    1. Residuals vs detector column  — accepted (blue ●) and rejected (red ×)
+    2. Residuals vs echelle order    — accepted (blue ●) and rejected (red ×)
+    3. Residual histogram (accepted) with optional rejected overlay
+    4. Summary annotation box with ntot / nacc / nrej / RMS / median
+
+    All residual axes are in **nm** (nanometres).
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        cols_all   = k3_model.matched_cols_px
+        orders_all = k3_model.matched_order_numbers
+        resid_all  = k3_model.matched_residual_um * 1e3  # µm → nm
+        mask       = k3_model.accepted_mask
+
+        cols_acc  = cols_all[mask]
+        cols_rej  = cols_all[~mask]
+        orders_acc = orders_all[mask]
+        orders_rej = orders_all[~mask]
+        resid_acc  = resid_all[mask]
+        resid_rej  = resid_all[~mask]
+
+        ntot = k3_model.n_lines_total
+        nacc = k3_model.n_lines
+        nrej = k3_model.n_lines_rejected
+        rms_nm   = k3_model.fit_rms_um * 1e3
+        med_nm   = k3_model.median_residual_um * 1e3
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+        # ----------------------------------------------------------------
+        # Panel 1: residuals vs detector column
+        # ----------------------------------------------------------------
+        ax = axes[0, 0]
+        if len(cols_acc) > 0:
+            ax.scatter(cols_acc, resid_acc, s=8, color="steelblue",
+                       alpha=0.7, label="Accepted")
+        if len(cols_rej) > 0:
+            ax.scatter(cols_rej, resid_rej, s=14, color="tomato",
+                       marker="x", linewidths=1.0, alpha=0.9, label="Rejected (σ-clip)")
+        ax.axhline(0.0, color="k", lw=0.6, ls="--")
+        ax.set_xlabel("Detector column (pixels)")
+        ax.set_ylabel("Residual (nm)")
+        ax.set_title("Residuals vs detector column")
+        ax.legend(fontsize=8)
+
+        # ----------------------------------------------------------------
+        # Panel 2: residuals vs echelle order
+        # ----------------------------------------------------------------
+        ax = axes[0, 1]
+        if len(orders_acc) > 0:
+            ax.scatter(orders_acc, resid_acc, s=8, color="steelblue",
+                       alpha=0.7, label="Accepted")
+        if len(orders_rej) > 0:
+            ax.scatter(orders_rej, resid_rej, s=14, color="tomato",
+                       marker="x", linewidths=1.0, alpha=0.9, label="Rejected (σ-clip)")
+        ax.axhline(0.0, color="k", lw=0.6, ls="--")
+        ax.set_xlabel("Echelle order number")
+        ax.set_ylabel("Residual (nm)")
+        ax.set_title("Residuals vs echelle order")
+        ax.legend(fontsize=8)
+
+        # ----------------------------------------------------------------
+        # Panel 3: residual histogram (accepted), rejected overlay
+        # ----------------------------------------------------------------
+        ax = axes[1, 0]
+        if len(resid_acc) > 0:
+            ax.hist(resid_acc, bins=30, color="steelblue", alpha=0.7,
+                    label="Accepted")
+        if len(resid_rej) > 0:
+            ax.hist(resid_rej, bins=20, color="tomato", alpha=0.5,
+                    label="Rejected (σ-clip)")
+        ax.axvline(0.0, color="k", lw=0.8, ls="--")
+        ax.axvline(rms_nm, color="steelblue", lw=1.0, ls=":",
+                   label=f"+RMS = {rms_nm:.3f} nm")
+        ax.axvline(-rms_nm, color="steelblue", lw=1.0, ls=":")
+        ax.set_xlabel("Residual (nm)")
+        ax.set_ylabel("Count")
+        ax.set_title("Residual histogram (accepted + rejected)")
+        ax.legend(fontsize=7)
+
+        # ----------------------------------------------------------------
+        # Panel 4: summary annotation
+        # ----------------------------------------------------------------
+        ax = axes[1, 1]
+        ax.axis("off")
+        summary = (
+            "Python K3 1DXD QA\n"
+            "────────────────────────\n"
+            f"wdeg = {k3_model.wdeg},  odeg = {k3_model.odeg}\n"
+            f"ntot  = {ntot}\n"
+            f"nacc  = {nacc}\n"
+            f"nrej  = {nrej}\n"
+            f"RMS   = {rms_nm:.4f} nm\n"
+            f"median= {med_nm:.4f} nm\n"
+            f"Orders: {k3_model.n_orders_fit}\n"
+        )
+        ax.text(
+            0.05, 0.95, summary,
+            transform=ax.transAxes, va="top", ha="left",
+            fontsize=9, fontfamily="monospace",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+        )
+
+        fig.suptitle(
+            "Python K3 1DXD QA — residuals from sigma-clipped global fit\n"
+            "NOTE: preliminary — not IDL-equivalent",
+            fontsize=10,
+        )
+        fig.tight_layout()
+
+        out_path: Optional[str] = None
+        if save:
+            out_path = os.path.join(out_dir, f"{prefix}_k3_1dxd_residuals.png")
+            fig.savefig(out_path, dpi=120, bbox_inches="tight")
+            print(f"  [QA] Saved: {out_path}")
+        else:
+            plt.show()
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        print(f"  [QA] K3 1DXD residuals plot skipped: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# K3 1DXD global summary metadata export
+# ---------------------------------------------------------------------------
+
+
+def _export_1dxd_global_summary(
+    k3_model: "IdlStyle1DXDModel",
+    out_dir: str,
+    prefix: str,
+) -> str:
+    """Write K3 1DXD global summary metadata to a JSON sidecar file.
+
+    The file is named::
+
+        {prefix}_k3_1dxd_summary.json
+
+    Schema
+    ------
+    ::
+
+        {
+          "n_lines_total":      int,
+          "n_lines_accepted":   int,
+          "n_lines_rejected":   int,
+          "fit_rms_um":         float,
+          "median_residual_um": float,
+          "lambda_degree":      int,
+          "order_degree":       int,
+          "fitted_order_numbers": [int, ...],
+          "mode":               str
+        }
+
+    Returns the path of the written file.
+    """
+    data = {
+        "n_lines_total":       k3_model.n_lines_total,
+        "n_lines_accepted":    k3_model.n_lines,
+        "n_lines_rejected":    k3_model.n_lines_rejected,
+        "fit_rms_um":          k3_model.fit_rms_um,
+        "median_residual_um":  k3_model.median_residual_um,
+        "lambda_degree":       k3_model.wdeg,
+        "order_degree":        k3_model.odeg,
+        "fitted_order_numbers": k3_model.fitted_order_numbers,
+        "mode":                k3_model.mode,
+    }
+    out_path = os.path.join(out_dir, f"{prefix}_k3_1dxd_summary.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Main reduction driver
 # ---------------------------------------------------------------------------
 
@@ -1682,6 +1878,7 @@ def run_k3_example(
 
     if not no_plots and k3_model is not None:
         _plot_k3_1dxd_qa(k3_model, out_dir, save=save_plots, prefix=prefix)
+        _plot_k3_1dxd_residuals(k3_model, out_dir, save=save_plots, prefix=prefix)
 
     # ------------------------------------------------------------------
     # Stage 4: Global wavelength surface (scaffold — kept for reference)
@@ -1886,10 +2083,16 @@ def run_k3_example(
             order_diags, out_dir, cfg.diagnostics_format, prefix,
             diags_1dxd=diags_1dxd,
         )
-        print(f"\n  [DIAG] Diagnostics exported to: {diag_path}")
+        print(f"\n  [DIAG] Per-order diagnostics exported to: {diag_path}")
         completed["diagnostics_export"] = True
     else:
         completed["diagnostics_export"] = False
+
+    # Export K3 1DXD global summary JSON (always written when Stage 3b succeeded)
+    if k3_model is not None:
+        summary_path = _export_1dxd_global_summary(k3_model, out_dir, prefix)
+        print(f"  [DIAG] K3 1DXD global summary exported to: {summary_path}")
+        completed["_1dxd_summary_path"] = summary_path  # type: ignore[assignment]
 
     # Expose diagnostics on the returned mapping for programmatic access.
     completed["_order_diagnostics"] = order_diags  # type: ignore[assignment]

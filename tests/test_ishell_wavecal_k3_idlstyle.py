@@ -1375,3 +1375,333 @@ class TestStage6WithoutProvMap:
             n_spectral=16, n_spatial=4,
         )
         assert rect_idx.n_orders == len(order_nums)
+
+
+# ===========================================================================
+# 13. Fit-result structure — matched-point arrays
+# ===========================================================================
+
+
+class TestMatchedPointArrays:
+    """fit_1dxd_wavelength_model returns explicit matched-point arrays."""
+
+    def _run(self):
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import fit_1dxd_wavelength_model
+        return fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+
+    def test_matched_cols_px_exists(self):
+        model = self._run()
+        assert hasattr(model, "matched_cols_px")
+
+    def test_matched_order_numbers_exists(self):
+        model = self._run()
+        assert hasattr(model, "matched_order_numbers")
+
+    def test_matched_ref_wavelength_um_exists(self):
+        model = self._run()
+        assert hasattr(model, "matched_ref_wavelength_um")
+
+    def test_matched_fit_wavelength_um_exists(self):
+        model = self._run()
+        assert hasattr(model, "matched_fit_wavelength_um")
+
+    def test_matched_residual_um_exists(self):
+        model = self._run()
+        assert hasattr(model, "matched_residual_um")
+
+    def test_all_arrays_length_equals_n_lines_total(self):
+        model = self._run()
+        n = model.n_lines_total
+        assert len(model.matched_cols_px) == n
+        assert len(model.matched_order_numbers) == n
+        assert len(model.matched_ref_wavelength_um) == n
+        assert len(model.matched_fit_wavelength_um) == n
+        assert len(model.matched_residual_um) == n
+
+    def test_accepted_mask_length_matches(self):
+        model = self._run()
+        assert len(model.accepted_mask) == model.n_lines_total
+
+    def test_matched_residual_is_ref_minus_fit(self):
+        """matched_residual_um must equal ref - fit."""
+        model = self._run()
+        diff = model.matched_ref_wavelength_um - model.matched_fit_wavelength_um
+        np.testing.assert_allclose(model.matched_residual_um, diff, atol=1e-12)
+
+    def test_accepted_points_rms_matches_fit_rms(self):
+        """RMS of accepted residuals must match model.fit_rms_um."""
+        model = self._run()
+        acc_resid = model.matched_residual_um[model.accepted_mask]
+        if len(acc_resid) > 0:
+            rms = float(np.sqrt(np.mean(acc_resid ** 2)))
+            assert abs(rms - model.fit_rms_um) < 1e-9 * max(rms, 1e-12)
+
+    def test_fit_wavelengths_finite(self):
+        model = self._run()
+        assert np.all(np.isfinite(model.matched_fit_wavelength_um))
+
+    def test_ref_wavelengths_finite(self):
+        model = self._run()
+        assert np.all(np.isfinite(model.matched_ref_wavelength_um))
+
+
+# ===========================================================================
+# 14. Residual QA plot file — integration test (K3 data required)
+# ===========================================================================
+
+
+class TestResidualQAFile:
+    """_plot_k3_1dxd_residuals produces the expected output file."""
+
+    @pytest.mark.skipif(not _HAVE_K3_DATA, reason="K3 raw data not available")
+    def test_residual_qa_file_created(self):
+        import importlib.util
+        import sys
+        import tempfile
+
+        scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "run_ishell_k3_example_resqa",
+            os.path.join(scripts_dir, "run_ishell_k3_example.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        with tempfile.TemporaryDirectory() as tmp_out:
+            completed = mod.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                output_dir=tmp_out,
+                no_plots=False,
+                save_plots=True,
+            )
+            # Check the residual QA file exists if Stage 3b succeeded
+            if completed.get("stage3b_k3_1dxd"):
+                import glob
+                matches = glob.glob(os.path.join(tmp_out, "*k3_1dxd_residuals*"))
+                assert len(matches) >= 1, (
+                    "Expected at least one file matching *k3_1dxd_residuals* "
+                    f"in {tmp_out}, got: {list(os.listdir(tmp_out))}"
+                )
+
+    def test_residual_plot_function_returns_path_when_saving(self):
+        """_plot_k3_1dxd_residuals returns a file path when save=True."""
+        import importlib.util
+        import sys
+        import tempfile
+
+        scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "run_ishell_k3_example_resqa_unit",
+            os.path.join(scripts_dir, "run_ishell_k3_example.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        # Build a minimal IdlStyle1DXDModel with matched arrays
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import IdlStyle1DXDModel
+
+        rng = np.random.default_rng(42)
+        n = 30
+        cols = rng.uniform(0, 2047, n)
+        orders = rng.choice([203, 215, 229], n).astype(float)
+        ref_wavs = rng.uniform(2.0, 2.5, n)
+        fit_wavs = ref_wavs + rng.normal(0, 0.001, n)
+        resid = ref_wavs - fit_wavs
+        mask = np.abs(resid) < 0.003
+
+        model = IdlStyle1DXDModel(
+            mode="K3", wdeg=3, odeg=2, order_ref=203.0,
+            coeffs=np.zeros((4, 3)), fitted_order_numbers=[203, 215, 229],
+            fit_rms_um=float(np.sqrt(np.mean(resid[mask] ** 2))),
+            n_lines=int(np.sum(mask)), n_lines_total=n,
+            n_lines_rejected=int(np.sum(~mask)),
+            accepted_mask=mask, median_residual_um=float(np.median(resid[mask])),
+            n_orders_fit=3,
+            matched_cols_px=cols,
+            matched_order_numbers=orders,
+            matched_ref_wavelength_um=ref_wavs,
+            matched_fit_wavelength_um=fit_wavs,
+            matched_residual_um=resid,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = mod._plot_k3_1dxd_residuals(model, tmp, save=True, prefix="test")
+            assert out is not None
+            assert os.path.isfile(out)
+            assert "k3_1dxd_residuals" in os.path.basename(out)
+
+
+# ===========================================================================
+# 15. Global metadata export
+# ===========================================================================
+
+
+class TestGlobalMetadataExport:
+    """_export_1dxd_global_summary writes required fields to JSON."""
+
+    def _make_model_for_export(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import IdlStyle1DXDModel
+        n = 20
+        return IdlStyle1DXDModel(
+            mode="K3", wdeg=3, odeg=2, order_ref=203.0,
+            coeffs=np.zeros((4, 3)), fitted_order_numbers=[203, 215, 229],
+            fit_rms_um=0.00015, n_lines=18, n_lines_total=n,
+            n_lines_rejected=2, accepted_mask=np.ones(n, dtype=bool),
+            median_residual_um=0.00002, n_orders_fit=3,
+        )
+
+    def test_summary_file_created(self):
+        import importlib.util
+        import sys
+        import tempfile
+
+        scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "run_ishell_k3_example_summary",
+            os.path.join(scripts_dir, "run_ishell_k3_example.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        model = self._make_model_for_export()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = mod._export_1dxd_global_summary(model, tmp, "test")
+            assert os.path.isfile(path)
+            assert path.endswith(".json")
+
+    def test_summary_contains_required_fields(self):
+        import json as _json
+        import importlib.util
+        import sys
+        import tempfile
+
+        scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "run_ishell_k3_example_summary2",
+            os.path.join(scripts_dir, "run_ishell_k3_example.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        model = self._make_model_for_export()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = mod._export_1dxd_global_summary(model, tmp, "test")
+            with open(path) as fh:
+                data = _json.load(fh)
+
+        required = [
+            "n_lines_total",
+            "n_lines_accepted",
+            "n_lines_rejected",
+            "fit_rms_um",
+            "median_residual_um",
+            "lambda_degree",
+            "order_degree",
+            "fitted_order_numbers",
+        ]
+        for field in required:
+            assert field in data, f"Missing required field: {field!r}"
+
+    def test_summary_values_correct(self):
+        import json as _json
+        import importlib.util
+        import sys
+        import tempfile
+
+        scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "run_ishell_k3_example_summary3",
+            os.path.join(scripts_dir, "run_ishell_k3_example.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        model = self._make_model_for_export()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = mod._export_1dxd_global_summary(model, tmp, "test")
+            with open(path) as fh:
+                data = _json.load(fh)
+
+        assert data["n_lines_total"] == model.n_lines_total
+        assert data["n_lines_accepted"] == model.n_lines
+        assert data["n_lines_rejected"] == model.n_lines_rejected
+        assert data["lambda_degree"] == model.wdeg
+        assert data["order_degree"] == model.odeg
+        assert data["fitted_order_numbers"] == model.fitted_order_numbers
+
+    @pytest.mark.skipif(not _HAVE_K3_DATA, reason="K3 raw data not available")
+    def test_summary_written_by_run(self):
+        """run_k3_example always writes the global summary JSON when Stage 3b runs."""
+        import importlib.util
+        import sys
+        import tempfile
+
+        scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "run_ishell_k3_example_summary_run",
+            os.path.join(scripts_dir, "run_ishell_k3_example.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        with tempfile.TemporaryDirectory() as tmp_out:
+            completed = mod.run_k3_example(
+                raw_dir=_K3_RAW_DIR,
+                output_dir=tmp_out,
+                no_plots=True,
+            )
+            if completed.get("stage3b_k3_1dxd"):
+                import glob
+                matches = glob.glob(os.path.join(tmp_out, "*k3_1dxd_summary.json"))
+                assert len(matches) >= 1, (
+                    "Expected global summary JSON when Stage 3b succeeded"
+                )
+
+
+# ===========================================================================
+# 16. Regression — existing per-order export still works
+# ===========================================================================
+
+
+class TestPerOrderExportRegression:
+    """Existing per-order diagnostics export is not broken."""
+
+    def test_csv_export_still_works(self):
+        """_export_diagnostics still writes CSV correctly after new changes."""
+        import csv as _csv
+        import tempfile
+        import sys
+        import importlib.util
+
+        scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "run_ishell_k3_example_reg",
+            os.path.join(scripts_dir, "run_ishell_k3_example.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        mock_diag = mod.OrderCalibrationDiagnostics(
+            order_number=215,
+            n_candidate=10, n_accepted=8, n_rejected=2,
+            poly_degree_requested=3, poly_degree_used=3,
+            fit_rms_nm=0.05, skipped=False, non_monotonic=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = mod._export_diagnostics(
+                [mock_diag], tmp, "csv", "test",
+            )
+            assert os.path.isfile(path)
+            with open(path, newline="") as fh:
+                rows = list(_csv.DictReader(fh))
+        assert len(rows) == 1
+        assert int(rows[0]["order_number"]) == 215

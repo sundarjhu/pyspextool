@@ -265,11 +265,32 @@ class IdlStyle1DXDModel:
         Number of orders that contributed at least one accepted match.
     per_order_stats : list of :class:`OrderMatchStats`
         Per-order match statistics (one entry per order in *spectra_set*).
+    matched_cols_px : ndarray, shape (n_lines_total,)
+        Detector column of each matched arc-line point (before or after the
+        xcorr shift correction; the value stored is the detected peak column).
+    matched_order_numbers : ndarray, shape (n_lines_total,)
+        Echelle order number for each matched point.
+    matched_ref_wavelength_um : ndarray, shape (n_lines_total,)
+        Reference catalogue wavelength (µm) for each matched point.
+    matched_fit_wavelength_um : ndarray, shape (n_lines_total,)
+        Wavelength predicted by the **final** (sigma-clipped) fit for each
+        matched point (µm).
+    matched_residual_um : ndarray, shape (n_lines_total,)
+        Residual ``ref - fit`` (µm) for each matched point from the final fit.
+        Accepted points satisfy ``|residual| ≤ sigma_thresh × rms``.
 
     Notes
     -----
     Use :meth:`eval` (scalar) or :meth:`eval_array` (vectorised) to predict
     wavelength at arbitrary ``(col, order)`` combinations.
+
+    The five ``matched_*`` arrays all have the same length ``n_lines_total``
+    and are aligned element-wise with ``accepted_mask``.  To recover accepted
+    vs rejected subsets::
+
+        cols_acc  = model.matched_cols_px[model.accepted_mask]
+        cols_rej  = model.matched_cols_px[~model.accepted_mask]
+        resid_acc = model.matched_residual_um[model.accepted_mask]
     """
 
     mode: str
@@ -286,6 +307,22 @@ class IdlStyle1DXDModel:
     median_residual_um: float
     n_orders_fit: int
     per_order_stats: list[OrderMatchStats] = field(default_factory=list)
+    # Per-point arrays aligned with accepted_mask (length = n_lines_total)
+    matched_cols_px: npt.NDArray = field(
+        default_factory=lambda: np.empty(0, dtype=float)
+    )
+    matched_order_numbers: npt.NDArray = field(
+        default_factory=lambda: np.empty(0, dtype=float)
+    )
+    matched_ref_wavelength_um: npt.NDArray = field(
+        default_factory=lambda: np.empty(0, dtype=float)
+    )
+    matched_fit_wavelength_um: npt.NDArray = field(
+        default_factory=lambda: np.empty(0, dtype=float)
+    )
+    matched_residual_um: npt.NDArray = field(
+        default_factory=lambda: np.empty(0, dtype=float)
+    )
 
     # ------------------------------------------------------------------
     # Coordinate helper
@@ -844,6 +881,12 @@ def fit_1dxd_wavelength_model(
     )
     n_orders_fit_final = len(fitted_orders_final)
 
+    # ------------------------------------------------------------------
+    # Build per-point arrays for reproducible QA
+    # ------------------------------------------------------------------
+    # matched_fit_wavelength_um: predicted wavelength from the final fit
+    matched_fit_wavs = _build_design(cols_arr, vs) @ c_flat_final
+
     logger.info(
         "fit_1dxd_wavelength_model: wdeg=%d, odeg=%d, "
         "total=%d acc=%d rej=%d rms=%.4f nm",
@@ -866,6 +909,11 @@ def fit_1dxd_wavelength_model(
         median_residual_um=median_residual_um,
         n_orders_fit=n_orders_fit_final,
         per_order_stats=per_order_stats,
+        matched_cols_px=cols_arr,
+        matched_order_numbers=orders_arr,
+        matched_ref_wavelength_um=wavs_arr,
+        matched_fit_wavelength_um=matched_fit_wavs,
+        matched_residual_um=residuals_all_final,
     )
 
 

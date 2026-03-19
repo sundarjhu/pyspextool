@@ -212,20 +212,66 @@ The wavecal output filename is controlled by `--wavecal-output-name` (default
 
 ### QA plots (Python scaffold)
 
-All plots are labelled *"Python scaffold QA"* to distinguish them from the
-IDL Spextool manual figures.  The prefix is controlled by `--qa-plot-prefix`
-(default `qa`).
+All plots are labelled *"Python scaffold QA"* or *"Python K3 1DXD QA"* to
+distinguish them from the IDL Spextool manual figures.  The prefix is
+controlled by `--qa-plot-prefix` (default `qa`).
 
 | File (default prefix) | Description | Manual analogue |
 |-----------------------|-------------|-----------------|
 | `qa_flat_orders.png` | Smooth fitted order-centre curves overlaid on the combined flat (27 science orders) | — |
 | `qa_arc_lines.png` | Traced arc-line seed positions overlaid on the combined arc | — |
-| `qa_wavecal_residuals.png` | Residuals vs order/column (accepted=blue, rejected=red×), histogram, per-order line count with RMS labels | **Figure 3** (1DXD QA plot) |
+| `qa_wavecal_residuals.png` | Residuals vs order/column (accepted=blue, rejected=red×), histogram, per-order line count with RMS labels | **Figure 3** (1DXD QA plot, scaffold path) |
 | `qa_2d_coeff_fit.png` | Arc-line position cloud, tilt-slope map, wavelength solution curves, residual map | **Figures 4–7** (2DCoeffFit.pdf, partial) |
 | `qa_rectified_order.png` | First available rectified order flux image | — |
+| `qa_k3_1dxd_qa.png` | K3 1DXD summary QA: xcorr shifts, accepted/rejected bar chart, per-order RMS, global summary text | — |
+| **`qa_k3_1dxd_residuals.png`** | **Primary K3 1DXD QA**: point-based residuals vs column, residuals vs order, histogram of accepted/rejected residuals (nm), global summary box (ntot/nacc/nrej/RMS/median) | **Figure 3 analogue** |
+
+> `qa_k3_1dxd_residuals.png` is the **primary K3 1DXD QA artifact**.
+> It is built directly from the per-point arrays stored on `IdlStyle1DXDModel`
+> (`matched_cols_px`, `matched_order_numbers`, `matched_residual_um`,
+> `accepted_mask`).  All residuals are in **nm**.
 
 See [K3 order-filtering rule](#k3-order-filtering-rule) for why only 27 orders
 appear in the flat-orders plot.
+
+### Diagnostics exports
+
+Two separate files are written when Stage 3b succeeds:
+
+| File | Content | When written |
+|------|---------|--------------|
+| `qa_order_diagnostics.{csv,json}` | Per-order row table (scaffold fields + 1DXD fields) | `--export-diagnostics` flag |
+| **`qa_k3_1dxd_summary.json`** | Global K3 1DXD summary metadata | **Always** when Stage 3b succeeds |
+
+#### Per-order diagnostics (`qa_order_diagnostics.*`)
+
+Written only when `--export-diagnostics` is passed.  Row schema (CSV columns /
+JSON keys):
+
+```
+order_number, n_candidate, n_accepted, n_rejected, poly_degree_requested,
+poly_degree_used, fit_rms_nm, skipped, non_monotonic,
+1dxd_xcorr_shift_px, 1dxd_n_candidate, 1dxd_n_matched, 1dxd_n_accepted,
+1dxd_n_rejected, 1dxd_rms_nm, 1dxd_participated
+```
+
+#### K3 1DXD global summary (`qa_k3_1dxd_summary.json`)
+
+Written unconditionally when Stage 3b succeeds (no flag required).  Schema:
+
+```json
+{
+  "n_lines_total":       int,
+  "n_lines_accepted":    int,
+  "n_lines_rejected":    int,
+  "fit_rms_um":          float,
+  "median_residual_um":  float,
+  "lambda_degree":       int,
+  "order_degree":        int,
+  "fitted_order_numbers": [int, ...],
+  "mode":                str
+}
+```
 
 ---
 

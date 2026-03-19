@@ -140,6 +140,38 @@ The `IdlStyle1DXDModel` dataclass stores:
 - `accepted_mask`, `median_residual_um`
 - `per_order_stats`: list of `OrderMatchStats`
 
+### Explicit matched-point arrays
+
+To support reproducible QA without depending on hidden local variables inside
+the fit function, `IdlStyle1DXDModel` also stores the raw matched-point data
+as explicit arrays.  All five arrays have the same length `n_lines_total` and
+are aligned element-wise with `accepted_mask`:
+
+| Field | Shape | Description |
+|-------|-------|-------------|
+| `matched_cols_px` | `(n_lines_total,)` | Detector column of each matched peak |
+| `matched_order_numbers` | `(n_lines_total,)` | Echelle order number for each point |
+| `matched_ref_wavelength_um` | `(n_lines_total,)` | Reference catalogue wavelength (µm) |
+| `matched_fit_wavelength_um` | `(n_lines_total,)` | Wavelength from the **final** clipped fit (µm) |
+| `matched_residual_um` | `(n_lines_total,)` | Residual `ref − fit` (µm) |
+
+`accepted_mask[i] = True` means point `i` survived sigma clipping and
+contributed to the final fit.
+
+To recover accepted vs rejected subsets:
+
+```python
+cols_acc  = model.matched_cols_px[model.accepted_mask]
+cols_rej  = model.matched_cols_px[~model.accepted_mask]
+resid_acc = model.matched_residual_um[model.accepted_mask]
+```
+
+**Why storing these arrays is necessary**: the residual QA plot
+(`qa_k3_1dxd_residuals.png`) and the global summary export
+(`qa_k3_1dxd_summary.json`) both need the per-point information.  Without
+explicit arrays the QA plot would have to reconstruct residuals by re-evaluating
+the model, which is fragile and imprecise (floating-point ordering).
+
 ### Evaluation
 
 ```python
