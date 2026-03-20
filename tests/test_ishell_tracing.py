@@ -207,8 +207,11 @@ class TestOrderTraceStatsDataclass:
             order_index=2,
             rms_residual=1.5,
             curvature_metric=2e-4,
-            min_separation=35.0,
-            is_monotonic=True,
+            oscillation_metric=0.005,
+            min_sep_lower=35.0,
+            min_sep_upper=38.0,
+            crosses_lower=False,
+            crosses_upper=False,
             trace_valid=True,
         )
 
@@ -221,11 +224,20 @@ class TestOrderTraceStatsDataclass:
     def test_curvature_metric(self, dummy_stats):
         assert dummy_stats.curvature_metric == pytest.approx(2e-4)
 
-    def test_min_separation(self, dummy_stats):
-        assert dummy_stats.min_separation == pytest.approx(35.0)
+    def test_oscillation_metric(self, dummy_stats):
+        assert dummy_stats.oscillation_metric == pytest.approx(0.005)
 
-    def test_is_monotonic(self, dummy_stats):
-        assert dummy_stats.is_monotonic is True
+    def test_min_sep_lower(self, dummy_stats):
+        assert dummy_stats.min_sep_lower == pytest.approx(35.0)
+
+    def test_min_sep_upper(self, dummy_stats):
+        assert dummy_stats.min_sep_upper == pytest.approx(38.0)
+
+    def test_crosses_lower_false(self, dummy_stats):
+        assert dummy_stats.crosses_lower is False
+
+    def test_crosses_upper_false(self, dummy_stats):
+        assert dummy_stats.crosses_upper is False
 
     def test_trace_valid(self, dummy_stats):
         assert dummy_stats.trace_valid is True
@@ -235,8 +247,11 @@ class TestOrderTraceStatsDataclass:
             order_index=0,
             rms_residual=float("nan"),
             curvature_metric=float("nan"),
-            min_separation=float("nan"),
-            is_monotonic=False,
+            oscillation_metric=float("nan"),
+            min_sep_lower=float("nan"),
+            min_sep_upper=float("nan"),
+            crosses_lower=False,
+            crosses_upper=False,
             trace_valid=False,
         )
         assert s.trace_valid is False
@@ -268,8 +283,11 @@ class TestFlatOrderTraceOrderStatsDefault:
             order_index=0,
             rms_residual=1.0,
             curvature_metric=1e-4,
-            min_separation=40.0,
-            is_monotonic=True,
+            oscillation_metric=0.002,
+            min_sep_lower=float("nan"),
+            min_sep_upper=40.0,
+            crosses_lower=False,
+            crosses_upper=False,
             trace_valid=True,
         )
         trace = FlatOrderTrace(
@@ -502,27 +520,70 @@ class TestTraceOrdersFromFlatSynthetic:
             if np.isfinite(s.curvature_metric):
                 assert s.curvature_metric >= 0.0
 
-    def test_is_monotonic_true_for_nearly_linear_synthetic_orders(self, trace):
-        """Synthetic orders have a small positive tilt; derivative should not flip."""
+    def test_oscillation_metric_nonnegative_for_synthetic_orders(self, trace):
+        """Synthetic orders have a small linear tilt; oscillation should be tiny."""
         for s in trace.order_stats:
-            assert s.is_monotonic is True, (
-                f"Order {s.order_index} unexpectedly non-monotonic"
-            )
-
-    def test_min_separation_positive_for_well_separated_orders(self, trace):
-        """Synthetic orders are spaced 40 rows apart; separations should be large."""
-        for s in trace.order_stats:
-            if np.isfinite(s.min_separation):
-                assert s.min_separation > 0.0, (
-                    f"Order {s.order_index}: min_separation should be positive"
+            if np.isfinite(s.oscillation_metric):
+                assert s.oscillation_metric >= 0.0, (
+                    f"Order {s.order_index}: oscillation_metric must be non-negative"
                 )
 
-    def test_first_and_last_orders_have_finite_min_separation(self, trace):
-        """With 5 orders every order has at least one neighbour."""
+    def test_oscillation_metric_small_for_nearly_linear_orders(self, trace):
+        """Synthetic orders with a 0.01 px/col tilt should have near-zero oscillation."""
         for s in trace.order_stats:
-            assert np.isfinite(s.min_separation), (
-                f"Order {s.order_index}: expected finite min_separation"
+            if np.isfinite(s.oscillation_metric):
+                assert s.oscillation_metric < 0.05, (
+                    f"Order {s.order_index}: oscillation_metric={s.oscillation_metric:.4f} "
+                    "unexpectedly large for a nearly-linear synthetic trace"
+                )
+
+    def test_min_sep_lower_upper_nonnegative(self, trace):
+        """Absolute separations must never be negative."""
+        for s in trace.order_stats:
+            if np.isfinite(s.min_sep_lower):
+                assert s.min_sep_lower >= 0.0, (
+                    f"Order {s.order_index}: min_sep_lower must be non-negative"
+                )
+            if np.isfinite(s.min_sep_upper):
+                assert s.min_sep_upper >= 0.0, (
+                    f"Order {s.order_index}: min_sep_upper must be non-negative"
+                )
+
+    def test_min_sep_large_for_well_separated_synthetic_orders(self, trace):
+        """Synthetic orders are spaced 40 rows apart; separations should be large."""
+        for s in trace.order_stats:
+            if np.isfinite(s.min_sep_lower):
+                assert s.min_sep_lower > 20.0, (
+                    f"Order {s.order_index}: min_sep_lower={s.min_sep_lower:.1f} "
+                    "unexpectedly small for 40-row-spaced synthetic orders"
+                )
+            if np.isfinite(s.min_sep_upper):
+                assert s.min_sep_upper > 20.0, (
+                    f"Order {s.order_index}: min_sep_upper={s.min_sep_upper:.1f} "
+                    "unexpectedly small for 40-row-spaced synthetic orders"
+                )
+
+    def test_no_crossings_for_well_separated_synthetic_orders(self, trace):
+        """Well-separated synthetic orders must not cross any neighbour."""
+        for s in trace.order_stats:
+            assert not s.crosses_lower, (
+                f"Order {s.order_index}: unexpected crosses_lower=True"
             )
+            assert not s.crosses_upper, (
+                f"Order {s.order_index}: unexpected crosses_upper=True"
+            )
+
+    def test_inner_orders_have_finite_both_separations(self, trace):
+        """Orders that are not first or last should have both sep values finite."""
+        for s in trace.order_stats:
+            if s.order_index > 0:
+                assert np.isfinite(s.min_sep_lower), (
+                    f"Order {s.order_index}: expected finite min_sep_lower"
+                )
+            if s.order_index < trace.n_orders - 1:
+                assert np.isfinite(s.min_sep_upper), (
+                    f"Order {s.order_index}: expected finite min_sep_upper"
+                )
 
     def test_trace_valid_true_for_synthetic_data(self, trace):
         """All synthetic orders should pass QA checks."""
@@ -530,7 +591,9 @@ class TestTraceOrdersFromFlatSynthetic:
             assert s.trace_valid is True, (
                 f"Order {s.order_index} unexpectedly flagged invalid: "
                 f"rms={s.rms_residual:.3f}, curv={s.curvature_metric:.2e}, "
-                f"sep={s.min_separation:.1f}, mono={s.is_monotonic}"
+                f"osc={s.oscillation_metric:.4f}, "
+                f"sep_lo={s.min_sep_lower:.1f}, sep_hi={s.min_sep_upper:.1f}, "
+                f"x_lo={s.crosses_lower}, x_hi={s.crosses_upper}"
             )
 
 

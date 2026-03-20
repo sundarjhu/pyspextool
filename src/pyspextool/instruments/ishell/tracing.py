@@ -129,7 +129,8 @@ logger = logging.getLogger(__name__)
 
 _RMS_THRESHOLD: float = 5.0          # px -- flag if rms_residual exceeds this
 _CURVATURE_THRESHOLD: float = 1e-3   # px/col^2 -- flag if max |d2y/dx2| exceeds this
-_SEPARATION_THRESHOLD: float = 3.0   # px -- flag if min inter-order gap drops below this
+_SEPARATION_THRESHOLD: float = 3.0   # px -- flag if min absolute inter-order gap drops below this
+_OSCILLATION_THRESHOLD: float = 0.05 # px/col -- flag if peak-to-peak slope variation exceeds this
 
 
 # ---------------------------------------------------------------------------
@@ -157,24 +158,38 @@ class OrderTraceStats:
     curvature_metric : float
         Maximum absolute second derivative of the fitted polynomial
         evaluated at the sample columns (px / col²).  Large values
-        indicate unrealistic curvature.  ``NaN`` if the fit failed.
-    min_separation : float
-        Minimum vertical separation to the nearest neighbouring order
-        across all sample columns, in pixels.  Negative values mean the
-        trace has crossed a neighbour.  ``NaN`` if the order has no
-        neighbours or its own fit failed.
-    is_monotonic : bool
-        ``True`` if the first derivative of the fitted polynomial does not
-        change sign across the sample columns (no oscillatory behaviour).
-        ``False`` if the fit failed.
+        indicate unrealistic bending.  ``NaN`` if the fit failed.
+    oscillation_metric : float
+        Peak-to-peak variation in the first derivative (slope) of the
+        fitted polynomial across the sample columns (px / col).  For a
+        straight trace this is zero; large values flag oscillatory or
+        pathologically curved polynomials.  ``NaN`` if the fit failed.
+    min_sep_lower : float
+        Minimum *absolute* vertical separation to the lower-row neighbouring
+        order across all sample columns, in pixels.  ``NaN`` if this order
+        has no lower neighbour or the fit failed.  Always ≥ 0.
+    min_sep_upper : float
+        Minimum *absolute* vertical separation to the upper-row neighbouring
+        order across all sample columns, in pixels.  ``NaN`` if this order
+        has no upper neighbour or the fit failed.  Always ≥ 0.
+    crosses_lower : bool
+        ``True`` if the fitted centre curve crosses (or touches) the lower
+        neighbouring order at any sample column.  ``False`` if there is no
+        lower neighbour or the fit failed.
+    crosses_upper : bool
+        ``True`` if the fitted centre curve crosses (or touches) the upper
+        neighbouring order at any sample column.  ``False`` if there is no
+        upper neighbour or the fit failed.
     trace_valid : bool
         Composite validity flag.  ``True`` if *all* of the following hold:
 
         * ``rms_residual`` is finite and ≤ ``_RMS_THRESHOLD`` (5 px).
         * ``curvature_metric`` ≤ ``_CURVATURE_THRESHOLD`` (1 × 10⁻³ px/col²).
-        * ``is_monotonic`` is ``True``.
-        * ``min_separation`` is ``NaN`` (no neighbours) *or*
-          ≥ ``_SEPARATION_THRESHOLD`` (3 px).
+        * ``oscillation_metric`` ≤ ``_OSCILLATION_THRESHOLD`` (0.05 px/col).
+        * ``min_sep_lower`` is ``NaN`` *or* ≥ ``_SEPARATION_THRESHOLD`` (3 px).
+        * ``min_sep_upper`` is ``NaN`` *or* ≥ ``_SEPARATION_THRESHOLD`` (3 px).
+        * ``crosses_lower`` is ``False``.
+        * ``crosses_upper`` is ``False``.
 
     Notes
     -----
@@ -185,8 +200,11 @@ class OrderTraceStats:
     order_index: int
     rms_residual: float
     curvature_metric: float
-    min_separation: float
-    is_monotonic: bool
+    oscillation_metric: float
+    min_sep_lower: float
+    min_sep_upper: float
+    crosses_lower: bool
+    crosses_upper: bool
     trace_valid: bool
 
 
@@ -822,6 +840,7 @@ def _compute_order_trace_stats(
     rms_threshold: float = _RMS_THRESHOLD,
     curvature_threshold: float = _CURVATURE_THRESHOLD,
     separation_threshold: float = _SEPARATION_THRESHOLD,
+    oscillation_threshold: float = _OSCILLATION_THRESHOLD,
 ) -> list[OrderTraceStats]:
     """Compute per-order QA metrics for traced order-centre polynomials.
 
@@ -839,7 +858,9 @@ def _compute_order_trace_stats(
     curvature_threshold : float, default ``_CURVATURE_THRESHOLD``
         Maximum acceptable second derivative of the polynomial (px / col²).
     separation_threshold : float, default ``_SEPARATION_THRESHOLD``
-        Minimum acceptable inter-order separation in pixels.
+        Minimum acceptable absolute inter-order separation in pixels.
+    oscillation_threshold : float, default ``_OSCILLATION_THRESHOLD``
+        Maximum acceptable peak-to-peak slope variation (px / col).
 
     Returns
     -------
@@ -883,38 +904,61 @@ def _compute_order_trace_stats(
                 curvature_metric = float(np.max(d2_vals))
 
         # ------------------------------------------------------------------
-        # 2. Monotonicity: no sign flip in the first derivative.
+        # 2. Oscillation metric: peak-to-peak variation in the first
+        #    derivative (slope) across the sample columns.  A straight trace
+        #    gives 0; oscillatory or pathologically curved polynomials give
+        #    large values.  This replaces the previous boolean monotonicity
+        #    test, which incorrectly flagged even gently curved traces.
         # ------------------------------------------------------------------
         if not fit_ok:
-            is_monotonic = False
+            oscillation_metric = np.nan
         else:
             d1_coeffs = np.polynomial.polynomial.polyder(coeffs, 1)
             if d1_coeffs.size == 0:
-                is_monotonic = True
+                oscillation_metric = 0.0
             else:
                 d1_vals = np.polynomial.polynomial.polyval(cols, d1_coeffs)
-                nonzero = d1_vals[d1_vals != 0.0]
-                if nonzero.size < 2:
-                    is_monotonic = True
-                else:
-                    is_monotonic = bool(
-                        np.all(np.diff(np.sign(nonzero)) == 0)
-                    )
+                oscillation_metric = float(np.max(d1_vals) - np.min(d1_vals))
 
         # ------------------------------------------------------------------
-        # 3. Inter-order separation: minimum gap to the nearest neighbour.
+        # 3. Inter-order separation: absolute gap to each adjacent neighbour.
+        #    Reports lower and upper neighbours separately, and flags any
+        #    crossing explicitly.  Uses nanmin so that isolated NaN columns
+        #    (missed peaks in center_vals) do not discard an entire neighbour.
         # ------------------------------------------------------------------
         if n_orders <= 1 or not fit_ok:
-            min_separation = np.nan
+            min_sep_lower = np.nan
+            min_sep_upper = np.nan
+            crosses_lower = False
+            crosses_upper = False
         else:
-            seps = []
-            if i > 0 and np.all(np.isfinite(center_vals[i - 1])):
+            # Lower neighbour (smaller row values, index i-1).
+            if i > 0 and np.any(np.isfinite(center_vals[i - 1])):
                 gap = center_vals[i] - center_vals[i - 1]
-                seps.append(float(np.min(gap)))
-            if i < n_orders - 1 and np.all(np.isfinite(center_vals[i + 1])):
+                finite_mask = np.isfinite(gap)
+                if np.any(finite_mask):
+                    min_sep_lower = float(np.min(np.abs(gap[finite_mask])))
+                    crosses_lower = bool(np.any(gap[finite_mask] < 0))
+                else:
+                    min_sep_lower = np.nan
+                    crosses_lower = False
+            else:
+                min_sep_lower = np.nan
+                crosses_lower = False
+
+            # Upper neighbour (larger row values, index i+1).
+            if i < n_orders - 1 and np.any(np.isfinite(center_vals[i + 1])):
                 gap = center_vals[i + 1] - center_vals[i]
-                seps.append(float(np.min(gap)))
-            min_separation = float(min(seps)) if seps else np.nan
+                finite_mask = np.isfinite(gap)
+                if np.any(finite_mask):
+                    min_sep_upper = float(np.min(np.abs(gap[finite_mask])))
+                    crosses_upper = bool(np.any(gap[finite_mask] < 0))
+                else:
+                    min_sep_upper = np.nan
+                    crosses_upper = False
+            else:
+                min_sep_upper = np.nan
+                crosses_upper = False
 
         # ------------------------------------------------------------------
         # 4. Composite validity flag.
@@ -923,17 +967,27 @@ def _compute_order_trace_stats(
         curv_ok = np.isfinite(curvature_metric) and (
             curvature_metric <= curvature_threshold
         )
-        mono_ok = is_monotonic
-        sep_ok = np.isnan(min_separation) or min_separation >= separation_threshold
-        trace_valid = bool(rms_ok and curv_ok and mono_ok and sep_ok)
+        osc_ok = np.isfinite(oscillation_metric) and (
+            oscillation_metric <= oscillation_threshold
+        )
+        sep_ok = (
+            (np.isnan(min_sep_lower) or min_sep_lower >= separation_threshold)
+            and (np.isnan(min_sep_upper) or min_sep_upper >= separation_threshold)
+            and not crosses_lower
+            and not crosses_upper
+        )
+        trace_valid = bool(rms_ok and curv_ok and osc_ok and sep_ok)
 
         stats_list.append(
             OrderTraceStats(
                 order_index=i,
                 rms_residual=rms,
                 curvature_metric=curvature_metric,
-                min_separation=min_separation,
-                is_monotonic=is_monotonic,
+                oscillation_metric=oscillation_metric,
+                min_sep_lower=min_sep_lower,
+                min_sep_upper=min_sep_upper,
+                crosses_lower=crosses_lower,
+                crosses_upper=crosses_upper,
                 trace_valid=trace_valid,
             )
         )
@@ -944,8 +998,9 @@ def _compute_order_trace_stats(
 def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
     """Log a concise per-order QA summary after tracing.
 
-    Orders that would be considered invalid are clearly marked with
-    ``*** INVALID ***`` so they are easy to spot in the log output.
+    Orders that fail any QA check are clearly marked with ``*** INVALID ***``
+    and the specific failing checks are listed so they are easy to spot in
+    the log output.
 
     Parameters
     ----------
@@ -956,9 +1011,12 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
         return
 
     header = (
-        "  {:>5}  {:>9}  {:>11}  {:>10}  {:>9}  {}"
-    ).format("Order", "RMS(px)", "Curv(p/c²)", "MinSep(px)", "Monotonic", "Valid")
-    separator = "  " + "-" * 64
+        "  {:>5}  {:>9}  {:>11}  {:>10}  {:>9}  {:>9}  {:>6}  {:>6}  {}"
+    ).format(
+        "Order", "RMS(px)", "Curv(p/c²)", "Osc(p/c)",
+        "SepLo(px)", "SepHi(px)", "XLo", "XHi", "Valid"
+    )
+    separator = "  " + "-" * 88
 
     logger.info("Per-order trace QA summary:")
     logger.info(header)
@@ -971,19 +1029,55 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
             if np.isfinite(s.curvature_metric)
             else "        NaN"
         )
-        sep_str = (
-            f"{s.min_separation:10.1f}"
-            if np.isfinite(s.min_separation)
+        osc_str = (
+            f"{s.oscillation_metric:10.4f}"
+            if np.isfinite(s.oscillation_metric)
             else "       NaN"
         )
-        flag = "" if s.trace_valid else "  *** INVALID ***"
+        sep_lo_str = (
+            f"{s.min_sep_lower:9.1f}"
+            if np.isfinite(s.min_sep_lower)
+            else "      NaN"
+        )
+        sep_hi_str = (
+            f"{s.min_sep_upper:9.1f}"
+            if np.isfinite(s.min_sep_upper)
+            else "      NaN"
+        )
+        xlo_str = f"{'Y' if s.crosses_lower else 'N':>6}"
+        xhi_str = f"{'Y' if s.crosses_upper else 'N':>6}"
+
+        # Build a short failure reason string for invalid orders.
+        if not s.trace_valid:
+            reasons = []
+            if not (np.isfinite(s.rms_residual) and s.rms_residual <= _RMS_THRESHOLD):
+                reasons.append("RMS")
+            if not (np.isfinite(s.curvature_metric) and s.curvature_metric <= _CURVATURE_THRESHOLD):
+                reasons.append("Curv")
+            if not (np.isfinite(s.oscillation_metric) and s.oscillation_metric <= _OSCILLATION_THRESHOLD):
+                reasons.append("Osc")
+            if np.isfinite(s.min_sep_lower) and s.min_sep_lower < _SEPARATION_THRESHOLD:
+                reasons.append("SepLo")
+            if np.isfinite(s.min_sep_upper) and s.min_sep_upper < _SEPARATION_THRESHOLD:
+                reasons.append("SepHi")
+            if s.crosses_lower:
+                reasons.append("XLo")
+            if s.crosses_upper:
+                reasons.append("XHi")
+            flag = f"  *** INVALID ({', '.join(reasons)}) ***"
+        else:
+            flag = ""
+
         line = (
-            "  {:>5}  {}  {}  {}  {:>9}  {}{}".format(
+            "  {:>5}  {}  {}  {}  {}  {}  {}  {}  {}{}".format(
                 s.order_index,
                 rms_str,
                 curv_str,
-                sep_str,
-                str(s.is_monotonic),
+                osc_str,
+                sep_lo_str,
+                sep_hi_str,
+                xlo_str,
+                xhi_str,
                 str(s.trace_valid),
                 flag,
             )
