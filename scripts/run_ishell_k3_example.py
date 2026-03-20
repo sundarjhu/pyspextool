@@ -1262,6 +1262,7 @@ def _plot_k3_1dxd_qa(
     """
     try:
         import matplotlib.pyplot as plt
+        import numpy as np
 
         # -- Reconstruct all point coordinates from the accepted_mask ----
         # We need to rebuild them from the model's stats; the raw arrays
