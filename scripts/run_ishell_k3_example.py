@@ -722,10 +722,15 @@ def _plot_flat_orders(
 ) -> None:
     """Python scaffold QA: traced order centres overlaid on the combined flat.
 
-    The overlay shows **smooth polynomial curves** evaluated continuously
-    across the full column range of each order, so the fitted trace is
-    clearly visible.  Sparse sampled points are overlaid in a lighter
-    style for reference.
+    The overlay shows:
+    - **Smooth polynomial curves** (solid colored lines) evaluated across
+      the full column range, so the stable fitted trace is clearly visible.
+    - **Accepted sample points** (small white dots) – columns where a peak
+      was successfully detected and included in the polynomial fit.
+    - **Rejected / missed sample positions** (small red plus markers) –
+      columns where no peak was found (NaN in center_rows), shown at the
+      row position predicted by the polynomial so they sit on the trace
+      line and make the gap obvious.
     """
     try:
         import matplotlib
@@ -753,19 +758,57 @@ def _plot_flat_orders(
             coeffs = trace.center_poly_coeffs[i]
             centers_smooth = np.polynomial.polynomial.polyval(col_range, coeffs)
             ax.plot(col_range, centers_smooth, lw=0.9, alpha=0.85)
-            # Overlay sampled points in a light grey for reference
+
+            # Accepted sample points: where a peak was detected
+            valid_mask = np.isfinite(trace.center_rows[i])
             ax.plot(
-                trace.sample_cols,
-                trace.center_rows[i],
+                trace.sample_cols[valid_mask],
+                trace.center_rows[i][valid_mask],
                 ".",
                 ms=2,
-                alpha=0.25,
+                alpha=0.3,
                 color="white",
             )
 
+            # Rejected/missed positions: NaN in center_rows.
+            # Show at the polynomial-predicted row so they overlay the
+            # trace line and reveal where coverage is absent.
+            nan_mask = ~valid_mask
+            if np.any(nan_mask):
+                nan_cols = trace.sample_cols[nan_mask].astype(float)
+                nan_rows_pred = np.polynomial.polynomial.polyval(nan_cols, coeffs)
+                ax.plot(
+                    nan_cols,
+                    nan_rows_pred,
+                    "+",
+                    ms=3,
+                    alpha=0.45,
+                    color="red",
+                    markeredgewidth=0.7,
+                )
+
+        # Fallback-degree annotation: mark orders that used a reduced degree
+        if len(trace.poly_degrees_used) == trace.n_orders:
+            max_deg = int(trace.poly_degree)
+            for i in range(trace.n_orders):
+                deg = int(trace.poly_degrees_used[i])
+                if deg < max_deg:
+                    coeffs = trace.center_poly_coeffs[i]
+                    seed_col = float(trace.seed_col)
+                    y_seed = float(
+                        np.polynomial.polynomial.polyval(seed_col, coeffs)
+                    )
+                    ax.text(
+                        seed_col, y_seed,
+                        f"d{deg}",
+                        fontsize=5, color="yellow", alpha=0.8,
+                        ha="center", va="bottom",
+                    )
+
         ax.set_title(
             "Python scaffold QA — K3 flat: traced order centres\n"
-            f"({trace.n_orders} science orders, smooth polynomial curves)"
+            f"({trace.n_orders} orders | white=accepted, red+=missed peaks, "
+            f"yellow=fallback degree)"
         )
         ax.set_xlabel("Column (pixels)")
         ax.set_ylabel("Row (pixels)")
