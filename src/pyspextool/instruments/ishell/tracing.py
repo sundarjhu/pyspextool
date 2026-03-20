@@ -115,6 +115,7 @@ from .geometry import OrderGeometry, OrderGeometrySet
 
 __all__ = [
     "FlatOrderTrace",
+    "OrderTraceStats",
     "trace_orders_from_flat",
     "load_and_combine_flats",
 ]
@@ -123,8 +124,70 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Public result dataclass
+# QA thresholds (module-level defaults)
 # ---------------------------------------------------------------------------
+
+_RMS_THRESHOLD: float = 5.0          # px -- flag if rms_residual exceeds this
+_CURVATURE_THRESHOLD: float = 1e-3   # px/col^2 -- flag if max |d2y/dx2| exceeds this
+_SEPARATION_THRESHOLD: float = 3.0   # px -- flag if min inter-order gap drops below this
+
+
+# ---------------------------------------------------------------------------
+# Public result dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OrderTraceStats:
+    """Per-order QA metrics from the flat-field order tracing stage.
+
+    These metrics provide visibility into the quality of each traced
+    order-centre polynomial **before** any orders are rejected.  They are
+    stored in :attr:`FlatOrderTrace.order_stats` and printed as a concise
+    summary log after tracing completes.
+
+    Attributes
+    ----------
+    order_index : int
+        Zero-based index of the order within :class:`FlatOrderTrace`.
+    rms_residual : float
+        RMS of the polynomial fit residuals in pixels.  Equals
+        :attr:`FlatOrderTrace.fit_rms[order_index]`.  ``NaN`` if the
+        polynomial fit failed (too few valid sample points).
+    curvature_metric : float
+        Maximum absolute second derivative of the fitted polynomial
+        evaluated at the sample columns (px / col²).  Large values
+        indicate unrealistic curvature.  ``NaN`` if the fit failed.
+    min_separation : float
+        Minimum vertical separation to the nearest neighbouring order
+        across all sample columns, in pixels.  Negative values mean the
+        trace has crossed a neighbour.  ``NaN`` if the order has no
+        neighbours or its own fit failed.
+    is_monotonic : bool
+        ``True`` if the first derivative of the fitted polynomial does not
+        change sign across the sample columns (no oscillatory behaviour).
+        ``False`` if the fit failed.
+    trace_valid : bool
+        Composite validity flag.  ``True`` if *all* of the following hold:
+
+        * ``rms_residual`` is finite and ≤ ``_RMS_THRESHOLD`` (5 px).
+        * ``curvature_metric`` ≤ ``_CURVATURE_THRESHOLD`` (1 × 10⁻³ px/col²).
+        * ``is_monotonic`` is ``True``.
+        * ``min_separation`` is ``NaN`` (no neighbours) *or*
+          ≥ ``_SEPARATION_THRESHOLD`` (3 px).
+
+    Notes
+    -----
+    Setting ``trace_valid = False`` does **not** remove the order from
+    downstream processing; it is a diagnostic flag only.
+    """
+
+    order_index: int
+    rms_residual: float
+    curvature_metric: float
+    min_separation: float
+    is_monotonic: bool
+    trace_valid: bool
 
 
 @dataclass
@@ -158,6 +221,11 @@ class FlatOrderTrace:
         Degree of the fitted centre-line polynomials.
     seed_col : int
         Detector column used to locate initial order-centre seeds.
+    order_stats : list of OrderTraceStats
+        Per-order QA metrics computed immediately after polynomial fitting.
+        See :class:`OrderTraceStats` for the available fields.  Empty if
+        the result was constructed directly without calling
+        :func:`trace_orders_from_flat`.
 
     Notes
     -----
@@ -176,6 +244,7 @@ class FlatOrderTrace:
     half_width_rows: np.ndarray
     poly_degree: int
     seed_col: int
+    order_stats: list[OrderTraceStats] = field(default_factory=list)
 
     def to_order_geometry_set(
         self,
@@ -431,6 +500,14 @@ def trace_orders_from_flat(
     # ------------------------------------------------------------------
     half_width_rows = _estimate_half_widths(seed_profile, seed_peaks)
 
+    # ------------------------------------------------------------------
+    # 8. Compute per-order QA metrics
+    # ------------------------------------------------------------------
+    order_stats = _compute_order_trace_stats(
+        center_poly_coeffs, fit_rms, sample_cols,
+    )
+    _log_trace_qa_summary(order_stats)
+
     logger.info(
         "Order tracing complete: %d orders, median RMS = %.2f px",
         n_orders,
@@ -446,6 +523,7 @@ def trace_orders_from_flat(
         half_width_rows=half_width_rows,
         poly_degree=poly_degree,
         seed_col=seed_col,
+        order_stats=order_stats,
     )
 
 
@@ -734,3 +812,190 @@ def _estimate_half_widths(
         half_widths[i] = (right - left) / 2.0
 
     return half_widths
+
+
+def _compute_order_trace_stats(
+    center_poly_coeffs: npt.NDArray,
+    fit_rms: npt.NDArray,
+    sample_cols: npt.NDArray,
+    *,
+    rms_threshold: float = _RMS_THRESHOLD,
+    curvature_threshold: float = _CURVATURE_THRESHOLD,
+    separation_threshold: float = _SEPARATION_THRESHOLD,
+) -> list[OrderTraceStats]:
+    """Compute per-order QA metrics for traced order-centre polynomials.
+
+    Parameters
+    ----------
+    center_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1)
+        Per-order polynomial coefficients in ``numpy.polynomial.polynomial``
+        convention.
+    fit_rms : ndarray, shape (n_orders,)
+        RMS of polynomial residuals per order.  ``NaN`` marks failed fits.
+    sample_cols : ndarray, shape (n_sample,)
+        Detector column indices at which the polynomial is evaluated.
+    rms_threshold : float, default ``_RMS_THRESHOLD``
+        Maximum acceptable RMS residual in pixels.
+    curvature_threshold : float, default ``_CURVATURE_THRESHOLD``
+        Maximum acceptable second derivative of the polynomial (px / col²).
+    separation_threshold : float, default ``_SEPARATION_THRESHOLD``
+        Minimum acceptable inter-order separation in pixels.
+
+    Returns
+    -------
+    list of OrderTraceStats
+        One entry per order.
+    """
+    n_orders = len(fit_rms)
+    cols = sample_cols.astype(float)
+
+    # Pre-compute centre-row positions at all sample columns.
+    # Use NaN rows where the polynomial fit failed so they do not
+    # corrupt inter-order separation calculations.
+    center_vals = np.full((n_orders, len(cols)), np.nan)
+    for i in range(n_orders):
+        if np.isfinite(fit_rms[i]):
+            center_vals[i] = np.polynomial.polynomial.polyval(
+                cols, center_poly_coeffs[i]
+            )
+
+    stats_list: list[OrderTraceStats] = []
+
+    for i in range(n_orders):
+        coeffs = center_poly_coeffs[i]
+        rms = float(fit_rms[i])
+        fit_ok = np.isfinite(rms)
+
+        # ------------------------------------------------------------------
+        # 1. Curvature metric: max |d²y/dx²| evaluated at sample columns.
+        #    Uses numpy.polynomial.polynomial.polyder to differentiate.
+        # ------------------------------------------------------------------
+        if not fit_ok:
+            curvature_metric = np.nan
+        else:
+            d2_coeffs = np.polynomial.polynomial.polyder(coeffs, 2)
+            if d2_coeffs.size == 0:
+                curvature_metric = 0.0
+            else:
+                d2_vals = np.abs(
+                    np.polynomial.polynomial.polyval(cols, d2_coeffs)
+                )
+                curvature_metric = float(np.max(d2_vals))
+
+        # ------------------------------------------------------------------
+        # 2. Monotonicity: no sign flip in the first derivative.
+        # ------------------------------------------------------------------
+        if not fit_ok:
+            is_monotonic = False
+        else:
+            d1_coeffs = np.polynomial.polynomial.polyder(coeffs, 1)
+            if d1_coeffs.size == 0:
+                is_monotonic = True
+            else:
+                d1_vals = np.polynomial.polynomial.polyval(cols, d1_coeffs)
+                nonzero = d1_vals[d1_vals != 0.0]
+                if nonzero.size < 2:
+                    is_monotonic = True
+                else:
+                    is_monotonic = bool(
+                        np.all(np.diff(np.sign(nonzero)) == 0)
+                    )
+
+        # ------------------------------------------------------------------
+        # 3. Inter-order separation: minimum gap to the nearest neighbour.
+        # ------------------------------------------------------------------
+        if n_orders <= 1 or not fit_ok:
+            min_separation = np.nan
+        else:
+            seps = []
+            if i > 0 and np.all(np.isfinite(center_vals[i - 1])):
+                gap = center_vals[i] - center_vals[i - 1]
+                seps.append(float(np.min(gap)))
+            if i < n_orders - 1 and np.all(np.isfinite(center_vals[i + 1])):
+                gap = center_vals[i + 1] - center_vals[i]
+                seps.append(float(np.min(gap)))
+            min_separation = float(min(seps)) if seps else np.nan
+
+        # ------------------------------------------------------------------
+        # 4. Composite validity flag.
+        # ------------------------------------------------------------------
+        rms_ok = fit_ok and rms <= rms_threshold
+        curv_ok = np.isfinite(curvature_metric) and (
+            curvature_metric <= curvature_threshold
+        )
+        mono_ok = is_monotonic
+        sep_ok = np.isnan(min_separation) or min_separation >= separation_threshold
+        trace_valid = bool(rms_ok and curv_ok and mono_ok and sep_ok)
+
+        stats_list.append(
+            OrderTraceStats(
+                order_index=i,
+                rms_residual=rms,
+                curvature_metric=curvature_metric,
+                min_separation=min_separation,
+                is_monotonic=is_monotonic,
+                trace_valid=trace_valid,
+            )
+        )
+
+    return stats_list
+
+
+def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
+    """Log a concise per-order QA summary after tracing.
+
+    Orders that would be considered invalid are clearly marked with
+    ``*** INVALID ***`` so they are easy to spot in the log output.
+
+    Parameters
+    ----------
+    stats : list of OrderTraceStats
+        Per-order statistics returned by :func:`_compute_order_trace_stats`.
+    """
+    if not stats:
+        return
+
+    header = (
+        "  {:>5}  {:>9}  {:>11}  {:>10}  {:>9}  {}"
+    ).format("Order", "RMS(px)", "Curv(p/c²)", "MinSep(px)", "Monotonic", "Valid")
+    separator = "  " + "-" * 64
+
+    logger.info("Per-order trace QA summary:")
+    logger.info(header)
+    logger.info(separator)
+
+    for s in stats:
+        rms_str = f"{s.rms_residual:9.3f}" if np.isfinite(s.rms_residual) else "      NaN"
+        curv_str = (
+            f"{s.curvature_metric:11.2e}"
+            if np.isfinite(s.curvature_metric)
+            else "        NaN"
+        )
+        sep_str = (
+            f"{s.min_separation:10.1f}"
+            if np.isfinite(s.min_separation)
+            else "       NaN"
+        )
+        flag = "" if s.trace_valid else "  *** INVALID ***"
+        line = (
+            "  {:>5}  {}  {}  {}  {:>9}  {}{}".format(
+                s.order_index,
+                rms_str,
+                curv_str,
+                sep_str,
+                str(s.is_monotonic),
+                str(s.trace_valid),
+                flag,
+            )
+        )
+        logger.info(line)
+
+    n_invalid = sum(1 for s in stats if not s.trace_valid)
+    if n_invalid:
+        logger.warning(
+            "%d / %d order(s) flagged as potentially invalid (not rejected).",
+            n_invalid,
+            len(stats),
+        )
+    else:
+        logger.info("All %d orders passed QA checks.", len(stats))

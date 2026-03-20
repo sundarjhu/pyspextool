@@ -28,6 +28,7 @@ from astropy.io import fits
 
 from pyspextool.instruments.ishell.tracing import (
     FlatOrderTrace,
+    OrderTraceStats,
     load_and_combine_flats,
     trace_orders_from_flat,
 )
@@ -190,6 +191,100 @@ class TestFlatOrderTraceDataclass:
         geom = dummy_trace.to_order_geometry_set("H1")
         for i, g in enumerate(geom.geometries):
             assert g.order == i
+
+
+# ---------------------------------------------------------------------------
+# 1b. OrderTraceStats dataclass API
+# ---------------------------------------------------------------------------
+
+
+class TestOrderTraceStatsDataclass:
+    """OrderTraceStats can be constructed and queried directly."""
+
+    @pytest.fixture()
+    def dummy_stats(self):
+        return OrderTraceStats(
+            order_index=2,
+            rms_residual=1.5,
+            curvature_metric=2e-4,
+            min_separation=35.0,
+            is_monotonic=True,
+            trace_valid=True,
+        )
+
+    def test_order_index(self, dummy_stats):
+        assert dummy_stats.order_index == 2
+
+    def test_rms_residual(self, dummy_stats):
+        assert dummy_stats.rms_residual == pytest.approx(1.5)
+
+    def test_curvature_metric(self, dummy_stats):
+        assert dummy_stats.curvature_metric == pytest.approx(2e-4)
+
+    def test_min_separation(self, dummy_stats):
+        assert dummy_stats.min_separation == pytest.approx(35.0)
+
+    def test_is_monotonic(self, dummy_stats):
+        assert dummy_stats.is_monotonic is True
+
+    def test_trace_valid(self, dummy_stats):
+        assert dummy_stats.trace_valid is True
+
+    def test_invalid_order_has_trace_valid_false(self):
+        s = OrderTraceStats(
+            order_index=0,
+            rms_residual=float("nan"),
+            curvature_metric=float("nan"),
+            min_separation=float("nan"),
+            is_monotonic=False,
+            trace_valid=False,
+        )
+        assert s.trace_valid is False
+
+
+# ---------------------------------------------------------------------------
+# 1c. FlatOrderTrace.order_stats default
+# ---------------------------------------------------------------------------
+
+
+class TestFlatOrderTraceOrderStatsDefault:
+    """FlatOrderTrace.order_stats defaults to an empty list."""
+
+    def test_order_stats_defaults_to_empty_list(self):
+        trace = FlatOrderTrace(
+            n_orders=2,
+            sample_cols=np.arange(10),
+            center_rows=np.ones((2, 10)) * 50.0,
+            center_poly_coeffs=np.zeros((2, 4)),
+            fit_rms=np.ones(2),
+            half_width_rows=np.full(2, 10.0),
+            poly_degree=3,
+            seed_col=5,
+        )
+        assert trace.order_stats == []
+
+    def test_order_stats_accepts_list_of_stats(self):
+        s = OrderTraceStats(
+            order_index=0,
+            rms_residual=1.0,
+            curvature_metric=1e-4,
+            min_separation=40.0,
+            is_monotonic=True,
+            trace_valid=True,
+        )
+        trace = FlatOrderTrace(
+            n_orders=1,
+            sample_cols=np.arange(10),
+            center_rows=np.ones((1, 10)) * 50.0,
+            center_poly_coeffs=np.zeros((1, 4)),
+            fit_rms=np.ones(1),
+            half_width_rows=np.full(1, 10.0),
+            poly_degree=3,
+            seed_col=5,
+            order_stats=[s],
+        )
+        assert len(trace.order_stats) == 1
+        assert trace.order_stats[0].order_index == 0
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +478,61 @@ class TestTraceOrdersFromFlatSynthetic:
         )
         assert trace1.n_orders == trace3.n_orders
 
+    # ------------------------------------------------------------------
+    # QA stats tests on synthetic data
+    # ------------------------------------------------------------------
+
+    def test_order_stats_length_matches_n_orders(self, trace):
+        assert len(trace.order_stats) == trace.n_orders
+
+    def test_order_stats_indices_sequential(self, trace):
+        for i, s in enumerate(trace.order_stats):
+            assert s.order_index == i
+
+    def test_rms_residual_matches_fit_rms(self, trace):
+        for s in trace.order_stats:
+            expected = float(trace.fit_rms[s.order_index])
+            if np.isfinite(expected):
+                assert s.rms_residual == pytest.approx(expected)
+            else:
+                assert np.isnan(s.rms_residual)
+
+    def test_curvature_metric_nonnegative(self, trace):
+        for s in trace.order_stats:
+            if np.isfinite(s.curvature_metric):
+                assert s.curvature_metric >= 0.0
+
+    def test_is_monotonic_true_for_nearly_linear_synthetic_orders(self, trace):
+        """Synthetic orders have a small positive tilt; derivative should not flip."""
+        for s in trace.order_stats:
+            assert s.is_monotonic is True, (
+                f"Order {s.order_index} unexpectedly non-monotonic"
+            )
+
+    def test_min_separation_positive_for_well_separated_orders(self, trace):
+        """Synthetic orders are spaced 40 rows apart; separations should be large."""
+        for s in trace.order_stats:
+            if np.isfinite(s.min_separation):
+                assert s.min_separation > 0.0, (
+                    f"Order {s.order_index}: min_separation should be positive"
+                )
+
+    def test_first_and_last_orders_have_finite_min_separation(self, trace):
+        """With 5 orders every order has at least one neighbour."""
+        for s in trace.order_stats:
+            assert np.isfinite(s.min_separation), (
+                f"Order {s.order_index}: expected finite min_separation"
+            )
+
+    def test_trace_valid_true_for_synthetic_data(self, trace):
+        """All synthetic orders should pass QA checks."""
+        for s in trace.order_stats:
+            assert s.trace_valid is True, (
+                f"Order {s.order_index} unexpectedly flagged invalid: "
+                f"rms={s.rms_residual:.3f}, curv={s.curvature_metric:.2e}, "
+                f"sep={s.min_separation:.1f}, mono={s.is_monotonic}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # 5. Module import regression
@@ -396,17 +546,20 @@ class TestModuleImport:
         from pyspextool.instruments.ishell import tracing  # noqa: F401
         assert hasattr(tracing, "trace_orders_from_flat")
         assert hasattr(tracing, "FlatOrderTrace")
+        assert hasattr(tracing, "OrderTraceStats")
         assert hasattr(tracing, "load_and_combine_flats")
 
     def test_import_symbols_directly(self):
         from pyspextool.instruments.ishell.tracing import (
             FlatOrderTrace,
+            OrderTraceStats,
             load_and_combine_flats,
             trace_orders_from_flat,
         )
         assert callable(trace_orders_from_flat)
         assert callable(load_and_combine_flats)
         assert FlatOrderTrace is not None
+        assert OrderTraceStats is not None
 
 
 # ---------------------------------------------------------------------------
