@@ -212,20 +212,66 @@ The wavecal output filename is controlled by `--wavecal-output-name` (default
 
 ### QA plots (Python scaffold)
 
-All plots are labelled *"Python scaffold QA"* to distinguish them from the
-IDL Spextool manual figures.  The prefix is controlled by `--qa-plot-prefix`
-(default `qa`).
+All plots are labelled *"Python scaffold QA"* or *"Python K3 1DXD QA"* to
+distinguish them from the IDL Spextool manual figures.  The prefix is
+controlled by `--qa-plot-prefix` (default `qa`).
 
 | File (default prefix) | Description | Manual analogue |
 |-----------------------|-------------|-----------------|
 | `qa_flat_orders.png` | Smooth fitted order-centre curves overlaid on the combined flat (27 science orders) | — |
 | `qa_arc_lines.png` | Traced arc-line seed positions overlaid on the combined arc | — |
-| `qa_wavecal_residuals.png` | Residuals vs order/column (accepted=blue, rejected=red×), histogram, per-order line count with RMS labels | **Figure 3** (1DXD QA plot) |
+| `qa_wavecal_residuals.png` | Residuals vs order/column (accepted=blue, rejected=red×), histogram, per-order line count with RMS labels | **Figure 3** (1DXD QA plot, scaffold path) |
 | `qa_2d_coeff_fit.png` | Arc-line position cloud, tilt-slope map, wavelength solution curves, residual map | **Figures 4–7** (2DCoeffFit.pdf, partial) |
 | `qa_rectified_order.png` | First available rectified order flux image | — |
+| `qa_k3_1dxd_qa.png` | K3 1DXD summary QA: xcorr shifts, accepted/rejected bar chart, per-order RMS, global summary text | — |
+| **`qa_k3_1dxd_residuals.png`** | **Primary K3 1DXD QA**: point-based residuals vs column, residuals vs order, histogram of accepted/rejected residuals (nm), global summary box (ntot/nacc/nrej/RMS/median) | **Figure 3 analogue** |
+
+> `qa_k3_1dxd_residuals.png` is the **primary K3 1DXD QA artifact**.
+> It is built directly from the per-point arrays stored on `IdlStyle1DXDModel`
+> (`matched_cols_px`, `matched_order_numbers`, `matched_residual_um`,
+> `accepted_mask`).  All residuals are in **nm**.
 
 See [K3 order-filtering rule](#k3-order-filtering-rule) for why only 27 orders
 appear in the flat-orders plot.
+
+### Diagnostics exports
+
+Two separate files are written when Stage 3b succeeds:
+
+| File | Content | When written |
+|------|---------|--------------|
+| `qa_order_diagnostics.{csv,json}` | Per-order row table (scaffold fields + 1DXD fields) | `--export-diagnostics` flag |
+| **`qa_k3_1dxd_summary.json`** | Global K3 1DXD summary metadata | **Always** when Stage 3b succeeds |
+
+#### Per-order diagnostics (`qa_order_diagnostics.*`)
+
+Written only when `--export-diagnostics` is passed.  Row schema (CSV columns /
+JSON keys):
+
+```
+order_number, n_candidate, n_accepted, n_rejected, poly_degree_requested,
+poly_degree_used, fit_rms_nm, skipped, non_monotonic,
+1dxd_xcorr_shift_px, 1dxd_n_candidate, 1dxd_n_matched, 1dxd_n_accepted,
+1dxd_n_rejected, 1dxd_rms_nm, 1dxd_participated
+```
+
+#### K3 1DXD global summary (`qa_k3_1dxd_summary.json`)
+
+Written unconditionally when Stage 3b succeeds (no flag required).  Schema:
+
+```json
+{
+  "n_lines_total":       int,
+  "n_lines_accepted":    int,
+  "n_lines_rejected":    int,
+  "fit_rms_um":          float,
+  "median_residual_um":  float,
+  "lambda_degree":       int,
+  "order_degree":        int,
+  "fitted_order_numbers": [int, ...],
+  "mode":                str
+}
+```
 
 ---
 
@@ -234,16 +280,80 @@ appear in the flat-orders plot.
 The following stages map to the IDL Spextool manual's K3 walkthrough and
 are **implemented and exercised** by the benchmark script:
 
-| Stage | Module | Description |
-|-------|--------|-------------|
-| 1 | `tracing.py` | Flat/order-centre tracing from QTH flat frames |
-| 2 | `arc_tracing.py` | 2-D arc-line tracing |
-| 3 | `wavecal_2d.py` | Provisional per-order wavelength mapping |
-| 4 | `wavecal_2d_surface.py` | Global wavelength surface fit |
-| 5 | `wavecal_2d_refine.py` | Coefficient-surface refinement |
-| 6 | `rectification_indices.py` | Rectification-index generation |
-| 7 | `rectified_orders.py` | Rectified order images |
-| 8 | `calibration_fits.py` | Write calibration FITS products |
+| Stage | Module | Description | Role |
+|-------|--------|-------------|------|
+| 1 | `tracing.py` | Flat/order-centre tracing from QTH flat frames | Both paths |
+| 2 | `arc_tracing.py` | 2-D arc-line tracing | Both paths |
+| 3 | `wavecal_2d.py` | Provisional per-order wavelength mapping | Scaffold (reference) |
+| 3b | `wavecal_k3_idlstyle.py` | K3 1DXD 1D extraction + global polynomial fit | **K3 primary** |
+| 4 | `wavecal_2d_surface.py` | Global wavelength surface fit | Scaffold (reference) |
+| 5 | `wavecal_2d_refine.py` | Coefficient-surface refinement | Scaffold (reference) |
+| 6 | `rectification_indices.py` | Rectification-index generation | Driven by Stage 3b |
+| 7 | `rectified_orders.py` | Rectified order images | Downstream of Stage 6 |
+| 8 | `calibration_fits.py` | Write calibration FITS products | Downstream of Stage 6 |
+
+### K3 wavelength calibration path (Stage 3b)
+
+**Stage 3b is the PRIMARY source of truth for wavelength calibration** in the
+K3 benchmark.  Stages 3–5 (scaffold) still execute but their results are used
+for diagnostics and comparison only — they do **not** drive K3 rectification
+or FITS output.
+
+> **Note on IDL parity**: Stage 3b is not yet IDL-equivalent.  It implements
+> the correct algorithmic *structure* (cross-correlation, 1DXD global fit,
+> iterative sigma clipping), but several numerical details differ (see
+> "Remaining differences from IDL" below).
+
+Stage 3b operates as follows:
+
+1. **1D extraction** (`extract_order_arc_spectra`): for each echelle order, the
+   traced centre-line polynomial from Stage 1 (`FlatOrderTrace.center_poly_coeffs`)
+   is evaluated at every detector column.  A symmetric aperture of ±3 pixels is
+   averaged at each column.  This uses **only flat-field geometry** — the arc
+   image is NOT used to estimate the centre row.
+
+2. **Cross-correlation shift** (`_xcorr_order_shift`): a synthetic reference comb
+   (Gaussians at expected arc-line column positions from the coarse `WaveCalInfo`
+   grid) is cross-correlated against the extracted 1D spectrum.  The peak offset
+   gives a per-order pixel shift that is applied before peak matching.  This
+   corrects for any bulk positional offset between the coarse reference and the
+   actual spectrum.  The shift is stored in `OrderMatchStats.xcorr_shift_px`.
+
+3. **Global 1DXD fit** (`fit_1dxd_wavelength_model`): arc-line peaks are
+   detected in the shift-corrected 1D spectra, matched to the reference line
+   list, and a global 2D polynomial is fit:
+
+   ```
+   λ(col, order) = Σ_{i=0}^{3} Σ_{j=0}^{2}  C_{i,j} · col^i · v^j
+   ```
+
+   where `v = order_ref / order` is the normalised inverse-order coordinate.
+
+4. **Iterative sigma clipping**: after the initial fit, points whose residual
+   exceeds `3 × rms` are rejected and the fit is repeated (up to 5 iterations).
+   The model stores `accepted_mask`, `n_lines_total`, `n_lines_rejected`, and
+   per-order RMS in `per_order_stats`.
+
+5. **Rectification** (`build_rectification_indices` with `wavelength_func`): the
+   Stage 3b model is passed as a callable `wavelength_func(cols, order_number)`
+   plus a `geom_order_map` derived directly from `wavecalinfo.orders`.  The
+   scaffold `prov_map` is **not** required for the K3 rectification path.
+
+6. **Order labels**: `RectificationIndexOrder.order` always contains the real
+   echelle order number (e.g. 203–229), not a geometry placeholder index.
+
+See `docs/ishell_k3_1dxd_design.md` for full design documentation.
+
+### Remaining differences from IDL
+
+The following gaps still exist compared to the IDL Spextool K3 path:
+
+| Gap | Impact |
+|-----|--------|
+| Column normalisation | Columns are not normalised to `[-1,+1]` before fitting; IDL coefficients will differ |
+| Sub-pixel centroiding | Peak positions use integer `argmax`; IDL fits a Gaussian/parabola |
+| Tilt correction | Spectral-line tilt is not applied before wavelength assignment |
+| Per-iteration xcorr update | Cross-correlation shift is computed once, not updated after each sigma-clip iteration |
 
 ### First-pass observations on K3 data
 
@@ -252,11 +362,12 @@ are **implemented and exercised** by the benchmark script:
   edge-order filter (see [K3 order-filtering rule](#k3-order-filtering-rule)).
   The 2 dropped orders are partial edge orders clipped at the detector boundary.
 - Arc-line tracing recovers ~300–360 lines across the 27 science orders.
-- The provisional wavelength mapping produces per-order polynomial fits;
-  some orders receive only a low-degree fit due to few matched lines.
-  Per-order accepted-line counts and polynomial degrees are printed in the
-  benchmark output.
-- These are **first-pass scaffold results**, not finalised calibrations.
+- Stage 3b (K3 1DXD) extracts 27 1D arc spectra and fits a global (3,2) polynomial
+  with iterative sigma clipping.  Per-order cross-correlation shifts are printed.
+- The Stage 3b model drives Stage 6 rectification and Stages 7–8 FITS outputs.
+- Stage 6 derives the geometry→echelle order mapping directly from `wavecalinfo.orders`,
+  not from the scaffold `prov_map`.
+- Scaffold stages 3–5 still run and print diagnostics for comparison.
 
 ---
 
@@ -420,14 +531,26 @@ full K3 reduction flow described in the IDL Spextool manual.
 ## Remaining calibration mismatches vs the IDL manual
 
 The following mismatches are **known and documented** as of this benchmark
-pass.  They reflect scaffold-level limitations, not incorrect code:
+pass.  The first group reflects gaps in the K3 1DXD path specifically; the
+second group reflects scaffold-level limitations:
+
+**K3 1DXD path gaps (Stage 3b)**
 
 | Issue | Description |
 |-------|-------------|
-| Residual scale | Provisional 1DXD residuals are larger than the IDL manual's Figure 3 (RMS ~0.019 Å).  This is expected: the Python scaffold uses a coarse line-matching strategy without the full 2DXD surface fit. |
+| Column normalisation | IDL normalises columns to `[-1,+1]` before fitting; raw columns are used here.  Coefficient values will differ from IDL. |
+| Sub-pixel centroiding | Peak positions use integer `argmax`; IDL fits a Gaussian or parabola to obtain sub-pixel accuracy. |
+| Tilt correction | Spectral-line tilt is not applied before wavelength assignment. |
+| Per-iteration xcorr update | Cross-correlation shift is not updated after each sigma-clip iteration. |
+
+**Scaffold/general limitations**
+
+| Issue | Description |
+|-------|-------------|
+| Residual scale | 1DXD residuals are larger than the IDL manual's Figure 3 (RMS ~0.019 Å).  This is expected given the gaps above. |
 | 2DCoeffFit analogue | The `qa_2d_coeff_fit.png` is a partial analogue only.  No model surface overlay, no curvature coefficient panel, and no per-line rejection indicator are currently available. |
-| Non-monotonic wavelength surfaces | Several orders show non-monotonic wavelength surfaces during rectification (logged as `RuntimeWarning`).  These are expected artefacts of the provisional coefficient surface and not a bug in rectification logic. |
-| Order polynomial degree reduction | Some orders use a lower polynomial degree than requested because too few arc lines were accepted.  This degrades the local wavelength solution accuracy. |
+| Non-monotonic wavelength surfaces | Several orders show non-monotonic wavelength surfaces during rectification (logged as `RuntimeWarning`).  These are expected artefacts of the preliminary 1DXD model and not a bug in rectification logic. |
+| Order polynomial degree reduction | Some orders use a lower polynomial degree than requested because too few arc lines were accepted (scaffold path only). |
 
 ---
 

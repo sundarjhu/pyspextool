@@ -48,15 +48,27 @@ Data location (defaults)
 
 Implemented stages
 ------------------
-  Stage 1  – Flat/order-centre tracing  (tracing.py)
-  Stage 2  – Arc-line tracing           (arc_tracing.py)
-  Stage 3  – Provisional wavelength map (wavecal_2d.py)
-  Stage 4  – Global wavelength surface  (wavecal_2d_surface.py)
-  Stage 5  – Coefficient refinement     (wavecal_2d_refine.py)
-  Stage 6  – Rectification indices      (rectification_indices.py)
-  Stage 7  – Rectified order images     (rectified_orders.py)
-  Stage 8  – Calibration FITS products  (calibration_fits.py)
-  QA plots – Python scaffold QA figures (matplotlib)
+  Stage 1  – Flat/order-centre tracing    (tracing.py)
+  Stage 2  – Arc-line tracing             (arc_tracing.py)
+  Stage 3  – Provisional wavelength map   (wavecal_2d.py)          [scaffold]
+  Stage 3b – K3 1DXD wavelength model     (wavecal_k3_idlstyle.py) [K3 primary path]
+  Stage 4  – Global wavelength surface    (wavecal_2d_surface.py)  [scaffold]
+  Stage 5  – Coefficient refinement       (wavecal_2d_refine.py)   [scaffold]
+  Stage 6  – Rectification indices        (rectification_indices.py)
+             (driven by Stage 3b K3 1DXD model; falls back to Stage 5 if 3b fails)
+  Stage 7  – Rectified order images       (rectified_orders.py)
+  Stage 8  – Calibration FITS products    (calibration_fits.py)
+  QA plots – Python scaffold QA figures   (matplotlib)
+
+K3 calibration path
+-------------------
+  For the K3 benchmark, Stage 3b (wavecal_k3_idlstyle.py) is the PRIMARY
+  source of truth for wavelength calibration.  It:
+    1. Extracts 1-D arc spectra using the traced flat-field order geometry.
+    2. Fits a global (wdeg=3, odeg=2) 1DXD polynomial across all orders.
+  The Stage 3b model drives Stage 6 rectification and all downstream outputs.
+  Stages 3–5 (scaffold) run for reference and diagnostics but do NOT drive
+  K3 results.
 
 Not yet implemented in Python
 ------------------------------
@@ -111,6 +123,10 @@ from pyspextool.instruments.ishell.wavecal_2d_surface import (  # noqa: E402
 )
 from pyspextool.instruments.ishell.wavecal_2d_refine import (  # noqa: E402
     fit_refined_coefficient_surface,
+)
+from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (  # noqa: E402
+    extract_order_arc_spectra,
+    fit_1dxd_wavelength_model,
 )
 from pyspextool.instruments.ishell.rectification_indices import (  # noqa: E402
     build_rectification_indices,
@@ -394,6 +410,79 @@ class OrderCalibrationDiagnostics:
     non_monotonic: bool
 
 
+@dataclass
+class OrderDiagnostics1DXD:
+    """Per-order 1DXD diagnostic record.
+
+    Fields specific to the K3 1DXD (Stage 3b) calibration path.  Exported
+    alongside :class:`OrderCalibrationDiagnostics` when ``--export-diagnostics``
+    is specified.
+
+    Parameters
+    ----------
+    order_number : int
+        Echelle order number.
+    xcorr_shift_px : float
+        Cross-correlation column shift (px) applied before peak finding.
+    n_candidate : int
+        Number of peaks found in the 1D arc spectrum.
+    n_matched : int
+        Number of peaks matched to a reference line (before sigma clipping).
+    n_accepted : int
+        Number of matches retained after global sigma clipping.
+    n_rejected : int
+        Number of matches rejected by sigma clipping.
+    rms_resid_nm : float
+        Per-order RMS of the global-fit residuals for accepted points (nm).
+        NaN if this order contributed no accepted points.
+    participated : bool
+        True if this order contributed at least one accepted point.
+    """
+
+    order_number: int
+    xcorr_shift_px: float
+    n_candidate: int
+    n_matched: int
+    n_accepted: int
+    n_rejected: int
+    rms_resid_nm: float
+    participated: bool
+
+
+def _build_1dxd_diagnostics(
+    k3_model: "IdlStyle1DXDModel",
+) -> list["OrderDiagnostics1DXD"]:
+    """Build per-order 1DXD diagnostics from the Stage 3b model.
+
+    Parameters
+    ----------
+    k3_model : IdlStyle1DXDModel
+        Fitted global 1DXD model from Stage 3b.
+
+    Returns
+    -------
+    list of OrderDiagnostics1DXD
+    """
+    diags: list[OrderDiagnostics1DXD] = []
+    for stat in k3_model.per_order_stats:
+        rms_nm = (
+            stat.rms_resid_um * 1000.0
+            if not math.isnan(stat.rms_resid_um) else float("nan")
+        )
+        diags.append(OrderDiagnostics1DXD(
+            order_number=stat.order_number,
+            xcorr_shift_px=stat.xcorr_shift_px,
+            n_candidate=stat.n_candidate,
+            n_matched=stat.n_matched,
+            n_accepted=stat.n_accepted,
+            n_rejected=stat.n_rejected,
+            rms_resid_nm=rms_nm,
+            participated=stat.participated,
+        ))
+    return diags
+
+
+
 def _build_order_diagnostics(
     prov_map: "ProvisionalWavelengthMap",
     non_monotonic_orders: "set[int]",
@@ -495,13 +584,23 @@ def _export_diagnostics(
     out_dir: str,
     fmt: str,
     prefix: str,
+    diags_1dxd: "Optional[list[OrderDiagnostics1DXD]]" = None,
 ) -> str:
     """Write diagnostics to *out_dir* as CSV or JSON.
 
+    When *diags_1dxd* is provided the 1DXD-specific fields are merged into
+    each row (keyed by ``order_number``).
+
     Returns the path of the written file.
     """
-    rows = [
-        {
+    # Build a lookup for 1DXD per-order fields
+    dxd_lookup: dict[int, "OrderDiagnostics1DXD"] = {}
+    if diags_1dxd is not None:
+        dxd_lookup = {d.order_number: d for d in diags_1dxd}
+
+    rows = []
+    for d in diags:
+        row: dict = {
             "order_number": d.order_number,
             "n_candidate": d.n_candidate,
             "n_accepted": d.n_accepted,
@@ -514,8 +613,20 @@ def _export_diagnostics(
             "skipped": d.skipped,
             "non_monotonic": d.non_monotonic,
         }
-        for d in diags
-    ]
+        # Merge 1DXD fields when available
+        dxd = dxd_lookup.get(d.order_number)
+        if dxd is not None:
+            row["1dxd_xcorr_shift_px"] = round(dxd.xcorr_shift_px, 3)
+            row["1dxd_n_candidate"] = dxd.n_candidate
+            row["1dxd_n_matched"] = dxd.n_matched
+            row["1dxd_n_accepted"] = dxd.n_accepted
+            row["1dxd_n_rejected"] = dxd.n_rejected
+            row["1dxd_rms_nm"] = (
+                None if math.isnan(dxd.rms_resid_nm)
+                else round(dxd.rms_resid_nm, 6)
+            )
+            row["1dxd_participated"] = dxd.participated
+        rows.append(row)
 
     if fmt == "json":
         out_path = os.path.join(out_dir, f"{prefix}_order_diagnostics.json")
@@ -1128,6 +1239,329 @@ def _plot_2d_coeff_fit(
 
 
 # ---------------------------------------------------------------------------
+# K3 1DXD QA plot (accepted / rejected, residuals vs order / column)
+# ---------------------------------------------------------------------------
+
+
+def _plot_k3_1dxd_qa(
+    k3_model: "IdlStyle1DXDModel",
+    out_dir: str,
+    save: bool,
+    prefix: str,
+) -> None:
+    """Python K3 1DXD QA — accepted vs rejected points, residual plots.
+
+    Produces a 2×2 figure showing:
+
+    - Panel 1: residuals vs detector column (accepted=blue, rejected=red ×)
+    - Panel 2: residuals vs echelle order  (accepted=blue, rejected=red ×)
+    - Panel 3: residual histogram after sigma clipping
+    - Panel 4: per-order RMS bar chart
+
+    Clearly labelled as *Python K3 1DXD QA* to distinguish from IDL.
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        # -- Reconstruct all point coordinates from the accepted_mask ----
+        # We need to rebuild them from the model's stats; the raw arrays
+        # are not stored in the model, so we recover what we can from
+        # per_order_stats.
+        # For the residual panels we show per-order stats as a proxy.
+
+        stats = k3_model.per_order_stats
+        order_nums = [s.order_number for s in stats]
+        xcorr_shifts = [s.xcorr_shift_px for s in stats]
+        n_acc = [s.n_accepted for s in stats]
+        n_rej = [s.n_rejected for s in stats]
+        rms_vals = [
+            s.rms_resid_um * 1e3  # → nm
+            if not math.isnan(s.rms_resid_um) else float("nan")
+            for s in stats
+        ]
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+        # ----------------------------------------------------------------
+        # Panel 1: cross-correlation shift vs order
+        # ----------------------------------------------------------------
+        ax = axes[0, 0]
+        ax.axhline(0.0, color="gray", lw=0.8, ls="--")
+        ax.scatter(order_nums, xcorr_shifts, color="steelblue", s=20)
+        ax.set_xlabel("Echelle order number")
+        ax.set_ylabel("XCorr shift (pixels)")
+        ax.set_title("Per-order cross-correlation shift")
+
+        # ----------------------------------------------------------------
+        # Panel 2: per-order accepted vs rejected line counts
+        # ----------------------------------------------------------------
+        ax = axes[0, 1]
+        x = np.arange(len(order_nums))
+        width = 0.4
+        ax.bar(x - width / 2, n_acc, width, label="Accepted", color="steelblue")
+        ax.bar(x + width / 2, n_rej, width, label="Rejected (σ-clip)", color="tomato")
+        ax.set_xticks(x)
+        ax.set_xticklabels(order_nums, rotation=90, fontsize=6)
+        ax.set_xlabel("Echelle order number")
+        ax.set_ylabel("Line count")
+        ax.set_title("Accepted vs rejected lines per order\n(after sigma clipping)")
+        ax.legend(fontsize=8)
+
+        # ----------------------------------------------------------------
+        # Panel 3: per-order RMS after sigma clipping
+        # ----------------------------------------------------------------
+        ax = axes[1, 0]
+        rms_valid = [r for r in rms_vals if not math.isnan(r)]
+        rms_orders = [
+            s.order_number for s in stats if not math.isnan(s.rms_resid_um)
+        ]
+        if rms_valid:
+            ax.bar(rms_orders, rms_valid, color="steelblue", width=0.6)
+        ax.axhline(k3_model.fit_rms_um * 1e3, color="tomato",
+                   lw=1.2, ls="--", label=f"Global RMS = {k3_model.fit_rms_um*1e3:.3f} nm")
+        ax.set_xlabel("Echelle order number")
+        ax.set_ylabel("RMS residual (nm)")
+        ax.set_title("Per-order RMS after sigma clipping")
+        ax.legend(fontsize=8)
+
+        # ----------------------------------------------------------------
+        # Panel 4: global summary text
+        # ----------------------------------------------------------------
+        ax = axes[1, 1]
+        ax.axis("off")
+        summary = (
+            "Global 1DXD fit summary\n"
+            "──────────────────────\n"
+            f"wdeg = {k3_model.wdeg},  odeg = {k3_model.odeg}\n"
+            f"Total lines matched : {k3_model.n_lines_total}\n"
+            f"Accepted (σ-clip)   : {k3_model.n_lines}\n"
+            f"Rejected (σ-clip)   : {k3_model.n_lines_rejected}\n"
+            f"Orders in fit       : {k3_model.n_orders_fit}\n"
+            f"Global RMS          : {k3_model.fit_rms_um * 1e3:.4f} nm\n"
+            f"Median residual     : {k3_model.median_residual_um * 1e3:.4f} nm\n"
+        )
+        ax.text(
+            0.05, 0.95, summary,
+            transform=ax.transAxes, va="top", ha="left",
+            fontsize=9, fontfamily="monospace",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+        )
+
+        fig.suptitle(
+            "Python K3 1DXD QA — global polynomial fit with sigma clipping\n"
+            "NOTE: preliminary — not IDL-equivalent",
+            fontsize=10,
+        )
+        fig.tight_layout()
+
+        if save:
+            out_path = os.path.join(out_dir, f"{prefix}_k3_1dxd_qa.png")
+            fig.savefig(out_path, dpi=120, bbox_inches="tight")
+            print(f"  [QA] Saved: {out_path}")
+        else:
+            plt.show()
+        plt.close(fig)
+    except Exception as exc:
+        print(f"  [QA] K3 1DXD QA plot skipped: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# K3 1DXD residual QA plot — point-based (primary 1DXD QA artifact)
+# ---------------------------------------------------------------------------
+
+
+def _plot_k3_1dxd_residuals(
+    k3_model: "IdlStyle1DXDModel",
+    out_dir: str,
+    save: bool,
+    prefix: str,
+) -> Optional[str]:
+    """Point-based K3 1DXD residual QA plot.
+
+    Uses the explicit matched-point arrays stored on the model to produce the
+    primary K3 1DXD QA figure.  The output file is named::
+
+        {prefix}_k3_1dxd_residuals.png
+
+    Panels
+    ------
+    1. Residuals vs detector column  — accepted (blue ●) and rejected (red ×)
+    2. Residuals vs echelle order    — accepted (blue ●) and rejected (red ×)
+    3. Residual histogram (accepted) with optional rejected overlay
+    4. Summary annotation box with ntot / nacc / nrej / RMS / median
+
+    All residual axes are in **nm** (nanometres).
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        cols_all   = k3_model.matched_cols_px
+        orders_all = k3_model.matched_order_numbers
+        resid_all  = k3_model.matched_residual_um * 1e3  # µm → nm
+        mask       = k3_model.accepted_mask
+
+        cols_acc  = cols_all[mask]
+        cols_rej  = cols_all[~mask]
+        orders_acc = orders_all[mask]
+        orders_rej = orders_all[~mask]
+        resid_acc  = resid_all[mask]
+        resid_rej  = resid_all[~mask]
+
+        ntot = k3_model.n_lines_total
+        nacc = k3_model.n_lines
+        nrej = k3_model.n_lines_rejected
+        rms_nm   = k3_model.fit_rms_um * 1e3
+        med_nm   = k3_model.median_residual_um * 1e3
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+        # ----------------------------------------------------------------
+        # Panel 1: residuals vs detector column
+        # ----------------------------------------------------------------
+        ax = axes[0, 0]
+        if len(cols_acc) > 0:
+            ax.scatter(cols_acc, resid_acc, s=8, color="steelblue",
+                       alpha=0.7, label="Accepted")
+        if len(cols_rej) > 0:
+            ax.scatter(cols_rej, resid_rej, s=14, color="tomato",
+                       marker="x", linewidths=1.0, alpha=0.9, label="Rejected (σ-clip)")
+        ax.axhline(0.0, color="k", lw=0.6, ls="--")
+        ax.set_xlabel("Detector column (pixels)")
+        ax.set_ylabel("Residual (nm)")
+        ax.set_title("Residuals vs detector column")
+        ax.legend(fontsize=8)
+
+        # ----------------------------------------------------------------
+        # Panel 2: residuals vs echelle order
+        # ----------------------------------------------------------------
+        ax = axes[0, 1]
+        if len(orders_acc) > 0:
+            ax.scatter(orders_acc, resid_acc, s=8, color="steelblue",
+                       alpha=0.7, label="Accepted")
+        if len(orders_rej) > 0:
+            ax.scatter(orders_rej, resid_rej, s=14, color="tomato",
+                       marker="x", linewidths=1.0, alpha=0.9, label="Rejected (σ-clip)")
+        ax.axhline(0.0, color="k", lw=0.6, ls="--")
+        ax.set_xlabel("Echelle order number")
+        ax.set_ylabel("Residual (nm)")
+        ax.set_title("Residuals vs echelle order")
+        ax.legend(fontsize=8)
+
+        # ----------------------------------------------------------------
+        # Panel 3: residual histogram (accepted), rejected overlay
+        # ----------------------------------------------------------------
+        ax = axes[1, 0]
+        if len(resid_acc) > 0:
+            ax.hist(resid_acc, bins=30, color="steelblue", alpha=0.7,
+                    label="Accepted")
+        if len(resid_rej) > 0:
+            ax.hist(resid_rej, bins=20, color="tomato", alpha=0.5,
+                    label="Rejected (σ-clip)")
+        ax.axvline(0.0, color="k", lw=0.8, ls="--")
+        ax.axvline(rms_nm, color="steelblue", lw=1.0, ls=":",
+                   label=f"+RMS = {rms_nm:.3f} nm")
+        ax.axvline(-rms_nm, color="steelblue", lw=1.0, ls=":")
+        ax.set_xlabel("Residual (nm)")
+        ax.set_ylabel("Count")
+        ax.set_title("Residual histogram (accepted + rejected)")
+        ax.legend(fontsize=7)
+
+        # ----------------------------------------------------------------
+        # Panel 4: summary annotation
+        # ----------------------------------------------------------------
+        ax = axes[1, 1]
+        ax.axis("off")
+        summary = (
+            "Python K3 1DXD QA\n"
+            "────────────────────────\n"
+            f"wdeg = {k3_model.wdeg},  odeg = {k3_model.odeg}\n"
+            f"ntot  = {ntot}\n"
+            f"nacc  = {nacc}\n"
+            f"nrej  = {nrej}\n"
+            f"RMS   = {rms_nm:.4f} nm\n"
+            f"median= {med_nm:.4f} nm\n"
+            f"Orders: {k3_model.n_orders_fit}\n"
+        )
+        ax.text(
+            0.05, 0.95, summary,
+            transform=ax.transAxes, va="top", ha="left",
+            fontsize=9, fontfamily="monospace",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+        )
+
+        fig.suptitle(
+            "Python K3 1DXD QA — residuals from sigma-clipped global fit\n"
+            "NOTE: preliminary — not IDL-equivalent",
+            fontsize=10,
+        )
+        fig.tight_layout()
+
+        out_path: Optional[str] = None
+        if save:
+            out_path = os.path.join(out_dir, f"{prefix}_k3_1dxd_residuals.png")
+            fig.savefig(out_path, dpi=120, bbox_inches="tight")
+            print(f"  [QA] Saved: {out_path}")
+        else:
+            plt.show()
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        print(f"  [QA] K3 1DXD residuals plot skipped: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# K3 1DXD global summary metadata export
+# ---------------------------------------------------------------------------
+
+
+def _export_1dxd_global_summary(
+    k3_model: "IdlStyle1DXDModel",
+    out_dir: str,
+    prefix: str,
+) -> str:
+    """Write K3 1DXD global summary metadata to a JSON sidecar file.
+
+    The file is named::
+
+        {prefix}_k3_1dxd_summary.json
+
+    Schema
+    ------
+    ::
+
+        {
+          "n_lines_total":      int,
+          "n_lines_accepted":   int,
+          "n_lines_rejected":   int,
+          "fit_rms_um":         float,
+          "median_residual_um": float,
+          "lambda_degree":      int,
+          "order_degree":       int,
+          "fitted_order_numbers": [int, ...],
+          "mode":               str
+        }
+
+    Returns the path of the written file.
+    """
+    data = {
+        "n_lines_total":       k3_model.n_lines_total,
+        "n_lines_accepted":    k3_model.n_lines,
+        "n_lines_rejected":    k3_model.n_lines_rejected,
+        "fit_rms_um":          k3_model.fit_rms_um,
+        "median_residual_um":  k3_model.median_residual_um,
+        "lambda_degree":       k3_model.wdeg,
+        "order_degree":        k3_model.odeg,
+        "fitted_order_numbers": k3_model.fitted_order_numbers,
+        "mode":                k3_model.mode,
+    }
+    out_path = os.path.join(out_dir, f"{prefix}_k3_1dxd_summary.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Main reduction driver
 # ---------------------------------------------------------------------------
 
@@ -1355,10 +1789,10 @@ def run_k3_example(
                         prefix=prefix)
 
     # ------------------------------------------------------------------
-    # Stage 3: Provisional wavelength map
+    # Stage 3: Provisional wavelength map (scaffold — used for diagnostics)
     # ------------------------------------------------------------------
 
-    _banner("Stage 3: Provisional per-order wavelength mapping")
+    _banner("Stage 3: Provisional per-order wavelength mapping (scaffold)")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         prov_map = fit_provisional_wavelength_map(
@@ -1385,7 +1819,7 @@ def run_k3_example(
             f"poly degree={deg}"
         )
 
-    _ok("Stage 3 — provisional wavelength mapping")
+    _ok("Stage 3 — provisional wavelength mapping (scaffold)")
     completed["stage3_provisional_wavemap"] = True
 
     if not no_plots:
@@ -1395,52 +1829,133 @@ def run_k3_example(
                            prefix=prefix)
 
     # ------------------------------------------------------------------
-    # Stage 4: Global wavelength surface
+    # Build the geometry→echelle order mapping from wavecalinfo.
+    # This allows Stage 6 to use the K3 1DXD path WITHOUT depending on
+    # the scaffold prov_map as the primary order-number source.
+    #
+    # The flat-field tracing produces geometry with 0-based placeholder
+    # order indices (0, 1, 2, …).  wavecalinfo.orders lists the real
+    # echelle order numbers in the same position order.
+    # ------------------------------------------------------------------
+    k3_geom_order_map: dict[int, int] = {}
+    try:
+        orders_from_wci = list(wavecalinfo.orders)
+        for geom_order_idx, real_order in enumerate(orders_from_wci):
+            k3_geom_order_map[geom_order_idx] = int(real_order)
+    except Exception as exc:  # noqa: BLE001
+        # Fallback: use prov_map for the mapping (scaffold dependency)
+        k3_geom_order_map = {}
+        print(f"  [warn] Could not build geom_order_map from wavecalinfo: {exc}")
+
+    # ------------------------------------------------------------------
+    # Stage 3b: K3 1DXD wavelength calibration (IDL-style — primary path)
     # ------------------------------------------------------------------
 
-    _banner("Stage 4: Global wavelength surface")
+    _banner("Stage 3b: K3 1DXD wavelength calibration (IDL-style — primary path)")
+    k3_model = None
+    try:
+        arc_spectra = extract_order_arc_spectra(
+            arc_img, trace, wavecalinfo, aperture_half_width=3
+        )
+        print(f"  1D arc spectra extracted : {arc_spectra.n_orders} orders")
+
+        k3_model = fit_1dxd_wavelength_model(
+            arc_spectra, wavecalinfo, line_list, wdeg=3, odeg=2
+        )
+        print(f"  1DXD fit: {k3_model.n_orders_fit} orders")
+        print(f"    total={k3_model.n_lines_total}, "
+              f"accepted={k3_model.n_lines}, "
+              f"rejected={k3_model.n_lines_rejected}")
+        print(f"    RMS = {k3_model.fit_rms_um * 1e3:.3f} nm  "
+              f"median_res = {k3_model.median_residual_um * 1e3:.4f} nm")
+        print(f"  Fitted orders: {k3_model.fitted_order_numbers}")
+        _ok("Stage 3b — K3 1DXD wavelength calibration")
+        completed["stage3b_k3_1dxd"] = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Stage 3b raised: {exc}")
+        _skip("Stage 3b — K3 1DXD wavelength calibration", "exception (see above)")
+        completed["stage3b_k3_1dxd"] = False
+
+    if not no_plots and k3_model is not None:
+        _plot_k3_1dxd_qa(k3_model, out_dir, save=save_plots, prefix=prefix)
+        _plot_k3_1dxd_residuals(k3_model, out_dir, save=save_plots, prefix=prefix)
+
+    # ------------------------------------------------------------------
+    # Stage 4: Global wavelength surface (scaffold — kept for reference)
+    # ------------------------------------------------------------------
+
+    _banner("Stage 4: Global wavelength surface (scaffold)")
     try:
         surface_result = fit_global_wavelength_surface(prov_map)
         print(f"  Surface fit converged: {getattr(surface_result, 'converged', 'N/A')}")
-        _ok("Stage 4 — global wavelength surface")
+        _ok("Stage 4 — global wavelength surface (scaffold)")
         completed["stage4_global_surface"] = True
     except Exception as exc:  # noqa: BLE001
         print(f"  Stage 4 raised: {exc}")
-        _skip("Stage 4 — global wavelength surface", "exception (see above)")
+        _skip("Stage 4 — global wavelength surface (scaffold)", "exception (see above)")
         completed["stage4_global_surface"] = False
         surface_result = None
 
     # ------------------------------------------------------------------
-    # Stage 5: Coefficient refinement
+    # Stage 5: Coefficient refinement (scaffold — kept for reference)
     # ------------------------------------------------------------------
 
-    _banner("Stage 5: Coefficient-surface refinement")
+    _banner("Stage 5: Coefficient-surface refinement (scaffold)")
     try:
         refined = fit_refined_coefficient_surface(prov_map)
         print(f"  Refined surface n_orders: {getattr(refined, 'n_orders', 'N/A')}")
-        _ok("Stage 5 — coefficient refinement")
+        _ok("Stage 5 — coefficient refinement (scaffold)")
         completed["stage5_refinement"] = True
     except Exception as exc:  # noqa: BLE001
         print(f"  Stage 5 raised: {exc}")
-        _skip("Stage 5 — coefficient refinement", "exception (see above)")
+        _skip("Stage 5 — coefficient refinement (scaffold)", "exception (see above)")
         completed["stage5_refinement"] = False
         refined = None
 
     # ------------------------------------------------------------------
     # Stage 6: Rectification indices
+    #
+    # K3 benchmark path: uses the 1DXD model (Stage 3b) as the source of
+    # truth for wavelengths.  Falls back to the scaffold surface (Stage 5)
+    # only if the 1DXD model is unavailable.
     # ------------------------------------------------------------------
 
     # Capture non-monotonic warnings so they can feed into the diagnostics.
     _non_monotonic_orders: set[int] = set()
 
     _banner("Stage 6: Rectification indices")
-    if refined is not None:
+    # Decide which wavelength model drives rectification.
+    _use_k3_path = k3_model is not None
+    _rect_prereq_ok = _use_k3_path or (refined is not None)
+
+    if _rect_prereq_ok:
         try:
             with warnings.catch_warnings(record=True) as _caught_warns:
                 warnings.simplefilter("always")
-                rect_idx = build_rectification_indices(
-                    geom, refined, wav_map=prov_map
-                )
+                if _use_k3_path:
+                    # K3 benchmark path: 1DXD model drives rectification.
+                    # Use geom_order_map (derived directly from wavecalinfo)
+                    # to avoid any scaffold prov_map dependency.
+                    print("  Wavelength source: K3 1DXD model (Stage 3b)")
+                    _k3_geom_map = k3_geom_order_map if k3_geom_order_map else None
+                    _k3_wav_map = prov_map if not _k3_geom_map else None
+                    if _k3_geom_map:
+                        print("  Order mapping   : wavecalinfo (no scaffold dependency)")
+                    else:
+                        print("  Order mapping   : scaffold prov_map (fallback)")
+                    rect_idx = build_rectification_indices(
+                        geom,
+                        wavelength_func=k3_model.as_wavelength_func(),
+                        fitted_order_numbers=k3_model.fitted_order_numbers,
+                        geom_order_map=_k3_geom_map,
+                        wav_map=_k3_wav_map,
+                    )
+                else:
+                    # Scaffold fallback (K3 1DXD unavailable).
+                    print("  Wavelength source: scaffold surface (Stage 5 fallback)")
+                    rect_idx = build_rectification_indices(
+                        geom, refined, wav_map=prov_map
+                    )
             # Extract order numbers from non-monotonic RuntimeWarnings.
             for w in _caught_warns:
                 if issubclass(w.category, RuntimeWarning):
@@ -1469,7 +1984,8 @@ def run_k3_example(
             completed["stage6_rect_indices"] = False
             rect_idx = None
     else:
-        _skip("Stage 6 — rectification indices", "Stage 5 did not complete")
+        _skip("Stage 6 — rectification indices",
+              "neither Stage 3b (K3 1DXD) nor Stage 5 (scaffold) completed")
         completed["stage6_rect_indices"] = False
         rect_idx = None
 
@@ -1556,14 +2072,27 @@ def run_k3_example(
     _banner("Weak-order summary")
     _print_weak_order_warnings(order_diags)
 
+    # Build 1DXD diagnostics when Stage 3b succeeded
+    diags_1dxd = None
+    if k3_model is not None:
+        diags_1dxd = _build_1dxd_diagnostics(k3_model)
+        completed["_1dxd_diagnostics"] = diags_1dxd  # type: ignore[assignment]
+
     if cfg.export_diagnostics:
         diag_path = _export_diagnostics(
-            order_diags, out_dir, cfg.diagnostics_format, prefix
+            order_diags, out_dir, cfg.diagnostics_format, prefix,
+            diags_1dxd=diags_1dxd,
         )
-        print(f"\n  [DIAG] Diagnostics exported to: {diag_path}")
+        print(f"\n  [DIAG] Per-order diagnostics exported to: {diag_path}")
         completed["diagnostics_export"] = True
     else:
         completed["diagnostics_export"] = False
+
+    # Export K3 1DXD global summary JSON (always written when Stage 3b succeeded)
+    if k3_model is not None:
+        summary_path = _export_1dxd_global_summary(k3_model, out_dir, prefix)
+        print(f"  [DIAG] K3 1DXD global summary exported to: {summary_path}")
+        completed["_1dxd_summary_path"] = summary_path  # type: ignore[assignment]
 
     # Expose diagnostics on the returned mapping for programmatic access.
     completed["_order_diagnostics"] = order_diags  # type: ignore[assignment]
