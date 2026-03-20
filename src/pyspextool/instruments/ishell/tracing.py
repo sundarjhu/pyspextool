@@ -144,6 +144,10 @@ _OSCILLATION_THRESHOLD: float = 0.5  # px/col -- flag if peak-to-peak slope vari
 # including well-fitted ones.  0.5 px/col still flags pathologically
 # oscillatory polynomials (e.g. the formerly divergent Order 24).
 
+# Number of evenly-spaced evaluation columns used by _fit_stable_poly and
+# _repair_crossing_orders for bounds / crossing checks.
+_N_EVAL_COLS: int = 50
+
 
 # ---------------------------------------------------------------------------
 # Public result dataclasses
@@ -1002,9 +1006,7 @@ def _fit_stable_poly(
         effective_max = max_degree
 
     # Evaluation grid for the acceptance tests
-    eval_cols = np.linspace(col_lo, col_hi, 50)
-
-    # Data row range for the data-range acceptance test
+    eval_cols = np.linspace(col_lo, col_hi, _N_EVAL_COLS)
     row_lo_bound = float(rows.min()) - data_range_margin
     row_hi_bound = float(rows.max()) + data_range_margin
 
@@ -1101,11 +1103,11 @@ def _repair_crossing_orders(
         Maximum number of repair passes before giving up.
     """
     n_orders = len(fit_rms)
-    eval_cols = np.linspace(col_lo, col_hi, 50)
+    eval_cols = np.linspace(col_lo, col_hi, _N_EVAL_COLS)
 
     for pass_num in range(max_passes):
         # Evaluate all polynomials
-        center_vals = np.full((n_orders, 50), np.nan)
+        center_vals = np.full((n_orders, _N_EVAL_COLS), np.nan)
         for i in range(n_orders):
             if np.isfinite(fit_rms[i]):
                 center_vals[i] = np.polynomial.polynomial.polyval(

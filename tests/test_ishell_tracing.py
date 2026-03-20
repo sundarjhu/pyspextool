@@ -781,7 +781,6 @@ class TestFitStablePoly:
         _fit_stable_poly, _ = self._import_helpers()
         # 7 points in cols 262-997, all near row 1780 – mirrors the
         # K3 Order 24 failure case.
-        rng = np.random.default_rng(0)
         cols = np.array([262, 315, 787, 840, 892, 945, 997], dtype=float)
         rows = np.array([1780, 1772, 1772, 1773, 1781, 1786, 1773], dtype=float)
         coeffs, rms, deg = _fit_stable_poly(
@@ -938,18 +937,11 @@ class TestRepairCrossingOrders:
         sample_cols = np.linspace(col_lo, col_hi, n_sample).astype(int)
 
         # Order 0: constant at row 200 (stable)
-        # Order 1: cubic that oscillates and crosses below 200 mid-detector
+        # Order 1: parabola with vertex at row 300 (col 1023) that dips to
+        # ~166 at the detector edges – below Order 0's row 200, causing a
+        # crossing.  f(x) = 300 - 1.28e-4*(x-1023)^2
         center_poly_coeffs = np.zeros((2, 4))
-        center_poly_coeffs[0, 0] = 200.0       # constant at 200
-        # Order 1: starts at 310 at col 0, has a large cubic term that
-        # makes it dip to ~180 mid-detector, then recover.
-        # f(x) = 310 - 3e-4*x + 6e-7*x^2 - 3e-10*x^3
-        # At col 1023: ~310 - 307 + 628 - 322 ≈ 309 (wrong – make simpler)
-        # Use a polynomial that definitely crosses: goes from 300 to 300
-        # via a valley at ~130 in the middle
-        # f(x) = 300 - 1.28e-4*(x-1023)^2  (parabola, vertex at 1023, 300)
-        # At col 1023: 300; at col 0: 300 - 1.28e-4*1023^2 = 300 - 134 = 166
-        # → dips below 200 → crossing with Order 0 at col 200
+        center_poly_coeffs[0, 0] = 200.0
         c0 = 300.0 - 1.28e-4 * 1023.0**2
         c1 = 2.0 * 1.28e-4 * 1023.0
         c2 = -1.28e-4
