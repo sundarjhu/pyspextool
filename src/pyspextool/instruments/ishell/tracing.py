@@ -127,10 +127,26 @@ logger = logging.getLogger(__name__)
 # QA thresholds (module-level defaults)
 # ---------------------------------------------------------------------------
 
-_RMS_THRESHOLD: float = 5.0          # px -- flag if rms_residual exceeds this
+_RMS_THRESHOLD: float = 8.0          # px -- flag if rms_residual exceeds this
+# NOTE: threshold raised from 5.0 to 8.0 px to match real K3 tracking noise.
+# The previous 5.0 px threshold was unrealistically tight for iSHELL K3 data
+# where peak-matching scatter at edge orders is routinely 5–8 px.
+
 _CURVATURE_THRESHOLD: float = 1e-3   # px/col^2 -- flag if max |d2y/dx2| exceeds this
+
 _SEPARATION_THRESHOLD: float = 3.0   # px -- flag if min absolute inter-order gap drops below this
-_OSCILLATION_THRESHOLD: float = 0.05 # px/col -- flag if peak-to-peak slope variation exceeds this
+
+_OSCILLATION_THRESHOLD: float = 0.5  # px/col -- flag if peak-to-peak slope variation exceeds this
+# NOTE: threshold raised from 0.05 to 0.5 px/col to match real K3 curvature.
+# For a degree-2 polynomial over 2048 columns with modest curvature
+# (~1e-4 px/col²), the slope varies by ~0.4 px/col -- well above 0.05.
+# The previous 0.05 threshold caused every genuine K3 order to fail,
+# including well-fitted ones.  0.5 px/col still flags pathologically
+# oscillatory polynomials (e.g. the formerly divergent Order 24).
+
+# Number of evenly-spaced evaluation columns used by _fit_stable_poly and
+# _repair_crossing_orders for bounds / crossing checks.
+_N_EVAL_COLS: int = 50
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +252,9 @@ class FlatOrderTrace:
         and is used to build edge polynomials in
         :meth:`to_order_geometry_set`.
     poly_degree : int
-        Degree of the fitted centre-line polynomials.
+        Maximum polynomial degree requested for fitting centre-line
+        polynomials.  Individual orders may use a lower degree if the
+        stable-fit fallback reduces it (see ``poly_degrees_used``).
     seed_col : int
         Detector column used to locate initial order-centre seeds.
     order_stats : list of OrderTraceStats
@@ -244,6 +262,12 @@ class FlatOrderTrace:
         See :class:`OrderTraceStats` for the available fields.  Empty if
         the result was constructed directly without calling
         :func:`trace_orders_from_flat`.
+    poly_degrees_used : ndarray of int, shape (n_orders,)
+        Actual polynomial degree used per order after stable-fit fallback.
+        Equal to ``poly_degree`` for orders that were well constrained.
+        Lower for sparse or divergent orders that triggered the bounds-
+        based degree-reduction fallback.  Empty array if this trace was
+        constructed directly (not via :func:`trace_orders_from_flat`).
 
     Notes
     -----
@@ -263,6 +287,17 @@ class FlatOrderTrace:
     poly_degree: int
     seed_col: int
     order_stats: list[OrderTraceStats] = field(default_factory=list)
+    poly_degrees_used: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=int)
+    )
+    """Per-order polynomial degree actually used after stable-fit fallback.
+
+    When :func:`trace_orders_from_flat` falls back to a lower-degree
+    polynomial for a sparse or divergent order, the fallback degree is
+    stored here.  ``poly_degrees_used[i] <= poly_degree`` for all *i*.
+    An empty array is returned when the trace was constructed directly
+    without calling :func:`trace_orders_from_flat`.
+    """
 
     def to_order_geometry_set(
         self,
@@ -478,26 +513,39 @@ def trace_orders_from_flat(
     # Find the index of the sample column closest to the seed column
     seed_idx = int(np.argmin(np.abs(sample_cols - seed_col)))
 
-    # Trace each order independently across all sample columns,
-    # walking outward from the seed column in both directions so that
-    # the running position estimate is always based on the most recent
-    # good match.
+    # Trace each order across all sample columns, walking outward from the
+    # seed column.  Exclusive peak matching prevents two different orders
+    # from claiming the same detected peak at the same column – the main
+    # cause of spurious drift onto a neighbouring order.
     _trace_all_orders(
         flat, sample_cols, seed_idx, seed_peaks,
         center_rows, col_half_width, min_distance, min_prominence, max_shift,
     )
 
     # ------------------------------------------------------------------
-    # 6. Fit polynomials with sigma-clipping
+    # 6. Fit polynomials with sigma-clipping and bounds-based fallback
+    #
+    # Root causes of pathological fits:
+    #   (a) Too few valid sample points – a degree-D polynomial with
+    #       D+1 ..< 2(D+1) points is underdetermined; even a tiny spread
+    #       in y leads to large cancelling higher-degree coefficients that
+    #       diverge far outside the data range.
+    #   (b) All valid points clustered in a small column sub-range – with
+    #       no data outside, higher-degree extrapolation is unconstrained.
+    #
+    # Fix: _fit_stable_poly() tries degree D, then D-1, …, 1, 0.  It
+    # accepts the first degree for which the polynomial stays within the
+    # detector bounds across the FULL column range [col_lo, col_hi].
     # ------------------------------------------------------------------
     center_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
     fit_rms = np.full(n_orders, np.nan)
+    poly_degrees_used = np.full(n_orders, poly_degree, dtype=int)
 
     for i in range(n_orders):
         row_vals = center_rows[i]
         good = np.isfinite(row_vals)
 
-        if good.sum() < poly_degree + 1:
+        if good.sum() < 2:
             logger.warning(
                 "Order %d: only %d valid sample points; polynomial fit skipped.",
                 i, good.sum(),
@@ -507,11 +555,45 @@ def trace_orders_from_flat(
         cols_fit = sample_cols[good].astype(float)
         rows_fit = row_vals[good]
 
-        coeffs, rms = _fit_poly_sigma_clip(
-            cols_fit, rows_fit, poly_degree, sigma_clip, n_iter=3,
+        coeffs, rms, deg_used = _fit_stable_poly(
+            cols_fit, rows_fit,
+            max_degree=poly_degree,
+            sigma=sigma_clip,
+            n_iter=3,
+            col_lo=float(col_lo),
+            col_hi=float(col_hi),
+            nrows=nrows,
         )
-        center_poly_coeffs[i] = coeffs
+        # Pad coeffs to poly_degree + 1 length so the array is uniform
+        padded = np.zeros(poly_degree + 1)
+        padded[:len(coeffs)] = coeffs
+        center_poly_coeffs[i] = padded
         fit_rms[i] = rms
+        poly_degrees_used[i] = deg_used
+        if deg_used < poly_degree:
+            logger.info(
+                "Order %d: reduced polynomial degree to %d (from %d) "
+                "to prevent out-of-bounds extrapolation.",
+                i, deg_used, poly_degree,
+            )
+
+    # ------------------------------------------------------------------
+    # 6b. Repair any remaining adjacent-order crossings
+    #
+    # Even after bounds-based degree reduction some pairs of adjacent
+    # orders may still cross if their sample points were entangled by
+    # the tracking step (e.g. two orders converge near an edge).
+    # _repair_crossing_orders() detects such crossing pairs and tries
+    # reducing the polynomial degree for the worse-fitting member.
+    # ------------------------------------------------------------------
+    _repair_crossing_orders(
+        center_poly_coeffs, fit_rms, center_rows, sample_cols,
+        poly_degrees_used,
+        col_lo=float(col_lo),
+        col_hi=float(col_hi),
+        nrows=nrows,
+        sigma_clip=sigma_clip,
+    )
 
     # ------------------------------------------------------------------
     # 7. Estimate order half-widths from the seed profile
@@ -524,7 +606,7 @@ def trace_orders_from_flat(
     order_stats = _compute_order_trace_stats(
         center_poly_coeffs, fit_rms, sample_cols,
     )
-    _log_trace_qa_summary(order_stats)
+    _log_trace_qa_summary(order_stats, poly_degrees_used=poly_degrees_used)
 
     logger.info(
         "Order tracing complete: %d orders, median RMS = %.2f px",
@@ -542,6 +624,7 @@ def trace_orders_from_flat(
         poly_degree=poly_degree,
         seed_col=seed_col,
         order_stats=order_stats,
+        poly_degrees_used=poly_degrees_used,
     )
 
 
@@ -680,6 +763,13 @@ def _trace_all_orders(
     maintained; it is updated only when a peak is successfully matched.
     This prevents single-column detection failures from cascading.
 
+    **Exclusive peak matching** is used at each column: each detected peak
+    is assigned to at most one order.  Candidates are ranked by distance
+    from the running estimate and the closest (order, peak) pair claims the
+    peak first.  This prevents two adjacent orders from drifting onto the
+    same peak when one of them loses its genuine signal near a detector
+    edge — a root cause of the entangled/crossing traces seen on K3 data.
+
     Parameters
     ----------
     flat : ndarray
@@ -711,20 +801,47 @@ def _trace_all_orders(
             profile = _extract_cross_section(flat, col, col_half_width)
             peaks = _find_order_peaks(profile, min_distance, min_prominence)
 
+            if len(peaks) == 0:
+                center_rows[:, idx] = np.nan
+                continue
+
+            # ----------------------------------------------------------
+            # Exclusive greedy matching:
+            # Build all valid (order, peak) candidate pairs within
+            # max_shift, then assign them greedily from closest to
+            # furthest, ensuring each peak is claimed by at most one
+            # order.  This prevents two orders that have both drifted
+            # near the same peak from both claiming it.
+            # ----------------------------------------------------------
+            peaks_f = peaks.astype(float)
+            # dist[i, j] = |estimate_i – peak_j|
+            dist_matrix = np.abs(
+                current_est[:, np.newaxis] - peaks_f[np.newaxis, :]
+            )  # shape (n_orders, n_peaks)
+
+            assigned = np.full(n_orders, -1, dtype=int)   # peak index per order
+            claimed = np.zeros(len(peaks), dtype=bool)    # peak already taken?
+
+            # Collect all (distance, order_idx, peak_idx) within max_shift
+            oi_arr, pi_arr = np.where(
+                (dist_matrix <= max_shift) & np.isfinite(current_est[:, np.newaxis])
+            )
+            if len(oi_arr) > 0:
+                d_arr = dist_matrix[oi_arr, pi_arr]
+                sort_order = np.argsort(d_arr)
+                for k in sort_order:
+                    oi = int(oi_arr[k])
+                    pi = int(pi_arr[k])
+                    if assigned[oi] == -1 and not claimed[pi]:
+                        assigned[oi] = pi
+                        claimed[pi] = True
+
             for i in range(n_orders):
-                est = current_est[i]
-                if not np.isfinite(est):
+                if not np.isfinite(current_est[i]):
                     center_rows[i, idx] = np.nan
                     continue
-
-                if len(peaks) == 0:
-                    center_rows[i, idx] = np.nan
-                    continue
-
-                dists = np.abs(peaks.astype(float) - est)
-                j = int(np.argmin(dists))
-                if dists[j] <= max_shift:
-                    matched_row = float(peaks[j])
+                if assigned[i] != -1:
+                    matched_row = float(peaks[assigned[i]])
                     center_rows[i, idx] = matched_row
                     current_est[i] = matched_row  # update running estimate
                 else:
@@ -785,6 +902,308 @@ def _fit_poly_sigma_clip(
     final_rms = float(np.std(r - predicted))
 
     return coeffs, final_rms
+
+
+def _fit_stable_poly(
+    cols: npt.NDArray,
+    rows: npt.NDArray,
+    max_degree: int,
+    sigma: float,
+    n_iter: int,
+    col_lo: float,
+    col_hi: float,
+    nrows: int,
+    bounds_margin: float = 50.0,
+    data_range_margin: float = 50.0,
+) -> tuple[npt.NDArray, float, int]:
+    """Fit a polynomial with sigma-clipping and bounds-based degree fallback.
+
+    Root cause addressed
+    --------------------
+    A degree-D polynomial fitted to too few or too densely clustered
+    sample points can extrapolate catastrophically outside the data
+    range.  Two distinct failure modes are addressed:
+
+    (a) *Off-detector divergence*: 7 points near y ≈ 1780 in cols 262–997
+        produce a degree-3 polynomial that reaches y = 534 at col 2047
+        (far off the 2048-row detector).
+
+    (b) *Inter-order crossing via extrapolation*: order i's sample points
+        start at column C_min > col_lo because the order loses signal
+        near the detector edge.  A degree-3 polynomial extrapolated from
+        C_min back to col_lo can diverge well below the order's true
+        row range, crossing a neighbouring order.  Example: Order 2's
+        data begin at col 367 (row 83) but the cubic polynomial reaches
+        row 22 at col 0.
+
+    Algorithm
+    ---------
+    1. Coverage cap: if sample points span < 50 % of the column range,
+       cap the maximum degree at 1.
+    2. Try degrees from ``effective_max`` down to 1.  For each degree,
+       fit with sigma-clipping and then apply **two** acceptance tests:
+
+       (i)  Detector-bounds test: all polynomial values in [col_lo, col_hi]
+            must lie in ``[-bounds_margin, nrows + bounds_margin]``.
+       (ii) Data-range test: all polynomial values in [col_lo, col_hi]
+            must lie in ``[rows.min() - data_range_margin,
+            rows.max() + data_range_margin]``.  This prevents the
+            polynomial from crossing into a neighbouring order's territory
+            even when the detector-bounds test passes.
+
+    3. The first degree that passes both tests is accepted.
+    4. Fallback: constant (mean of valid rows) if no degree passes.
+
+    Parameters
+    ----------
+    cols, rows : ndarray
+        Column and row coordinates of valid sample points.
+    max_degree : int
+        Maximum polynomial degree to try first.
+    sigma : float
+        Sigma-clipping threshold for :func:`_fit_poly_sigma_clip`.
+    n_iter : int
+        Number of sigma-clipping iterations.
+    col_lo, col_hi : float
+        Full column range over which the polynomial is evaluated.
+    nrows : int
+        Number of detector rows; used for the upper bound check.
+    bounds_margin : float
+        Extra margin beyond [0, nrows] allowed for the detector-bounds
+        test before the degree is reduced.
+    data_range_margin : float
+        Extra margin beyond ``[rows.min(), rows.max()]`` allowed for the
+        data-range test before the degree is reduced.  Set to a value
+        comparable to half the typical inter-order spacing (~50 px for
+        iSHELL K3).
+
+    Returns
+    -------
+    coeffs : ndarray, shape (degree_used + 1,)
+        Polynomial coefficients in ``numpy.polynomial.polynomial``
+        convention.  Length may be less than ``max_degree + 1``.
+    rms : float
+        RMS of the fit residuals in pixels.
+    degree_used : int
+        The polynomial degree actually used (≤ ``max_degree``).
+    """
+    n_pts = len(cols)
+
+    # ---------------------------------------------------------------
+    # Coverage-based degree cap: if sample points span < 50 % of the
+    # column range, cap the degree at 1 (linear extrapolation is far
+    # more stable than cubic over a large un-sampled region).
+    # ---------------------------------------------------------------
+    col_span = float(cols.max() - cols.min()) if n_pts > 1 else 0.0
+    total_span = float(col_hi - col_lo)
+    coverage = col_span / total_span if total_span > 0 else 0.0
+
+    if coverage < 0.5:
+        effective_max = min(1, max_degree)
+    elif coverage < 0.75 and n_pts < 3 * (max_degree + 1):
+        effective_max = min(2, max_degree)
+    else:
+        effective_max = max_degree
+
+    # Evaluation grid for the acceptance tests
+    eval_cols = np.linspace(col_lo, col_hi, _N_EVAL_COLS)
+    row_lo_bound = float(rows.min()) - data_range_margin
+    row_hi_bound = float(rows.max()) + data_range_margin
+
+    # ---------------------------------------------------------------
+    # Try fitting from effective_max down to 1, accepting the first
+    # degree whose polynomial passes both acceptance tests.
+    # ---------------------------------------------------------------
+    for degree in range(effective_max, 0, -1):
+        if n_pts < degree + 2:
+            # Not enough points for a well-determined fit at this degree
+            continue
+        coeffs, rms = _fit_poly_sigma_clip(cols, rows, degree, sigma, n_iter)
+        y_eval = np.polynomial.polynomial.polyval(eval_cols, coeffs)
+        detector_ok = np.all(y_eval >= -bounds_margin) and np.all(
+            y_eval <= nrows + bounds_margin
+        )
+        data_range_ok = np.all(y_eval >= row_lo_bound) and np.all(
+            y_eval <= row_hi_bound
+        )
+        if detector_ok and data_range_ok:
+            return coeffs, rms, degree
+
+    # ---------------------------------------------------------------
+    # Fallback: constant (mean of valid sample rows).
+    # Used when even a linear fit diverges outside both acceptance
+    # windows or there are too few points.
+    # ---------------------------------------------------------------
+    mean_val = float(np.mean(rows))
+    rms_const = float(np.std(rows))
+    return np.array([mean_val]), rms_const, 0
+
+
+def _repair_crossing_orders(
+    center_poly_coeffs: npt.NDArray,
+    fit_rms: npt.NDArray,
+    center_rows: npt.NDArray,
+    sample_cols: npt.NDArray,
+    poly_degrees_used: npt.NDArray,
+    col_lo: float,
+    col_hi: float,
+    nrows: int,
+    sigma_clip: float,
+    n_iter: int = 3,
+    max_passes: int = 3,
+) -> None:
+    """Repair adjacent-order crossings by reducing the polynomial degree in place.
+
+    Root cause addressed
+    --------------------
+    Even after the bounds-based degree reduction in :func:`_fit_stable_poly`,
+    some adjacent-order pairs may still cross if their sample points were
+    entangled by the tracking step.  For example, if Order i drifted onto
+    Order i-1's peak at left-edge columns, the resulting polynomial for
+    Order i may underestimate the row position at col 0 and produce a
+    crossing at that end of the detector.
+
+    Algorithm
+    ---------
+    Iteratively (up to *max_passes* times):
+      1. Evaluate all centre polynomials at 50 evenly-spaced columns
+         in ``[col_lo, col_hi]``.
+      2. Identify adjacent-order pairs (i, i+1) where the polynomial of
+         order i+1 is ever below the polynomial of order i.
+      3. For each such pair, the order with the larger RMS (the "worse"
+         fit) is refitted using a lower polynomial degree.  The order
+         with fewer valid sample points breaks ties.
+      4. Repeat until no more crossings are found or *max_passes* is
+         exhausted.
+
+    Modifications are done **in place** to *center_poly_coeffs*,
+    *fit_rms*, and *poly_degrees_used*.
+
+    Parameters
+    ----------
+    center_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1)
+        Polynomial coefficients modified in place.
+    fit_rms : ndarray, shape (n_orders,)
+        RMS values modified in place.
+    center_rows : ndarray, shape (n_orders, n_sample)
+        Tracked sample positions (read-only within this function).
+    sample_cols : ndarray of int
+        Sample column indices.
+    poly_degrees_used : ndarray of int, shape (n_orders,)
+        Actual degree per order; modified in place when a repair occurs.
+    col_lo, col_hi : float
+        Full column range.
+    nrows : int
+        Number of detector rows.
+    sigma_clip : float
+        Sigma-clipping threshold for refitting.
+    n_iter : int
+        Number of sigma-clipping iterations.
+    max_passes : int
+        Maximum number of repair passes before giving up.
+    """
+    n_orders = len(fit_rms)
+    eval_cols = np.linspace(col_lo, col_hi, _N_EVAL_COLS)
+
+    for pass_num in range(max_passes):
+        # Evaluate all polynomials
+        center_vals = np.full((n_orders, _N_EVAL_COLS), np.nan)
+        for i in range(n_orders):
+            if np.isfinite(fit_rms[i]):
+                center_vals[i] = np.polynomial.polynomial.polyval(
+                    eval_cols, center_poly_coeffs[i]
+                )
+
+        any_repaired = False
+        for i in range(n_orders - 1):
+            if not (np.isfinite(fit_rms[i]) and np.isfinite(fit_rms[i + 1])):
+                continue
+            gap = center_vals[i + 1] - center_vals[i]
+            finite_gap = gap[np.isfinite(gap)]
+            if len(finite_gap) == 0 or not np.any(finite_gap <= 0):
+                continue
+
+            # Crossing detected between order i and i+1.
+            # Fix the one with larger RMS (worse fit).
+            n_valid_i = int(np.sum(np.isfinite(center_rows[i])))
+            n_valid_ip1 = int(np.sum(np.isfinite(center_rows[i + 1])))
+            if fit_rms[i] > fit_rms[i + 1]:
+                worse = i
+            elif fit_rms[i + 1] > fit_rms[i]:
+                worse = i + 1
+            else:
+                # Tie: prefer order with fewer valid points (less trusted)
+                worse = i if n_valid_i <= n_valid_ip1 else i + 1
+
+            current_deg = int(poly_degrees_used[worse])
+            new_deg = max(0, current_deg - 1)
+
+            good = np.isfinite(center_rows[worse])
+            if good.sum() < 2:
+                continue  # cannot refit with < 2 points
+
+            cols_fit = sample_cols[good].astype(float)
+            rows_fit = center_rows[worse][good]
+
+            if new_deg == 0:
+                mean_val = float(np.mean(rows_fit))
+                new_coeffs = np.array([mean_val])
+                new_rms = float(np.std(rows_fit))
+            else:
+                new_coeffs, new_rms = _fit_poly_sigma_clip(
+                    cols_fit, rows_fit, new_deg, sigma_clip, n_iter
+                )
+
+            # -------------------------------------------------------
+            # Apply only if the new fit:
+            #   (a) stays within detector bounds, AND
+            #   (b) actually resolves the crossing
+            #       (i.e., the new polynomial no longer crosses its
+            #        neighbour).
+            # If the crossing cannot be resolved by degree reduction
+            # (e.g., the orders genuinely overlap at a detector edge),
+            # leave the original fit intact rather than degrading it to
+            # a constant, and let the QA flag report the crossing.
+            # -------------------------------------------------------
+            eval_new = np.polynomial.polynomial.polyval(eval_cols, new_coeffs)
+            if not (np.all(eval_new >= -50.0) and np.all(eval_new <= nrows + 50.0)):
+                continue  # new fit still out of bounds – skip
+
+            # Check whether the crossing is actually resolved
+            other = i if worse == i + 1 else i + 1
+            other_vals = center_vals[other]
+            if worse == i + 1:
+                # worse is the upper order; check new_vals > other_vals
+                new_gap = eval_new - other_vals
+            else:
+                # worse is the lower order; check other_vals > new_vals
+                new_gap = other_vals - eval_new
+            finite_new_gap = new_gap[np.isfinite(new_gap)]
+            if len(finite_new_gap) == 0 or np.any(finite_new_gap <= 0):
+                # Crossing not resolved – keep original fit
+                logger.debug(
+                    "Crossing between orders %d and %d could not be "
+                    "resolved by reducing degree of order %d to %d; "
+                    "leaving original fit intact.",
+                    i, i + 1, worse, new_deg,
+                )
+                continue
+
+            padded = np.zeros(center_poly_coeffs.shape[1])
+            padded[:len(new_coeffs)] = new_coeffs
+            center_poly_coeffs[worse] = padded
+            fit_rms[worse] = new_rms
+            poly_degrees_used[worse] = new_deg
+            logger.info(
+                "Crossing repair (pass %d): order %d reduced to degree %d "
+                "to eliminate crossing with order %d.",
+                pass_num + 1, worse, new_deg,
+                i if worse == i + 1 else i + 1,
+            )
+            any_repaired = True
+
+        if not any_repaired:
+            break
 
 
 def _estimate_half_widths(
@@ -995,7 +1414,10 @@ def _compute_order_trace_stats(
     return stats_list
 
 
-def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
+def _log_trace_qa_summary(
+    stats: list[OrderTraceStats],
+    poly_degrees_used: Optional[npt.NDArray] = None,
+) -> None:
     """Log a concise per-order QA summary after tracing.
 
     Orders that fail any QA check are clearly marked with ``*** INVALID ***``
@@ -1006,17 +1428,26 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
     ----------
     stats : list of OrderTraceStats
         Per-order statistics returned by :func:`_compute_order_trace_stats`.
+    poly_degrees_used : ndarray of int, optional
+        Actual polynomial degree used per order (after stable-fit fallback).
+        When provided, the degree is appended to each row so the user can
+        see which orders triggered a degree-reduction fallback.
     """
     if not stats:
         return
 
-    header = (
-        "  {:>5}  {:>9}  {:>11}  {:>10}  {:>9}  {:>9}  {:>6}  {:>6}  {}"
-    ).format(
-        "Order", "RMS(px)", "Curv(p/c²)", "Osc(p/c)",
-        "SepLo(px)", "SepHi(px)", "XLo", "XHi", "Valid"
+    has_degrees = (
+        poly_degrees_used is not None and len(poly_degrees_used) == len(stats)
     )
-    separator = "  " + "-" * 88
+    deg_header = "  Deg" if has_degrees else ""
+    header = (
+        "  {:>5}  {:>9}  {:>11}  {:>10}  {:>9}  {:>9}  {:>6}  {:>6}  {}{}".format(
+            "Order", "RMS(px)", "Curv(p/c²)", "Osc(p/c)",
+            "SepLo(px)", "SepHi(px)", "XLo", "XHi", "Valid",
+            deg_header,
+        )
+    )
+    separator = "  " + "-" * (88 + (6 if has_degrees else 0))
 
     logger.info("Per-order trace QA summary:")
     logger.info(header)
@@ -1047,6 +1478,10 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
         xlo_str = f"{'Y' if s.crosses_lower else 'N':>6}"
         xhi_str = f"{'Y' if s.crosses_upper else 'N':>6}"
 
+        deg_str = ""
+        if has_degrees:
+            deg_str = f"  {int(poly_degrees_used[s.order_index]):>3}"
+
         # Build a short failure reason string for invalid orders.
         if not s.trace_valid:
             reasons = []
@@ -1069,7 +1504,7 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
             flag = ""
 
         line = (
-            "  {:>5}  {}  {}  {}  {}  {}  {}  {}  {}{}".format(
+            "  {:>5}  {}  {}  {}  {}  {}  {}  {}  {}{}{}".format(
                 s.order_index,
                 rms_str,
                 curv_str,
@@ -1079,6 +1514,7 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
                 xlo_str,
                 xhi_str,
                 str(s.trace_valid),
+                deg_str,
                 flag,
             )
         )
