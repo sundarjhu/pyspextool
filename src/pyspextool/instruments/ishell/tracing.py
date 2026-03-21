@@ -99,6 +99,14 @@ IDL-to-Python fidelity status
   from all guess y-positions; per-order xranges recomputed with shifted edges
 - Per-order valid column ranges (``order_xranges``)
 - Per-order step-based sample column sets
+- Post-fit xrange restriction: after edge polynomial fitting, ``order_xranges``
+  is narrowed to only those columns where BOTH fitted edges evaluate to valid
+  pixel positions (``0 < edge < nrows-1``), matching IDL's end-of-loop
+  ``where(top gt 0 and top lt nrows-1 and bot gt 0 and bot lt nrows-1)`` block
+- Per-order polynomial domain enforcement: QA statistics (curvature,
+  oscillation, inter-order separation) are computed only within each order's
+  valid ``[x_start, x_end]`` range; extrapolated tails return ``NaN`` via
+  :func:`_polyval_with_xrange`
 
 **Does NOT fully match IDL:**
 
@@ -234,7 +242,12 @@ class OrderTraceSamples:
     order_index : int
         Zero-based index of this order within the :class:`FlatOrderTrace`.
     sample_cols : ndarray, shape (n_samp,)
-        Column indices at which this order was traced.
+        Column indices at which this order was traced.  These are the
+        original sampling grid built from the initial flatinfo/input xranges.
+        **After post-fit xrange restriction (step 6a in
+        :func:`trace_orders_from_flat`), some entries may fall outside
+        ``[x_start, x_end]``.  The authoritative final valid domain is
+        ``[x_start, x_end]``, not the span of ``sample_cols``.**
     center_rows : ndarray, shape (n_samp,)
         Derived centre-row at each sampled column (mean of bot/top edges).
         NaN where edges were not reliably detected.
@@ -243,9 +256,14 @@ class OrderTraceSamples:
     top_rows : ndarray, shape (n_samp,)
         Top-edge row at each sampled column.  NaN where not detected.
     x_start : int
-        First column of the order's valid range (IDL ``xranges[0, i]``).
+        First column of the order's **final post-fit restricted valid range**
+        (IDL ``xranges[0, i]``).  Set during step 6a to ensure the fitted
+        edge polynomials stay within the detector.  May be larger than
+        ``sample_cols[0]`` when the polynomial overshoots at the low end.
     x_end : int
-        Last column of the order's valid range (IDL ``xranges[1, i]``).
+        Last column of the order's **final post-fit restricted valid range**
+        (IDL ``xranges[1, i]``).  May be smaller than ``sample_cols[-1]``
+        when the polynomial overshoots at the high end.
     """
 
     order_index: int
@@ -282,10 +300,12 @@ class FlatOrderTrace:
     center_rows : ndarray, shape (n_orders, n_sample)
         **Compatibility view — MUST NOT be used for internal computation.**
         Centre-row positions on the shared ``sample_cols`` grid; NaN for
-        columns outside each order's own traced range.  Derived from
-        ``order_samples`` after tracing.  All polynomial fitting, edge
-        detection, and geometry construction MUST use
-        ``order_samples[i].center_rows`` instead.
+        columns outside each order's post-fit restricted xrange
+        ``[x_start, x_end]``.  Columns that appear in an order's
+        ``sample_cols`` but lie outside its ``[x_start, x_end]`` are also
+        NaN here.  Derived from ``order_samples`` after tracing.  All
+        polynomial fitting, edge detection, and geometry construction MUST
+        use ``order_samples[i].center_rows`` instead.
     center_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1)
         Per-order polynomial coefficients for the centre-row trajectory,
         derived as the arithmetic mean of ``bot_poly_coeffs`` and
@@ -712,6 +732,14 @@ def trace_orders_from_flat(
     # ------------------------------------------------------------------
     # 5a. Validate order_samples — assert internal consistency invariants
     #     before any downstream computation uses them.
+    #
+    #     NOTE: the xrange check below (sample_cols within [x_start, x_end])
+    #     is a PRE-FIT invariant only.  At construction time (step 5),
+    #     sample_cols is built from the initial input xranges so it lies
+    #     within [x_start, x_end] by design.  After step 6a (post-fit
+    #     xrange restriction), x_start/x_end may be narrowed inward, making
+    #     some sample_cols entries legitimately outside [x_start, x_end].
+    #     Do NOT re-run this check after step 6a.
     # ------------------------------------------------------------------
     if len(order_samples) != n_orders:
         raise RuntimeError(
@@ -790,6 +818,62 @@ def trace_orders_from_flat(
             fit_rms[i] = float(np.std(os_i.center_rows[good_cen] - pred))
 
     # ------------------------------------------------------------------
+    # 6a. Update per-order xranges from fitted edge polynomials.
+    #     IDL mc_findorders (verbatim port of the end-of-order-loop block):
+    #
+    #       x = findgen(stop-start+1)+start   ; all integer cols in srange
+    #       bot = poly(x, edgecoeffs[*,0,i])
+    #       top = poly(x, edgecoeffs[*,1,i])
+    #       z = where(top gt 0.0 and top lt nrows-1
+    #                 and bot gt 0 and bot lt nrows-1)
+    #       xranges[*,i] = [min(x[z],MAX=max), max]
+    #
+    #     i.e. restrict xrange to columns where BOTH fitted edge polynomials
+    #     evaluate to strictly valid pixel positions (inside [0, nrows-1]).
+    #     This prevents a pathological polynomial (one that shoots outside
+    #     the detector at one end of the input xrange) from being applied
+    #     over that extrapolated, unsupported region.
+    #
+    #     Python mismatch that this corrects: before this step the Python
+    #     code carried the input sranges straight through to order_xranges
+    #     without ever evaluating whether the fitted polynomial remained
+    #     within the detector.  IDL always performs this restriction.
+    # ------------------------------------------------------------------
+    for i, os_i in enumerate(order_samples):
+        b_coeffs = bot_poly_coeffs[i]
+        t_coeffs = top_poly_coeffs[i]
+        if np.any(np.isnan(b_coeffs)) or np.any(np.isnan(t_coeffs)):
+            # Fit failed — keep original xrange (degenerate fallback,
+            # matching IDL's implicit cancel-on-failure behaviour).
+            logger.warning(
+                "Order %d: edge fit has NaN coefficients; xrange not updated.", i,
+            )
+            continue
+        # Evaluate on every integer column in the order's current xrange
+        # (IDL: x = findgen(stop-start+1)+start).
+        x_dense = np.arange(os_i.x_start, os_i.x_end + 1, dtype=float)
+        bot_vals = np.polynomial.polynomial.polyval(x_dense, b_coeffs)
+        top_vals = np.polynomial.polynomial.polyval(x_dense, t_coeffs)
+        # IDL condition: top gt 0.0 and top lt nrows-1 and bot gt 0 and bot lt nrows-1
+        valid_mask = (
+            (bot_vals > 0.0) & (bot_vals < float(nrows - 1)) &
+            (top_vals > 0.0) & (top_vals < float(nrows - 1))
+        )
+        valid_x = x_dense[valid_mask].astype(int)
+        if len(valid_x) > 0:
+            os_i.x_start = int(valid_x[0])
+            os_i.x_end = int(valid_x[-1])
+        else:
+            # No valid columns — set degenerate range matching IDL's
+            # initialisation (xranges[0,i] = sranges[0,i], xranges[1,i] = sranges[0,i]).
+            logger.warning(
+                "Order %d: fitted edge polynomials evaluate outside detector in "
+                "all columns [%d, %d]; setting degenerate xrange.",
+                i, os_i.x_start, os_i.x_end,
+            )
+            os_i.x_end = os_i.x_start  # degenerate: start == end
+
+    # ------------------------------------------------------------------
     # 7. Estimate order half-widths directly from per-order edge samples.
     #    No temporary 2D arrays: compute mean edge separation per order.
     # ------------------------------------------------------------------
@@ -817,6 +901,11 @@ def trace_orders_from_flat(
     compat_center_rows = np.full((n_orders, len(union_cols)), np.nan)
     for i, os_i in enumerate(order_samples):
         for j, col in enumerate(os_i.sample_cols):
+            # Only copy values within the UPDATED (post-fit restricted) xrange.
+            # Columns outside [x_start, x_end] correspond to extrapolated
+            # polynomial territory and must remain NaN in the compat arrays.
+            if not (os_i.x_start <= col <= os_i.x_end):
+                continue
             k = int(np.searchsorted(union_cols, col))
             if k < len(union_cols) and union_cols[k] == col:
                 compat_center_rows[i, k] = os_i.center_rows[j]
@@ -840,7 +929,8 @@ def trace_orders_from_flat(
             f"values {union_cols[bad_indices].tolist()} -> {union_cols[bad_indices + 1].tolist()}"
         )
     # Every finite entry in compat_center_rows must correspond to a column
-    # that actually exists in that order's own order_samples[i].sample_cols.
+    # that actually exists in that order's own order_samples[i].sample_cols
+    # AND lies within the post-fit restricted [x_start, x_end].
     for i, os_i in enumerate(order_samples):
         order_col_set = set(os_i.sample_cols.tolist())
         for k, col in enumerate(union_cols):
@@ -850,15 +940,25 @@ def trace_orders_from_flat(
                     f"compat_center_rows[{i}, {k}] is finite but column {col} "
                     f"is not in order_samples[{i}].sample_cols — construction bug."
                 )
+            if np.isfinite(val) and (col < os_i.x_start or col > os_i.x_end):
+                raise RuntimeError(
+                    f"compat_center_rows[{i}, {k}] is finite but column {col} "
+                    f"is outside post-fit xrange [{os_i.x_start}, {os_i.x_end}] "
+                    f"for order {i} — construction bug."
+                )
 
     # ------------------------------------------------------------------
     # 9. Compute per-order QA metrics
-    #    _compute_order_trace_stats evaluates the fitted polynomials at the
-    #    supplied column array.  Passing union_cols is safe: it is used for
-    #    polynomial evaluation only, not for indexing raw traced arrays.
+    #    Build traced_xranges_out first so we can pass it to
+    #    _compute_order_trace_stats, which will restrict polynomial
+    #    evaluation to each order's valid column range.
     # ------------------------------------------------------------------
+    traced_xranges_out = np.array(
+        [[os_i.x_start, os_i.x_end] for os_i in order_samples], dtype=int
+    )
     order_stats = _compute_order_trace_stats(
         center_poly_coeffs, fit_rms, union_cols,
+        order_xranges=traced_xranges_out,
     )
     _log_trace_qa_summary(order_stats)
 
@@ -866,11 +966,6 @@ def trace_orders_from_flat(
         "Order tracing complete: %d orders, median RMS = %.2f px",
         n_orders,
         float(np.nanmedian(fit_rms)),
-    )
-
-    # Build order_xranges from order_samples (authoritative x_start/x_end)
-    traced_xranges_out = np.array(
-        [[os_i.x_start, os_i.x_end] for os_i in order_samples], dtype=int
     )
 
     return FlatOrderTrace(
@@ -1722,11 +1817,48 @@ def _estimate_half_widths(
     return half_widths
 
 
+def _polyval_with_xrange(
+    coeffs: npt.NDArray,
+    x: npt.NDArray,
+    x_start: int,
+    x_end: int,
+) -> npt.NDArray:
+    """Evaluate a polynomial, returning NaN outside ``[x_start, x_end]``.
+
+    Polynomials are only physically meaningful within the detector region
+    where edge samples were actually collected.  This helper enforces that
+    constraint so that extrapolated tails never contaminate QA stats or
+    compatibility arrays.
+
+    Parameters
+    ----------
+    coeffs : ndarray, shape (degree + 1,)
+        Polynomial coefficients in ``numpy.polynomial.polynomial`` convention.
+    x : ndarray, shape (n,)
+        Column values at which to evaluate.
+    x_start : int
+        First valid column (inclusive).
+    x_end : int
+        Last valid column (inclusive).
+
+    Returns
+    -------
+    ndarray, shape (n,)
+        Polynomial values where ``x_start <= x <= x_end``; ``NaN`` elsewhere.
+    """
+    result = np.full(len(x), np.nan)
+    valid = (x >= x_start) & (x <= x_end)
+    if np.any(valid):
+        result[valid] = np.polynomial.polynomial.polyval(x[valid], coeffs)
+    return result
+
+
 def _compute_order_trace_stats(
     center_poly_coeffs: npt.NDArray,
     fit_rms: npt.NDArray,
     sample_cols: npt.NDArray,
     *,
+    order_xranges: npt.NDArray | None = None,
     rms_threshold: float = _RMS_THRESHOLD,
     curvature_threshold: float = _CURVATURE_THRESHOLD,
     separation_threshold: float = _SEPARATION_THRESHOLD,
@@ -1743,6 +1875,13 @@ def _compute_order_trace_stats(
         RMS of polynomial residuals per order.  ``NaN`` marks failed fits.
     sample_cols : ndarray, shape (n_sample,)
         Detector column indices at which the polynomial is evaluated.
+    order_xranges : ndarray, shape (n_orders, 2), optional
+        Per-order valid column ranges ``[x_start, x_end]``.  When supplied,
+        polynomial evaluation is restricted to columns inside each order's
+        valid range via :func:`_polyval_with_xrange` — extrapolated tails
+        outside that range contribute ``NaN`` and do not corrupt metrics.
+        When ``None``, the full ``sample_cols`` grid is used for every order
+        (backward-compatible behaviour).
     rms_threshold : float, default ``_RMS_THRESHOLD``
         Maximum acceptable RMS residual in pixels.
     curvature_threshold : float, default ``_CURVATURE_THRESHOLD``
@@ -1770,16 +1909,24 @@ def _compute_order_trace_stats(
     )
 
     # Pre-compute centre-row positions at all sample columns.
-    # Use NaN rows where the polynomial fit failed so they do not
-    # corrupt inter-order separation calculations.
+    # When order_xranges is supplied, evaluate only within [x_start, x_end]
+    # for each order — extrapolated tails return NaN and do not corrupt
+    # inter-order separation calculations.
+    # When order_xranges is None (backward compat), use the full column grid.
     # NOTE: the only operation on `cols` throughout this function is
     # ``polyval(cols, coeffs)`` — no indexing into raw traced arrays occurs.
     center_vals = np.full((n_orders, len(cols)), np.nan)
     for i in range(n_orders):
         if np.isfinite(fit_rms[i]):
-            center_vals[i] = np.polynomial.polynomial.polyval(
-                cols, center_poly_coeffs[i]
-            )
+            if order_xranges is not None:
+                center_vals[i] = _polyval_with_xrange(
+                    center_poly_coeffs[i], cols,
+                    int(order_xranges[i, 0]), int(order_xranges[i, 1]),
+                )
+            else:
+                center_vals[i] = np.polynomial.polynomial.polyval(
+                    cols, center_poly_coeffs[i]
+                )
 
     stats_list: list[OrderTraceStats] = []
 
@@ -1788,37 +1935,46 @@ def _compute_order_trace_stats(
         rms = float(fit_rms[i])
         fit_ok = np.isfinite(rms)
 
+        # Per-order valid column sub-array: restrict metrics to the valid range.
+        if order_xranges is not None:
+            x_start_i = int(order_xranges[i, 0])
+            x_end_i = int(order_xranges[i, 1])
+            valid_col_mask = (cols >= x_start_i) & (cols <= x_end_i)
+            cols_i = cols[valid_col_mask]
+        else:
+            cols_i = cols
+
         # ------------------------------------------------------------------
-        # 1. Curvature metric: max |d²y/dx²| evaluated at sample columns.
+        # 1. Curvature metric: max |d²y/dx²| evaluated at valid sample columns.
         #    Uses numpy.polynomial.polynomial.polyder to differentiate.
         # ------------------------------------------------------------------
         if not fit_ok:
             curvature_metric = np.nan
         else:
             d2_coeffs = np.polynomial.polynomial.polyder(coeffs, 2)
-            if d2_coeffs.size == 0:
+            if d2_coeffs.size == 0 or len(cols_i) == 0:
                 curvature_metric = 0.0
             else:
                 d2_vals = np.abs(
-                    np.polynomial.polynomial.polyval(cols, d2_coeffs)
+                    np.polynomial.polynomial.polyval(cols_i, d2_coeffs)
                 )
                 curvature_metric = float(np.max(d2_vals))
 
         # ------------------------------------------------------------------
         # 2. Oscillation metric: peak-to-peak variation in the first
-        #    derivative (slope) across the sample columns.  A straight trace
-        #    gives 0; oscillatory or pathologically curved polynomials give
-        #    large values.  This replaces the previous boolean monotonicity
+        #    derivative (slope) across the valid sample columns.  A straight
+        #    trace gives 0; oscillatory or pathologically curved polynomials
+        #    give large values.  This replaces the previous boolean monotonicity
         #    test, which incorrectly flagged even gently curved traces.
         # ------------------------------------------------------------------
         if not fit_ok:
             oscillation_metric = np.nan
         else:
             d1_coeffs = np.polynomial.polynomial.polyder(coeffs, 1)
-            if d1_coeffs.size == 0:
+            if d1_coeffs.size == 0 or len(cols_i) == 0:
                 oscillation_metric = 0.0
             else:
-                d1_vals = np.polynomial.polynomial.polyval(cols, d1_coeffs)
+                d1_vals = np.polynomial.polynomial.polyval(cols_i, d1_coeffs)
                 oscillation_metric = float(np.max(d1_vals) - np.min(d1_vals))
 
         # ------------------------------------------------------------------
