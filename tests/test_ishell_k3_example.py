@@ -1008,3 +1008,240 @@ class TestArcLinePlotRepresentativeRow:
         line = self._make_fake_line(seed_col=600, trace_rows=trace_rows)
         row = float(np.median(line.trace_rows))
         assert row == 250.0
+
+
+# ---------------------------------------------------------------------------
+# 9. Flatinfo integration: benchmark explicitly uses IDL-style path
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_flat_order_trace():
+    """Return a minimal FlatOrderTrace for use in mocked tracing tests."""
+    import numpy as np
+    from pyspextool.instruments.ishell.tracing import FlatOrderTrace
+
+    n = 3
+    return FlatOrderTrace(
+        n_orders=n,
+        sample_cols=np.arange(10),
+        center_rows=np.zeros((n, 10)),
+        center_poly_coeffs=np.zeros((n, 2)),
+        fit_rms=np.ones(n),
+        half_width_rows=np.full(n, 16.0),
+        poly_degree=1,
+        seed_col=1023,
+    )
+
+
+def _make_minimal_raw_dir(tmp_path):
+    """Create a minimal raw directory with one flat and one arc FITS file.
+
+    Returns the raw directory path as a string.
+    """
+    import numpy as np
+    from astropy.io import fits
+
+    raw_dir = str(tmp_path / "raw")
+    os.makedirs(raw_dir)
+    for frame, ftype in [(6, "flat"), (11, "arc")]:
+        fname = f"icm.2017A999.170525.{ftype}.{frame:05d}.a.fits"
+        fits.PrimaryHDU(data=np.zeros((4, 4))).writeto(
+            os.path.join(raw_dir, fname)
+        )
+    return raw_dir
+
+
+class TestK3BenchmarkFlatinfoIntegration:
+    """Integration tests verifying that the K3 benchmark explicitly loads
+    flatinfo and passes it into trace_orders_from_flat.
+
+    These tests use mocking and do NOT require the real K3 dataset.
+    """
+
+    def _patch_stage1_pass_stage2_stop(self, monkeypatch, driver):
+        """Patch the driver so Stage 1 completes but Stage 2 raises StopIteration."""
+        import numpy as np
+
+        fake_trace = _make_fake_flat_order_trace()
+        monkeypatch.setattr(driver, "trace_orders_from_flat",
+                            lambda *a, **kw: fake_trace)
+        monkeypatch.setattr(driver, "load_and_combine_flats",
+                            lambda *a, **kw: np.zeros((4, 4)))
+        monkeypatch.setattr(driver, "load_and_combine_arcs",
+                            lambda *a, **kw: np.zeros((4, 4)))
+        monkeypatch.setattr(driver, "trace_arc_lines",
+                            lambda *a, **kw: (_ for _ in ()).throw(
+                                StopIteration("stop after stage 1")
+                            ))
+
+    def test_read_flatinfo_is_called_for_configured_mode(self, tmp_path, monkeypatch):
+        """run_k3_example calls read_flatinfo with the configured mode."""
+        driver = _import_driver()
+        raw_dir = _make_minimal_raw_dir(tmp_path)
+
+        calls: list[str] = []
+
+        def recording_read_flatinfo(mode_name):
+            calls.append(mode_name)
+            # Return the real flatinfo so the driver can proceed through Stage 1
+            from pyspextool.instruments.ishell.calibrations import read_flatinfo
+            return read_flatinfo(mode_name)
+
+        monkeypatch.setattr(driver, "read_flatinfo", recording_read_flatinfo)
+        self._patch_stage1_pass_stage2_stop(monkeypatch, driver)
+
+        with pytest.raises(StopIteration):
+            driver.run_k3_example(
+                raw_dir=raw_dir,
+                out_dir=str(tmp_path / "output"),
+                no_plots=True,
+            )
+
+        assert "K3" in calls, (
+            f"read_flatinfo was not called with mode 'K3'; calls recorded: {calls}"
+        )
+
+    def test_flatinfo_passed_to_trace_orders_from_flat(self, tmp_path, monkeypatch):
+        """run_k3_example passes the loaded flatinfo into trace_orders_from_flat."""
+        import numpy as np
+
+        driver = _import_driver()
+        raw_dir = _make_minimal_raw_dir(tmp_path)
+
+        fake_trace = _make_fake_flat_order_trace()
+
+        # Capture the kwargs that trace_orders_from_flat is called with
+        captured_kwargs: list[dict] = []
+
+        def capturing_trace(*args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return fake_trace
+
+        monkeypatch.setattr(driver, "trace_orders_from_flat", capturing_trace)
+        monkeypatch.setattr(driver, "load_and_combine_flats",
+                            lambda *a, **kw: np.zeros((4, 4)))
+        monkeypatch.setattr(driver, "load_and_combine_arcs",
+                            lambda *a, **kw: np.zeros((4, 4)))
+        monkeypatch.setattr(driver, "trace_arc_lines",
+                            lambda *a, **kw: (_ for _ in ()).throw(
+                                StopIteration("stop after stage 1")
+                            ))
+
+        with pytest.raises(StopIteration):
+            driver.run_k3_example(
+                raw_dir=raw_dir,
+                out_dir=str(tmp_path / "output"),
+                no_plots=True,
+            )
+
+        assert captured_kwargs, "trace_orders_from_flat was not called"
+        assert "flatinfo" in captured_kwargs[0], (
+            "trace_orders_from_flat was not called with flatinfo= keyword; "
+            f"kwargs were: {captured_kwargs[0]}"
+        )
+        assert captured_kwargs[0]["flatinfo"] is not None, (
+            "flatinfo passed to trace_orders_from_flat must not be None"
+        )
+
+    def test_flatinfo_load_failure_raises_runtime_error(self, tmp_path, monkeypatch):
+        """run_k3_example raises RuntimeError (not silently falls back) when
+        read_flatinfo fails.  The error message must mention the mode and the
+        IDL-style path."""
+        driver = _import_driver()
+        raw_dir = _make_minimal_raw_dir(tmp_path)
+
+        def broken_read_flatinfo(mode_name):
+            raise FileNotFoundError(f"No flatinfo for mode '{mode_name}'")
+
+        monkeypatch.setattr(driver, "read_flatinfo", broken_read_flatinfo)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            driver.run_k3_example(
+                raw_dir=raw_dir,
+                out_dir=str(tmp_path / "output"),
+                no_plots=True,
+            )
+
+        msg = str(exc_info.value)
+        assert "K3" in msg, (
+            f"RuntimeError message should mention the mode 'K3'; got: {msg!r}"
+        )
+        assert "IDL" in msg or "flatinfo" in msg.lower(), (
+            f"RuntimeError message should mention the IDL-style path; got: {msg!r}"
+        )
+
+    def test_flatinfo_load_failure_does_not_silently_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """When read_flatinfo raises, the benchmark must NOT silently continue.
+
+        This verifies the 'no silent fallback' constraint from the problem
+        statement: if flatinfo cannot be loaded the benchmark must fail loudly,
+        not auto-switch to the fallback tracing path.
+        """
+        driver = _import_driver()
+        raw_dir = _make_minimal_raw_dir(tmp_path)
+
+        trace_was_called = []
+
+        def broken_read_flatinfo(mode_name):
+            raise ValueError("simulated flatinfo parse failure")
+
+        def recording_trace(*args, **kwargs):
+            trace_was_called.append(kwargs.get("flatinfo"))
+            raise StopIteration("should not reach tracing")
+
+        monkeypatch.setattr(driver, "read_flatinfo", broken_read_flatinfo)
+        monkeypatch.setattr(driver, "trace_orders_from_flat", recording_trace)
+
+        # The benchmark must raise before reaching trace_orders_from_flat
+        with pytest.raises((RuntimeError, ValueError)):
+            driver.run_k3_example(
+                raw_dir=raw_dir,
+                out_dir=str(tmp_path / "output"),
+                no_plots=True,
+            )
+
+        assert not trace_was_called, (
+            "trace_orders_from_flat must not be reached when flatinfo "
+            "fails to load (no silent fallback allowed)"
+        )
+
+    def test_flatinfo_console_output_contains_mode(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """run_k3_example prints 'Flatinfo loaded for mode K3' to stdout."""
+        driver = _import_driver()
+        raw_dir = _make_minimal_raw_dir(tmp_path)
+        self._patch_stage1_pass_stage2_stop(monkeypatch, driver)
+
+        with pytest.raises(StopIteration):
+            driver.run_k3_example(
+                raw_dir=raw_dir,
+                out_dir=str(tmp_path / "output"),
+                no_plots=True,
+            )
+
+        captured = capsys.readouterr()
+        assert "Flatinfo loaded for mode K3" in captured.out, (
+            f"Expected 'Flatinfo loaded for mode K3' in stdout; got:\n{captured.out}"
+        )
+
+    def test_stage1_tracing_source_output(self, tmp_path, monkeypatch, capsys):
+        """run_k3_example prints 'Stage 1 tracing source: flatinfo / IDL-style path'."""
+        driver = _import_driver()
+        raw_dir = _make_minimal_raw_dir(tmp_path)
+        self._patch_stage1_pass_stage2_stop(monkeypatch, driver)
+
+        with pytest.raises(StopIteration):
+            driver.run_k3_example(
+                raw_dir=raw_dir,
+                out_dir=str(tmp_path / "output"),
+                no_plots=True,
+            )
+
+        captured = capsys.readouterr()
+        assert "flatinfo / IDL-style path" in captured.out, (
+            f"Expected 'flatinfo / IDL-style path' in Stage 1 output; "
+            f"got:\n{captured.out}"
+        )
