@@ -65,8 +65,10 @@ Algorithm (Python port)
    - *With flatinfo (DEFAULT path)*: when ``omask`` or ``ycororder`` is
      absent, use :func:`_compute_guess_positions_from_flatinfo` (IDL
      ``mc_adjustguesspos /DEFAULT`` equivalent).
-   - *Without flatinfo (fallback)*: auto-detect order centres at a
-     single seed column via :func:`scipy.signal.find_peaks`.
+   - *Without flatinfo (explicit path)*: caller must supply ``guess_rows``
+     — a list of one centre-row estimate per order at the seed column.
+     IDL ``mc_findorders`` always requires explicit ``guesspos`` from outside;
+     there is no auto-detection mode in the IDL algorithm.
 
 3. **Per-order sample columns** – in flatinfo mode, each order has its
    own valid column range from the adjusted ``xranges``; the sweep is
@@ -113,6 +115,8 @@ IDL-to-Python fidelity status
 - Step-based column sampling is used when ``flatinfo.step > 0``; otherwise
   ``n_sample_cols`` evenly-spaced columns are used (no IDL equivalent for
   that fallback).
+- When neither ``flatinfo`` nor explicit ``guess_rows`` are provided, a
+  ``ValueError`` is raised; IDL always requires external ``guesspos``.
 """
 
 from __future__ import annotations
@@ -125,7 +129,6 @@ import numpy as np
 import numpy.typing as npt
 from astropy.io import fits
 from scipy.ndimage import sobel as _scipy_sobel
-from scipy.signal import find_peaks as _scipy_find_peaks
 
 from pyspextool.fit.polyfit import polyfit_1d as _polyfit_1d
 
@@ -446,12 +449,10 @@ def trace_orders_from_flat(
     *,
     flatinfo=None,
     n_sample_cols: int = 40,
-    col_half_width: int = 10,
     poly_degree: int = 3,
     seed_col: int | None = None,
     col_range: tuple[int, int] | None = None,
-    min_prominence: float = 500.0,
-    min_distance: int = 25,
+    guess_rows: list[float] | None = None,
     max_shift: float = 15.0,
     sigma_clip: float = 3.0,
     intensity_fraction: float = 0.85,
@@ -461,6 +462,17 @@ def trace_orders_from_flat(
 ) -> FlatOrderTrace:
     """Trace echelle order edges from one or more iSHELL flat-field frames.
 
+    This function implements a direct port of IDL ``mc_findorders``.  It
+    requires explicit initial guess positions for each order — either via
+    *flatinfo* (the normal production path) or via *guess_rows* (a list of
+    one approximate centre-row value per order at the seed column, used for
+    development or testing when flatinfo is not available).
+
+    IDL ``mc_findorders`` always receives ``guesspos`` from outside (typically
+    from ``mc_adjustguesspos``); there is no auto-detection mode.  Accordingly,
+    this function raises ``ValueError`` if neither *flatinfo* nor *guess_rows*
+    is provided.
+
     When *flatinfo* is supplied, order initialization follows the IDL
     ``mc_readflatinfo`` / ``mc_adjustguesspos`` path: guess positions are
     derived from the stored reference edge polynomials in the flatinfo
@@ -468,10 +480,6 @@ def trace_orders_from_flat(
     ``com_half_width``, ``slit_height_range``, ``ybuffer``, ``poly_degree``)
     are taken from the flatinfo fields, overriding any explicit keyword
     arguments.
-
-    When *flatinfo* is ``None``, order centres are auto-detected at a
-    single seed column via :func:`scipy.signal.find_peaks` (generic
-    fallback mode).
 
     In both cases the tracking algorithm follows IDL ``mc_findorders``:
     for each order it sweeps left and right, tracking the **bottom and top
@@ -496,27 +504,26 @@ def trace_orders_from_flat(
           corresponding ``flatinfo`` fields.
         - Step-based column sampling uses ``flatinfo.step``.
 
-        When ``None`` (default), blind peak detection at the seed column
-        is used for order initialization.
+        When ``None`` (default), *guess_rows* must be provided.
     n_sample_cols : int, default 40
         Number of evenly-spaced sample columns (used only when ``flatinfo``
         is ``None`` or when ``flatinfo.step`` is 0).
-    col_half_width : int, default 10
-        Half-width of the column band used for cross-dispersion profile
-        extraction during seed peak detection (fallback mode only).
     poly_degree : int, default 3
         Degree of the polynomial fitted to the edges (overridden by
         ``flatinfo.edge_degree`` when *flatinfo* is supplied).
     seed_col : int, optional
-        Seed column for auto-detect mode.  Defaults to mid-point of
+        Seed column for explicit-guess mode.  Defaults to mid-point of
         *col_range*.  Ignored when *flatinfo* is supplied.
     col_range : tuple of int (col_start, col_end), optional
         Column range over which tracing is performed.  Defaults to the
         full detector width ``(0, ncols - 1)``.
-    min_prominence : float, default 500.0
-        Minimum peak prominence for seed detection (fallback mode only).
-    min_distance : int, default 25
-        Minimum row separation between seed peaks (fallback mode only).
+    guess_rows : list of float, optional
+        One approximate centre-row estimate per order, measured at *seed_col*
+        (or at the midpoint of *col_range* when *seed_col* is ``None``).
+        Used when *flatinfo* is ``None``.  This is the Python equivalent of
+        IDL's ``guesspos[1, i]`` — the y-coordinates that ``mc_findorders``
+        receives from ``mc_adjustguesspos``.  Required when *flatinfo* is
+        not provided.
     max_shift : float, default 15.0
         Retained for API compatibility; not used in the IDL tracking logic.
     sigma_clip : float, default 3.0
@@ -548,9 +555,8 @@ def trace_orders_from_flat(
     Raises
     ------
     ValueError
-        If *flat_files* is empty.
-    RuntimeError
-        If no order peaks are found (fallback mode only).
+        If *flat_files* is empty, or if neither *flatinfo* nor *guess_rows*
+        is provided.
     """
     if not flat_files:
         raise ValueError("flat_files must not be empty.")
@@ -632,9 +638,8 @@ def trace_orders_from_flat(
 
         n_orders = len(guess_positions)
 
-        # seed_col: representative column used for logging / half-width fallback
+        # seed_col: representative column used for logging
         seed_col = int(np.round(np.mean(guess_xranges[:, 0] + guess_xranges[:, 1]) / 2.0))
-        seed_profile = _extract_cross_section(flat, seed_col, col_half_width)
         seed_peaks = np.array([gp[1] for gp in guess_positions])
 
         # Build per-order sample column arrays (IDL sranges[*,i]).
@@ -659,27 +664,33 @@ def trace_orders_from_flat(
         traced_xranges = guess_xranges.copy()
 
     else:
-        # Fallback: auto-detect seed peaks at the central column.
-        if seed_col is None:
-            seed_col = (col_lo + col_hi) // 2
-        else:
-            seed_col = max(col_lo, min(col_hi, int(seed_col)))
-
-        seed_profile = _extract_cross_section(flat, seed_col, col_half_width)
-        seed_peaks = _find_order_peaks(seed_profile, min_distance, min_prominence)
-
-        if len(seed_peaks) == 0:
-            raise RuntimeError(
-                f"No order peaks found at seed column {seed_col} "
-                f"(prominence>{min_prominence}, distance>{min_distance}).  "
-                "Try reducing min_prominence or min_distance."
+        # Explicit-guess path (no flatinfo).
+        # IDL mc_findorders always requires guesspos from mc_adjustguesspos;
+        # there is no auto-detection mode in the IDL algorithm.
+        if guess_rows is None:
+            raise ValueError(
+                "Either 'flatinfo' or 'guess_rows' must be provided.  "
+                "IDL mc_findorders always requires explicit guess positions "
+                "(guesspos[1,i] = y-centre of each order); provide them via "
+                "guess_rows=[row0, row1, ...] or supply a flatinfo object."
             )
+
+        seed_peaks = np.asarray(guess_rows, dtype=float)
+        if len(seed_peaks) == 0:
+            raise ValueError("guess_rows must not be empty.")
 
         n_orders = len(seed_peaks)
         guess_positions = None
         traced_xranges = None
 
-        # All orders share the same column grid in fallback mode.
+        # Resolve seed column (IDL: tabinv(scols, guesspos[0,i], idx)).
+        if seed_col is None:
+            seed_col = (col_lo + col_hi) // 2
+        else:
+            seed_col = max(col_lo, min(col_hi, int(seed_col)))
+
+        # All orders share the same column grid (no per-order xranges available).
+        # IDL: scols = findgen(fix((stops-starts)/step)+1)*step + starts
         shared_cols = np.round(np.linspace(col_lo, col_hi, n_sample_cols)).astype(int)
         shared_cols = np.unique(shared_cols)
         seed_idx = int(np.argmin(np.abs(shared_cols - seed_col)))
@@ -687,7 +698,7 @@ def trace_orders_from_flat(
         order_seed_indices = [seed_idx] * n_orders
 
         logger.info(
-            "Auto-detect mode: %d order seeds at column %d: rows %s",
+            "Explicit-guess mode: %d order seeds at column %d: rows %s",
             n_orders, seed_col, seed_peaks.tolist(),
         )
 
@@ -874,21 +885,18 @@ def trace_orders_from_flat(
             os_i.x_end = os_i.x_start  # degenerate: start == end
 
     # ------------------------------------------------------------------
-    # 7. Estimate order half-widths directly from per-order edge samples.
-    #    No temporary 2D arrays: compute mean edge separation per order.
+    # 7. Estimate order half-widths from traced edge separation.
+    #    IDL approach: use mean (top − bottom) separation per order.
+    #    This is correct for all paths (flatinfo and explicit-guess).
     # ------------------------------------------------------------------
-    if flatinfo is not None:
-        # IDL path: use mean (top − bottom) edge separation for each order.
-        half_width_rows = np.zeros(n_orders, dtype=float)
-        for i, os_i in enumerate(order_samples):
-            sep = os_i.top_rows - os_i.bot_rows
-            valid = np.isfinite(sep) & (sep > 0)
-            if valid.sum() > 0:
-                half_width_rows[i] = float(np.mean(sep[valid]) / 2.0)
-            else:
-                half_width_rows[i] = 0.0
-    else:
-        half_width_rows = _estimate_half_widths(seed_profile, seed_peaks)
+    half_width_rows = np.zeros(n_orders, dtype=float)
+    for i, os_i in enumerate(order_samples):
+        sep = os_i.top_rows - os_i.bot_rows
+        valid = np.isfinite(sep) & (sep > 0)
+        if valid.sum() > 0:
+            half_width_rows[i] = float(np.mean(sep[valid]) / 2.0)
+        else:
+            half_width_rows[i] = 0.0
 
     # ------------------------------------------------------------------
     # 8. Build legacy compatibility arrays: union sample_cols + 2D center_rows
@@ -1033,73 +1041,6 @@ def load_and_combine_flats(flat_files: list[str]) -> npt.NDArray:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-
-def _extract_cross_section(
-    flat: npt.NDArray,
-    col: int,
-    half_width: int,
-    smooth_sigma: float = 1.0,
-) -> npt.NDArray:
-    """Return a cross-dispersion profile by median-averaging a column band.
-
-    Parameters
-    ----------
-    flat : ndarray, shape (nrows, ncols)
-        Flat-field image.
-    col : int
-        Centre column of the band.
-    half_width : int
-        Half-width of the band in pixels.
-    smooth_sigma : float, default 1.0
-        Standard deviation of the Gaussian kernel applied to the median
-        profile before peak detection.  Light smoothing suppresses
-        fringing features while preserving the broad order peaks.  Set
-        to ``0`` to disable smoothing.
-
-    Returns
-    -------
-    ndarray, shape (nrows,)
-        Median (and optionally smoothed) cross-dispersion profile.
-    """
-    from scipy.ndimage import gaussian_filter1d
-
-    nrows, ncols = flat.shape
-    c0 = max(0, col - half_width)
-    c1 = min(ncols, col + half_width + 1)
-    profile = np.median(flat[:, c0:c1], axis=1)
-    if smooth_sigma > 0:
-        profile = gaussian_filter1d(profile, sigma=smooth_sigma)
-    return profile
-
-
-def _find_order_peaks(
-    profile: npt.NDArray,
-    min_distance: int,
-    min_prominence: float,
-) -> npt.NDArray:
-    """Find order-centre peaks in a cross-dispersion profile.
-
-    Parameters
-    ----------
-    profile : ndarray, shape (nrows,)
-        Cross-dispersion intensity profile.
-    min_distance : int
-        Minimum separation between peaks in pixels.
-    min_prominence : float
-        Minimum peak prominence in detector counts.
-
-    Returns
-    -------
-    ndarray of int
-        Row indices of the detected peaks, sorted in ascending order.
-    """
-    peaks, _ = _scipy_find_peaks(
-        profile,
-        distance=min_distance,
-        prominence=min_prominence,
-    )
-    return peaks
 
 
 def _adjust_guess_positions(
@@ -1774,47 +1715,6 @@ def _estimate_half_widths_from_edges(
 
     return half_widths
 
-
-def _estimate_half_widths(
-    profile: npt.NDArray,
-    peaks: npt.NDArray,
-) -> npt.NDArray:
-    """Estimate the half-maximum half-width of each order peak.
-
-    This is a profile-based estimator used in the auto-detect fallback path.
-    For edge-tracked orders, prefer :func:`_estimate_half_widths_from_edges`.
-
-    Parameters
-    ----------
-    profile : ndarray, shape (nrows,)
-        Cross-dispersion intensity profile.
-    peaks : ndarray of int
-        Row indices of the order-centre peaks.
-
-    Returns
-    -------
-    ndarray of float, shape (n_peaks,)
-        Estimated half-maximum half-widths in pixels.
-    """
-    nrows = len(profile)
-    baseline = float(np.percentile(profile, 20))
-    half_widths = np.zeros(len(peaks), dtype=float)
-
-    for i, pk in enumerate(peaks):
-        peak_val = float(profile[pk])
-        half_max = baseline + (peak_val - baseline) * 0.5
-
-        left = int(pk)
-        while left > 0 and profile[left] > half_max:
-            left -= 1
-
-        right = int(pk)
-        while right < nrows - 1 and profile[right] > half_max:
-            right += 1
-
-        half_widths[i] = (right - left) / 2.0
-
-    return half_widths
 
 
 def _polyval_with_xrange(

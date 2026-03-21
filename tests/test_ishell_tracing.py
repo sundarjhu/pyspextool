@@ -87,6 +87,14 @@ _SYN_FIRST_CENTER = 60   # centre of order 0 at col 0
 _SYN_HALF_WIDTH = 10      # half-width in rows
 _SYN_TILT = 0.01          # pixels per column
 
+# Known centre-row guess positions for the synthetic flat (at col 0 / seed column).
+# These replace the old auto-detect (find_peaks) initialisation.
+# IDL mc_findorders always receives guesspos from mc_adjustguesspos; here we
+# hard-code the known positions for the synthetic test data.
+_SYN_GUESS_ROWS: list[float] = [
+    float(_SYN_FIRST_CENTER + k * _SYN_SPACING) for k in range(_SYN_N_ORDERS)
+]   # = [60.0, 100.0, 140.0, 180.0, 220.0]
+
 
 def _make_synthetic_flat(seed: int = 42) -> np.ndarray:
     """Return a synthetic flat image with 5 known order bands.
@@ -429,13 +437,25 @@ class TestTraceOrdersFromFlatErrors:
         with pytest.raises(ValueError, match="empty"):
             trace_orders_from_flat([])
 
-    def test_raises_when_no_peaks_found(self, tmp_path):
-        """A flat image with no order structure should raise RuntimeError."""
+    def test_raises_when_no_flatinfo_and_no_guess_rows(self, tmp_path):
+        """Without flatinfo or guess_rows, a ValueError must be raised.
+
+        IDL mc_findorders always requires explicit guesspos from mc_adjustguesspos;
+        there is no auto-detection mode.  The Python port mirrors this constraint.
+        """
         flat = np.ones((_NROWS, _NCOLS), dtype=np.float32) * 500.0
         path = str(tmp_path / "blank.fits")
         _write_fits_flat(flat, path)
-        with pytest.raises(RuntimeError, match="No order peaks"):
+        with pytest.raises(ValueError, match="guess_rows.*flatinfo"):
             trace_orders_from_flat([path])
+
+    def test_raises_on_empty_guess_rows(self, tmp_path):
+        """An empty guess_rows list should also raise ValueError."""
+        flat = np.ones((_NROWS, _NCOLS), dtype=np.float32) * 500.0
+        path = str(tmp_path / "blank.fits")
+        _write_fits_flat(flat, path)
+        with pytest.raises(ValueError, match="empty"):
+            trace_orders_from_flat([path], guess_rows=[])
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +478,7 @@ class TestTraceOrdersFromFlatSynthetic:
             n_sample_cols=15,
             poly_degree=2,
             col_range=(50, _NCOLS - 50),
+            guess_rows=_SYN_GUESS_ROWS,
         )
 
     def test_n_orders_matches_synthetic(self, trace):
@@ -502,12 +523,25 @@ class TestTraceOrdersFromFlatSynthetic:
     def test_half_width_rows_positive(self, trace):
         assert np.all(trace.half_width_rows > 0)
 
-    def test_half_width_rows_near_known(self, trace):
-        """Estimated half-widths should be within 5 px of the known value."""
+    def test_half_width_rows_physically_reasonable(self, trace):
+        """Estimated half-widths must be positive and within [1, 2*_SYN_HALF_WIDTH].
+
+        NOTE: the IDL-style edge-based half-width measures (top_edge - bot_edge)/2
+        where the edges are traced at the flux-fraction threshold (frac*peak).
+        For the synthetic Gaussian orders (frac=0.85), the traced edges are much
+        closer to the order centre than the full Gaussian half-width, so the
+        IDL-derived half_width_rows is smaller than _SYN_HALF_WIDTH.  This test
+        only verifies that the values are physically reasonable (positive and
+        bounded), not that they match the Gaussian half-width.
+        """
         for i in range(_SYN_N_ORDERS):
-            assert abs(trace.half_width_rows[i] - _SYN_HALF_WIDTH) < 5.0, (
-                f"Order {i}: half-width {trace.half_width_rows[i]:.1f} differs "
-                f"from known {_SYN_HALF_WIDTH} by more than 5 px"
+            hw = trace.half_width_rows[i]
+            assert hw > 1.0, (
+                f"Order {i}: half-width {hw:.1f} is unreasonably small (< 1 px)"
+            )
+            assert hw < 2.0 * _SYN_HALF_WIDTH, (
+                f"Order {i}: half-width {hw:.1f} exceeds 2x known "
+                f"half-width {2*_SYN_HALF_WIDTH}"
             )
 
     def test_to_order_geometry_set_works(self, trace):
@@ -537,11 +571,13 @@ class TestTraceOrdersFromFlatSynthetic:
             [paths[0]],
             n_sample_cols=10,
             col_range=(50, _NCOLS - 50),
+            guess_rows=_SYN_GUESS_ROWS,
         )
         trace3 = trace_orders_from_flat(
             paths,
             n_sample_cols=10,
             col_range=(50, _NCOLS - 50),
+            guess_rows=_SYN_GUESS_ROWS,
         )
         assert trace1.n_orders == trace3.n_orders
 
@@ -712,10 +748,15 @@ class TestTraceOrdersH1RealData:
 
     @pytest.fixture(scope="class")
     def h1_trace(self):
+        # Approximate H1 mode guess row positions (order centres at mid-column).
+        # In production, use read_flatinfo("H1") to get accurate positions.
+        # For iSHELL H1 mode (~43 orders, rows 0–2048, ~47-row pitch):
+        _H1_GUESS_ROWS = list(range(24, 2020, 47))
         return trace_orders_from_flat(
             _H1_FLAT_FILES,
             col_range=(650, 1550),
             n_sample_cols=20,
+            guess_rows=_H1_GUESS_ROWS,
         )
 
     def test_at_least_35_orders_detected(self, h1_trace):
@@ -814,7 +855,7 @@ class TestTracedEdgeGeometry:
         flat = _make_synthetic_flat(seed=42)
         path = str(tmp_path / "flat.fits")
         _write_fits_flat(flat, path)
-        return trace_orders_from_flat([path])
+        return trace_orders_from_flat([path], guess_rows=_SYN_GUESS_ROWS)
 
     def test_bot_poly_coeffs_shape(self, trace):
         assert trace.bot_poly_coeffs is not None
@@ -959,7 +1000,7 @@ class TestFilterEdgeOrders:
         flat = _make_synthetic_flat(seed=42)
         path = str(tmp_path / "flat.fits")
         _write_fits_flat(flat, path)
-        return trace_orders_from_flat([path])
+        return trace_orders_from_flat([path], guess_rows=_SYN_GUESS_ROWS)
 
     def test_filter_preserves_bot_top_polys(self, full_trace):
         """Filtered trace must retain bot/top polynomial arrays."""
@@ -1147,7 +1188,7 @@ class TestPerOrderXranges:
         flat = _make_synthetic_flat(seed=42)
         path = str(tmp_path / "flat.fits")
         _write_fits_flat(flat, path)
-        return trace_orders_from_flat([path])
+        return trace_orders_from_flat([path], guess_rows=_SYN_GUESS_ROWS)
 
     @pytest.fixture()
     def trace_flatinfo(self, tmp_path):
@@ -1425,7 +1466,7 @@ class TestOrderTraceSamples:
         flat = _make_synthetic_flat(seed=0)
         path = str(tmp_path / "flat.fits")
         _write_fits_flat(flat, path)
-        return trace_orders_from_flat([path])
+        return trace_orders_from_flat([path], guess_rows=_SYN_GUESS_ROWS)
 
     @pytest.fixture()
     def trace_flatinfo(self, tmp_path):
@@ -1582,7 +1623,7 @@ class TestCompatArrayInvariants:
         flat = _make_synthetic_flat(seed=0)
         path = str(tmp_path / "flat.fits")
         _write_fits_flat(flat, path)
-        return trace_orders_from_flat([path])
+        return trace_orders_from_flat([path], guess_rows=_SYN_GUESS_ROWS)
 
     # ── shape ──────────────────────────────────────────────────────────────
 
@@ -3028,18 +3069,29 @@ class TestIDLPortFidelity:
     # ---- Requirement 1: no peak-finding in the tracing core ---------------
 
     def test_trace_single_order_does_not_call_find_peaks(self):
-        """_trace_single_order must not call _find_order_peaks or scipy
-        find_peaks anywhere in its execution path.
+        """_find_order_peaks and scipy find_peaks must not exist in the tracing module.
 
         IDL mc_findorders has no peak-detection step: it uses only the
-        flux-threshold + Sobel COM logic at each sample column.
-        We verify this by patching _find_order_peaks to raise and confirming
-        that _trace_single_order still succeeds.
+        flux-threshold + Sobel COM logic at each sample column.  The Python
+        port removes _find_order_peaks entirely, so the attribute must not
+        exist.  _trace_single_order must still succeed without it.
         """
-        from unittest.mock import patch
+        import pyspextool.instruments.ishell.tracing as _tracing_module
         from pyspextool.instruments.ishell.tracing import (
             _trace_single_order,
             _compute_sobel_magnitude,
+        )
+
+        # _find_order_peaks must have been deleted from the module.
+        assert not hasattr(_tracing_module, "_find_order_peaks"), (
+            "_find_order_peaks must not exist in the tracing module; "
+            "IDL mc_findorders uses no peak detection."
+        )
+
+        # scipy.signal.find_peaks must not be imported by the module.
+        assert not hasattr(_tracing_module, "_scipy_find_peaks"), (
+            "_scipy_find_peaks (scipy.signal.find_peaks) must not be "
+            "imported in the tracing module."
         )
 
         flat, _, _ = _make_single_order_flat(seed=11)
@@ -3048,19 +3100,15 @@ class TestIDLPortFidelity:
         s_cols = np.arange(10, ncols - 10, 20)
         seed_idx = len(s_cols) // 2
 
-        # If _trace_single_order calls _find_order_peaks this will raise.
-        with patch(
-            "pyspextool.instruments.ishell.tracing._find_order_peaks",
-            side_effect=AssertionError("_find_order_peaks must not be called"),
-        ):
-            cen, bot, top = _trace_single_order(
-                flat, sflat, s_cols, seed_idx, y_seed=128.0,
-                poly_degree=2,
-                ybuffer=1,
-                intensity_fraction=0.85,
-                com_half_width=3,
-                slit_height_range=(12.0, 60.0),
-            )
+        # _trace_single_order must work without any peak detection.
+        cen, bot, top = _trace_single_order(
+            flat, sflat, s_cols, seed_idx, y_seed=128.0,
+            poly_degree=2,
+            ybuffer=1,
+            intensity_fraction=0.85,
+            com_half_width=3,
+            slit_height_range=(12.0, 60.0),
+        )
 
         # Tracing must succeed and return valid arrays.
         assert cen.shape == (len(s_cols),)
@@ -3140,7 +3188,7 @@ class TestIDLPortFidelity:
         flat = _make_synthetic_flat(seed=3)
         path = str(tmp_path / "flat.fits")
         _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat([path], poly_degree=2, n_sample_cols=15)
+        trace = trace_orders_from_flat([path], poly_degree=2, n_sample_cols=15, guess_rows=_SYN_GUESS_ROWS)
 
         assert trace.bot_poly_coeffs is not None, "bot_poly_coeffs must be populated"
         assert trace.top_poly_coeffs is not None, "top_poly_coeffs must be populated"
@@ -3163,7 +3211,7 @@ class TestIDLPortFidelity:
         flat = _make_synthetic_flat(seed=4)
         path = str(tmp_path / "flat.fits")
         _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat([path], poly_degree=2, n_sample_cols=15)
+        trace = trace_orders_from_flat([path], poly_degree=2, n_sample_cols=15, guess_rows=_SYN_GUESS_ROWS)
 
         for i in range(trace.n_orders):
             bot_vals = np.polynomial.polynomial.polyval(
@@ -3509,7 +3557,7 @@ class TestIDLPortFidelity:
         flat = _make_synthetic_flat(seed=5)
         path = str(tmp_path / "syn_flat.fits")
         _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat([path], n_sample_cols=15, poly_degree=2)
+        trace = trace_orders_from_flat([path], n_sample_cols=15, poly_degree=2, guess_rows=_SYN_GUESS_ROWS)
 
         nrows = flat.shape[0]
         for i in range(trace.n_orders):
@@ -3539,7 +3587,7 @@ class TestIDLPortFidelity:
         flat = _make_synthetic_flat(seed=6)
         path = str(tmp_path / "syn_flat.fits")
         _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2, guess_rows=_SYN_GUESS_ROWS)
 
         geom = trace.to_order_geometry_set("H1")
         assert isinstance(geom, OrderGeometrySet), (
@@ -3558,7 +3606,7 @@ class TestIDLPortFidelity:
         flat = _make_synthetic_flat(seed=7)
         path = str(tmp_path / "syn_flat.fits")
         _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2, guess_rows=_SYN_GUESS_ROWS)
 
         assert trace.bot_poly_coeffs is not None
         assert trace.top_poly_coeffs is not None
@@ -3588,7 +3636,7 @@ class TestIDLPortFidelity:
         flat = _make_synthetic_flat(seed=8)
         path = str(tmp_path / "syn_flat.fits")
         _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2, guess_rows=_SYN_GUESS_ROWS)
         geom = trace.to_order_geometry_set("H1")
 
         for i, g in enumerate(geom.geometries):
@@ -3611,7 +3659,7 @@ class TestIDLPortFidelity:
         flat = _make_synthetic_flat(seed=9)
         path = str(tmp_path / "syn_flat.fits")
         _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2, guess_rows=_SYN_GUESS_ROWS)
 
         n = trace.n_orders
         d = trace.poly_degree + 1   # number of polynomial coefficients
@@ -3651,7 +3699,7 @@ class TestIDLPortFidelity:
         flat = _make_synthetic_flat(seed=10)
         path = str(tmp_path / "syn_flat.fits")
         _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2, guess_rows=_SYN_GUESS_ROWS)
 
         for i, os_i in enumerate(trace.order_samples):
             n_samp = len(os_i.sample_cols)
@@ -3674,7 +3722,7 @@ class TestIDLPortFidelity:
         flat = _make_synthetic_flat(seed=99)
         path = str(tmp_path / "syn_flat.fits")
         _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat([path], n_sample_cols=15, poly_degree=2)
+        trace = trace_orders_from_flat([path], n_sample_cols=15, poly_degree=2, guess_rows=_SYN_GUESS_ROWS)
 
         bad = np.where(~np.isfinite(trace.fit_rms))[0]
         assert len(bad) == 0, (
