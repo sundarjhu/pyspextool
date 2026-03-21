@@ -1,13 +1,13 @@
 """
-Order-centre tracing from iSHELL flat-field frames.
+Order-edge and centre tracing from iSHELL flat-field frames.
 
 This module implements the first stage of the iSHELL 2DXD reduction
-scaffold: tracing echelle order centres from one or more median-combined
-QTH flat-field frames.  The result is a :class:`FlatOrderTrace` object
-containing:
+scaffold: tracing echelle order edges and centres from one or more
+median-combined QTH flat-field frames.  The result is a
+:class:`FlatOrderTrace` object containing:
 
-* the sampled centre-row positions at a set of detector columns,
-* low-order polynomial fits to those positions, and
+* per-order bottom and top **edge** polynomials (IDL Spextool-style),
+* per-order centre polynomials derived as the midpoint of the edges,
 * estimated per-order half-widths.
 
 The :class:`FlatOrderTrace` can be converted to an
@@ -16,10 +16,10 @@ The :class:`FlatOrderTrace` can be converted to an
 later 2DXD arc-line tracing stage.
 
 .. note::
-   This is a **first-pass tracing scaffold**, not a finalised geometry
-   calibration.  The outputs are suitable for development and smoke-testing
-   the downstream pipeline, but should not be used for science-quality
-   spectral rectification without further validation.
+   No IDL Spextool ``.pro`` source files were found in this repository.
+   The edge-based algorithm below is reconstructed from the documented IDL
+   Spextool behaviour (Cushing et al. 2004) and the existing Python scaffold.
+   It is a best-effort IDL port, not a verified line-by-line translation.
 
 Algorithm
 ---------
@@ -31,26 +31,34 @@ Algorithm
    median-averaging over a narrow column band (±``col_half_width`` columns).
    The median suppresses residual cosmic rays and bad pixels.
 
-3. **Peak finding** – at each sample column, find local maxima in the profile
-   using :func:`scipy.signal.find_peaks`.  The ``prominence`` criterion is the
-   most reliable discriminator: it measures how much a peak stands above its
-   local surroundings and is robust to the slowly-varying blaze envelope.
+3. **Seed peak finding** – at the central *seed column*, find local maxima in
+   the cross-dispersion profile using :func:`scipy.signal.find_peaks`.  These
+   peak positions serve as initial order-centre estimates.
 
-4. **Seed extraction** – peaks found at the central seed column are used as
-   initial position estimates for all orders.
+4. **Column-by-column edge tracking (IDL-like)** – at each sample column:
 
-5. **Column-by-column tracking** – at each sample column the nearest peak to
-   the most recent position estimate (within ``max_shift`` pixels) is
-   accepted.  Unmatched positions are left as ``NaN``.
+   a. The nearest profile peak to the current position estimate (within
+      ``max_shift`` pixels) is found.
+   b. The **bottom** and **top edges** of the order are located by walking
+      downward and upward from the accepted peak until the profile drops to
+      ``edge_fraction × (peak − baseline) + baseline`` (default:
+      half-maximum, ``edge_fraction = 0.5``).
+   c. The order **centre** is recorded as the midpoint of the two edges,
+      not directly as the peak location (IDL-like derivation).
+   d. If no matching peak is found within ``max_shift``, all three
+      quantities are marked ``NaN`` and the position estimate is unchanged.
 
-6. **Polynomial fitting with sigma-clipping** – a degree-``poly_degree``
-   polynomial is fitted to each order's traced positions using iterative
-   sigma-clipping (3 iterations, clip at ``sigma_clip`` × RMS).  The
-   :func:`numpy.polynomial.polynomial.polyfit` convention is used throughout:
-   ``coeffs[k]`` is the coefficient of ``x**k``.
+5. **Polynomial fitting with adaptive degree and sigma-clipping** – separate
+   degree-``poly_degree`` polynomials are fitted to the bottom and top edge
+   positions using iterative sigma-clipping (3 iterations, clip at
+   ``sigma_clip`` × RMS).  When fewer than ``poly_degree + 2`` valid
+   columns are available the degree is reduced adaptively to prevent
+   over-fitting near the detector edges.  The centre polynomial is the
+   arithmetic mean of the bottom and top edge polynomials.
 
-7. **Half-width estimation** – the half-maximum half-width of each order peak
-   in the seed-column profile is recorded as a proxy for order width.
+6. **Half-width estimation** – the half-width of each order at the seed column
+   is derived from the edge positions measured there, giving a
+   per-column-consistent width estimate rather than a seed-only heuristic.
 
 Observations from the H1 dataset
 ----------------------------------
@@ -77,10 +85,9 @@ These are first-pass observations, not finalised calibration results.
 
 Relationship to the 2DXD arc-line tracing stage
 -------------------------------------------------
-This module provides the *centre-line* geometry needed for the first step of
-2DXD rectification.  The subsequent steps (not yet implemented) are:
+This module provides the *edge and centre-line* geometry needed for the first
+step of 2DXD rectification.  The subsequent steps (not yet implemented) are:
 
-* Edge tracing – refine bottom/top order edges from the flat profile.
 * Tilt and curvature measurement – measure spectral-line tilt and curvature
   from arc-lamp frames using the order boundaries established here.
 * Wavelength calibration – identify arc lines and fit a wavelength solution.
@@ -89,8 +96,6 @@ This module provides the *centre-line* geometry needed for the first step of
 
 What remains unimplemented
 --------------------------
-* Precise edge tracing from flat-field profiles (only half-width estimates are
-  produced here).
 * Per-order column-range trimming (all orders use the same ``col_range``).
 * Tilt, curvature, wavelength, and spatial calibration polynomials.
 * Full 2DXD rectification.
@@ -263,6 +268,21 @@ class FlatOrderTrace:
     poly_degree: int
     seed_col: int
     order_stats: list[OrderTraceStats] = field(default_factory=list)
+    # Optional fields added for IDL-style edge tracing (populated by
+    # trace_orders_from_flat; None when constructed manually).
+    bottom_edge_poly_coeffs: Optional[np.ndarray] = None
+    """ndarray, shape (n_orders, poly_degree + 1) or None.
+    Per-order polynomial coefficients for the bottom (lower-row) order edge.
+    ``None`` if the result was constructed without edge tracing."""
+    top_edge_poly_coeffs: Optional[np.ndarray] = None
+    """ndarray, shape (n_orders, poly_degree + 1) or None.
+    Per-order polynomial coefficients for the top (upper-row) order edge.
+    ``None`` if the result was constructed without edge tracing."""
+    poly_degrees_used: Optional[np.ndarray] = None
+    """ndarray of int, shape (n_orders,) or None.
+    Actual polynomial degree used for each order after adaptive reduction.
+    -1 marks orders for which the polynomial fit was skipped.
+    ``None`` if the result was constructed without edge tracing."""
 
     def to_order_geometry_set(
         self,
@@ -271,19 +291,13 @@ class FlatOrderTrace:
     ) -> OrderGeometrySet:
         """Convert the tracing result to an :class:`OrderGeometrySet`.
 
-        .. warning::
-           The returned geometry is **provisional scaffolding**, not a
-           science-quality calibration.  Specifically:
-
-           * Only **order centres are traced from data**.  The bottom and
-             top edge polynomials are **approximated** by offsetting the
-             centre-line polynomial constant term by ``±half_width_rows``;
-             they are not independently fitted to the flat profile.
-           * Order numbers are **placeholder integers** (0, 1, 2, …) assigned
-             sequentially.  Real echelle order numbers are not yet assigned;
-             that requires the wavecal step.
-           * The geometry objects are intended for development and pipeline
-             scaffolding, not for final science-quality spectral rectification.
+        When :attr:`bottom_edge_poly_coeffs` and
+        :attr:`top_edge_poly_coeffs` are populated (i.e., the result came
+        from :func:`trace_orders_from_flat`), those fitted edge polynomials
+        are used directly for the order geometry.  Otherwise the edge
+        polynomials are approximated by offsetting the centre-line polynomial
+        constant term by ``±half_width_rows`` (legacy fallback for objects
+        constructed manually without edge tracing).
 
         Parameters
         ----------
@@ -297,6 +311,12 @@ class FlatOrderTrace:
         Returns
         -------
         :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet`
+
+        Notes
+        -----
+        Order numbers are **placeholder integers** (0, 1, 2, …) assigned
+        sequentially.  Real echelle order numbers are not yet assigned;
+        that requires the wavecal step.
         """
         if col_range is None:
             x_start = int(self.sample_cols[0])
@@ -304,15 +324,27 @@ class FlatOrderTrace:
         else:
             x_start, x_end = int(col_range[0]), int(col_range[1])
 
+        _have_edges = (
+            self.bottom_edge_poly_coeffs is not None
+            and self.top_edge_poly_coeffs is not None
+        )
+
         geometries = []
         for i in range(self.n_orders):
-            c = self.center_poly_coeffs[i].copy()
             hw = float(self.half_width_rows[i])
 
-            bot_coeffs = c.copy()
-            top_coeffs = c.copy()
-            bot_coeffs[0] -= hw
-            top_coeffs[0] += hw
+            if _have_edges and np.all(np.isfinite(self.bottom_edge_poly_coeffs[i])) \
+                    and np.all(np.isfinite(self.top_edge_poly_coeffs[i])):
+                # Use directly traced edge polynomials (IDL-like path).
+                bot_coeffs = self.bottom_edge_poly_coeffs[i].copy()
+                top_coeffs = self.top_edge_poly_coeffs[i].copy()
+            else:
+                # Legacy fallback: approximate edges from centre ± half_width.
+                c = self.center_poly_coeffs[i].copy()
+                bot_coeffs = c.copy()
+                top_coeffs = c.copy()
+                bot_coeffs[0] -= hw
+                top_coeffs[0] += hw
 
             geom = OrderGeometry(
                 order=i,
@@ -471,52 +503,100 @@ def trace_orders_from_flat(
     sample_cols = np.unique(sample_cols)
 
     # ------------------------------------------------------------------
-    # 5. Trace each order across sample columns
+    # 5. Trace each order across sample columns (IDL-like edge tracking)
+    #    centre_rows is derived as (bottom_edge + top_edge) / 2
     # ------------------------------------------------------------------
     center_rows = np.full((n_orders, len(sample_cols)), np.nan)
+    bottom_edge_rows = np.full((n_orders, len(sample_cols)), np.nan)
+    top_edge_rows = np.full((n_orders, len(sample_cols)), np.nan)
 
     # Find the index of the sample column closest to the seed column
     seed_idx = int(np.argmin(np.abs(sample_cols - seed_col)))
 
-    # Trace each order independently across all sample columns,
-    # walking outward from the seed column in both directions so that
-    # the running position estimate is always based on the most recent
-    # good match.
-    _trace_all_orders(
+    _trace_all_orders_and_edges(
         flat, sample_cols, seed_idx, seed_peaks,
-        center_rows, col_half_width, min_distance, min_prominence, max_shift,
+        center_rows, bottom_edge_rows, top_edge_rows,
+        col_half_width, min_distance, min_prominence, max_shift,
     )
 
     # ------------------------------------------------------------------
-    # 6. Fit polynomials with sigma-clipping
+    # 6. Fit edge and centre polynomials with adaptive degree and
+    #    sigma-clipping.  The centre polynomial is the mean of the two
+    #    edge polynomials (IDL-like derivation).
     # ------------------------------------------------------------------
-    center_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
+    n_terms = poly_degree + 1
+    center_poly_coeffs = np.zeros((n_orders, n_terms))
+    bottom_edge_poly_coeffs = np.full((n_orders, n_terms), np.nan)
+    top_edge_poly_coeffs = np.full((n_orders, n_terms), np.nan)
     fit_rms = np.full(n_orders, np.nan)
+    poly_degrees_used = np.full(n_orders, -1, dtype=int)
 
     for i in range(n_orders):
-        row_vals = center_rows[i]
-        good = np.isfinite(row_vals)
+        # Both edges must be valid at the same column.
+        good = np.isfinite(bottom_edge_rows[i]) & np.isfinite(top_edge_rows[i])
 
-        if good.sum() < poly_degree + 1:
+        if good.sum() < 2:
             logger.warning(
-                "Order %d: only %d valid sample points; polynomial fit skipped.",
-                i, good.sum(),
+                "Order %d: only %d valid edge sample points; "
+                "polynomial fit skipped.",
+                i, int(good.sum()),
             )
             continue
 
+        # Adaptive degree: reduce when there are too few valid columns
+        # to constrain the requested polynomial degree.  This prevents
+        # wild extrapolation near detector edges.
+        effective_degree = poly_degree
+        while effective_degree > 1 and good.sum() < effective_degree + 2:
+            effective_degree -= 1
+        if good.sum() < effective_degree + 1:
+            continue
+
         cols_fit = sample_cols[good].astype(float)
-        rows_fit = row_vals[good]
 
-        coeffs, rms = _fit_poly_sigma_clip(
-            cols_fit, rows_fit, poly_degree, sigma_clip, n_iter=3,
+        bot_coeffs, bot_rms = _fit_poly_sigma_clip(
+            cols_fit, bottom_edge_rows[i][good], effective_degree, sigma_clip,
+            n_iter=3,
         )
-        center_poly_coeffs[i] = coeffs
-        fit_rms[i] = rms
+        top_coeffs, top_rms = _fit_poly_sigma_clip(
+            cols_fit, top_edge_rows[i][good], effective_degree, sigma_clip,
+            n_iter=3,
+        )
+
+        # Pad to full length (zeros for higher-order terms when degree
+        # was reduced) so all arrays have consistent shape.
+        bot_full = np.zeros(n_terms)
+        top_full = np.zeros(n_terms)
+        bot_full[:effective_degree + 1] = bot_coeffs
+        top_full[:effective_degree + 1] = top_coeffs
+
+        bottom_edge_poly_coeffs[i] = bot_full
+        top_edge_poly_coeffs[i] = top_full
+
+        # Centre is the midpoint of the two edge polynomials.
+        center_poly_coeffs[i] = (bot_full + top_full) / 2.0
+
+        # Report RMS of the edge-midpoint residuals as the centre fit RMS.
+        center_mid = (bottom_edge_rows[i][good] + top_edge_rows[i][good]) / 2.0
+        predicted = np.polynomial.polynomial.polyval(cols_fit, center_poly_coeffs[i])
+        fit_rms[i] = float(np.std(center_mid - predicted))
+
+        poly_degrees_used[i] = effective_degree
 
     # ------------------------------------------------------------------
-    # 7. Estimate order half-widths from the seed profile
+    # 7. Estimate order half-widths from edge positions at the seed column.
+    #    Fall back to the profile walk method when seed edges are missing.
     # ------------------------------------------------------------------
-    half_width_rows = _estimate_half_widths(seed_profile, seed_peaks)
+    half_width_rows = np.full(n_orders, np.nan)
+    for i in range(n_orders):
+        bot_seed = bottom_edge_rows[i, seed_idx]
+        top_seed = top_edge_rows[i, seed_idx]
+        if np.isfinite(bot_seed) and np.isfinite(top_seed):
+            half_width_rows[i] = (top_seed - bot_seed) / 2.0
+        else:
+            # Fallback: half-maximum walk on the seed profile.
+            hw = _estimate_half_widths(seed_profile, np.array([seed_peaks[i]]))
+            half_width_rows[i] = hw[0]
 
     # ------------------------------------------------------------------
     # 8. Compute per-order QA metrics
@@ -542,6 +622,9 @@ def trace_orders_from_flat(
         poly_degree=poly_degree,
         seed_col=seed_col,
         order_stats=order_stats,
+        bottom_edge_poly_coeffs=bottom_edge_poly_coeffs,
+        top_edge_poly_coeffs=top_edge_poly_coeffs,
+        poly_degrees_used=poly_degrees_used,
     )
 
 
@@ -731,6 +814,149 @@ def _trace_all_orders(
                     center_rows[i, idx] = np.nan
                     # Keep current_est unchanged so the next column
                     # still uses the last known good position.
+
+
+def _find_edge_positions(
+    profile: npt.NDArray,
+    peak_row: float,
+    baseline: float,
+    edge_fraction: float = 0.5,
+) -> tuple[float, float]:
+    """Find the bottom and top edge row positions for a single order.
+
+    Walks downward (decreasing row index) and upward (increasing row index)
+    from *peak_row* until the profile drops to
+    ``baseline + edge_fraction * (peak_value - baseline)``.  The first row
+    on each side that is at or below this threshold is returned as the edge.
+
+    Parameters
+    ----------
+    profile : ndarray, shape (nrows,)
+        Cross-dispersion intensity profile.
+    peak_row : float
+        Approximate peak (centre) row position.
+    baseline : float
+        Background level, typically the 20th-percentile of the profile.
+    edge_fraction : float, default 0.5
+        Threshold as a fraction of the above-baseline peak signal.  The
+        default of 0.5 gives the half-maximum (FWHM) edges.
+
+    Returns
+    -------
+    (bottom_row, top_row) : tuple of float
+        Edge row indices.  ``bottom_row <= top_row``.  Both values are
+        clamped to ``[0, nrows - 1]``.
+    """
+    nrows = len(profile)
+    pk = max(0, min(nrows - 1, int(round(peak_row))))
+    peak_val = float(profile[pk])
+    threshold = baseline + (peak_val - baseline) * edge_fraction
+
+    # Walk down to the bottom (lower-row) edge.
+    bot = pk
+    while bot > 0 and profile[bot] > threshold:
+        bot -= 1
+
+    # Walk up to the top (upper-row) edge.
+    top = pk
+    while top < nrows - 1 and profile[top] > threshold:
+        top += 1
+
+    return float(bot), float(top)
+
+
+def _trace_all_orders_and_edges(
+    flat: npt.NDArray,
+    sample_cols: npt.NDArray,
+    seed_idx: int,
+    seed_peaks: npt.NDArray,
+    center_rows: npt.NDArray,
+    bottom_edge_rows: npt.NDArray,
+    top_edge_rows: npt.NDArray,
+    col_half_width: int,
+    min_distance: int,
+    min_prominence: float,
+    max_shift: float,
+    edge_fraction: float = 0.5,
+) -> None:
+    """Trace order centres and edges across all sample columns (IDL-like).
+
+    For each sample column, the algorithm:
+
+    1. Extracts a cross-dispersion profile.
+    2. Finds the nearest acceptable peak to the current position estimate
+       (within *max_shift* pixels).
+    3. Locates the bottom and top order edges by threshold-crossing walks
+       from the accepted peak position (using *edge_fraction* of the
+       above-baseline peak signal as the threshold level).
+    4. Records the order **centre as the midpoint of the two edges** —
+       matching the IDL Spextool convention of deriving centres from edges,
+       not directly from peak detection.
+    5. Leaves all three arrays as ``NaN`` at columns where no matching
+       peak is found; the position estimate is not updated in that case.
+
+    Fills *center_rows*, *bottom_edge_rows*, and *top_edge_rows* in place.
+
+    Parameters
+    ----------
+    flat : ndarray
+        Flat-field image.
+    sample_cols : ndarray of int
+        Column indices to evaluate.
+    seed_idx : int
+        Index into *sample_cols* of the seed column.
+    seed_peaks : ndarray of int
+        Row positions of order seeds.
+    center_rows, bottom_edge_rows, top_edge_rows :
+        Output arrays of shape (n_orders, n_sample); filled in place.
+    col_half_width, min_distance, min_prominence, max_shift :
+        Passed through to helper functions.
+    edge_fraction : float, default 0.5
+        Threshold level for edge detection (fraction of above-baseline peak).
+    """
+    n_orders = center_rows.shape[0]
+    n_cols = len(sample_cols)
+
+    for direction_start, direction_stop, direction_step in [
+        (seed_idx, n_cols, +1),    # rightward (includes seed column)
+        (seed_idx - 1, -1, -1),    # leftward
+    ]:
+        # Initialise running position estimates from seed peaks.
+        current_est = seed_peaks.astype(float).copy()
+
+        for idx in range(direction_start, direction_stop, direction_step):
+            col = int(sample_cols[idx])
+            profile = _extract_cross_section(flat, col, col_half_width)
+            peaks = _find_order_peaks(profile, min_distance, min_prominence)
+            baseline = float(np.percentile(profile, 20))
+
+            for i in range(n_orders):
+                est = current_est[i]
+                if not np.isfinite(est) or len(peaks) == 0:
+                    center_rows[i, idx] = np.nan
+                    bottom_edge_rows[i, idx] = np.nan
+                    top_edge_rows[i, idx] = np.nan
+                    continue
+
+                dists = np.abs(peaks.astype(float) - est)
+                j = int(np.argmin(dists))
+                if dists[j] > max_shift:
+                    center_rows[i, idx] = np.nan
+                    bottom_edge_rows[i, idx] = np.nan
+                    top_edge_rows[i, idx] = np.nan
+                    # Keep current_est unchanged for the next column.
+                    continue
+
+                peak_row = float(peaks[j])
+                bot, top = _find_edge_positions(
+                    profile, peak_row, baseline, edge_fraction
+                )
+                bottom_edge_rows[i, idx] = bot
+                top_edge_rows[i, idx] = top
+                # Centre is the edge midpoint (IDL Spextool convention).
+                edge_center = (bot + top) / 2.0
+                center_rows[i, idx] = edge_center
+                current_est[i] = edge_center
 
 
 def _fit_poly_sigma_clip(

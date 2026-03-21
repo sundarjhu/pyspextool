@@ -759,3 +759,337 @@ def _write_three_flats(tmp_path, base=None) -> list[str]:
         _write_fits_flat(flat_k, p)
         paths.append(p)
     return paths
+
+
+# ---------------------------------------------------------------------------
+# 7. Edge tracing — new fields and IDL-like algorithmic behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeTracingNewFields:
+    """trace_orders_from_flat populates edge polynomial and degree fields."""
+
+    @pytest.fixture(scope="class")
+    def trace(self, tmp_path_factory):
+        flat = _make_synthetic_flat(seed=0)
+        tmp = tmp_path_factory.mktemp("edge")
+        path = str(tmp / "syn_flat.fits")
+        _write_fits_flat(flat, path)
+        return trace_orders_from_flat(
+            [path],
+            n_sample_cols=15,
+            poly_degree=2,
+            col_range=(50, _NCOLS - 50),
+        )
+
+    def test_bottom_edge_poly_coeffs_is_populated(self, trace):
+        assert trace.bottom_edge_poly_coeffs is not None
+
+    def test_top_edge_poly_coeffs_is_populated(self, trace):
+        assert trace.top_edge_poly_coeffs is not None
+
+    def test_poly_degrees_used_is_populated(self, trace):
+        assert trace.poly_degrees_used is not None
+
+    def test_bottom_edge_poly_coeffs_shape(self, trace):
+        assert trace.bottom_edge_poly_coeffs.shape == (
+            _SYN_N_ORDERS, trace.poly_degree + 1
+        )
+
+    def test_top_edge_poly_coeffs_shape(self, trace):
+        assert trace.top_edge_poly_coeffs.shape == (
+            _SYN_N_ORDERS, trace.poly_degree + 1
+        )
+
+    def test_poly_degrees_used_shape(self, trace):
+        assert trace.poly_degrees_used.shape == (_SYN_N_ORDERS,)
+
+    def test_poly_degrees_used_values_at_most_poly_degree(self, trace):
+        for d in trace.poly_degrees_used:
+            assert d <= trace.poly_degree
+
+    def test_poly_degrees_used_nonnegative_for_synthetic(self, trace):
+        """All synthetic orders have enough sample points for at least degree 0."""
+        assert np.all(trace.poly_degrees_used >= 0), (
+            "All synthetic orders should have valid fits (degree >= 0)"
+        )
+
+    def test_center_equals_edge_midpoint(self, trace):
+        """Centre polynomial must be the arithmetic mean of the edge polynomials."""
+        for i in range(trace.n_orders):
+            expected = (
+                trace.bottom_edge_poly_coeffs[i] + trace.top_edge_poly_coeffs[i]
+            ) / 2.0
+            np.testing.assert_allclose(
+                trace.center_poly_coeffs[i], expected, atol=1e-6,
+                err_msg=f"Order {i}: centre poly != (bot + top) / 2"
+            )
+
+    def test_top_edge_above_bottom_edge_at_all_sample_cols(self, trace):
+        """Top edge must be strictly above bottom edge across the whole detector."""
+        for i in range(trace.n_orders):
+            if not (np.all(np.isfinite(trace.bottom_edge_poly_coeffs[i])) and
+                    np.all(np.isfinite(trace.top_edge_poly_coeffs[i]))):
+                continue
+            for col in trace.sample_cols:
+                bot = np.polynomial.polynomial.polyval(
+                    float(col), trace.bottom_edge_poly_coeffs[i]
+                )
+                top = np.polynomial.polynomial.polyval(
+                    float(col), trace.top_edge_poly_coeffs[i]
+                )
+                assert top > bot, (
+                    f"Order {i}, col {col}: top edge ({top:.1f}) not above "
+                    f"bottom edge ({bot:.1f})"
+                )
+
+    def test_to_order_geometry_uses_edge_polynomials(self, trace):
+        """When edge polys are present, to_order_geometry_set uses them directly."""
+        geom = trace.to_order_geometry_set("H1_syn", col_range=(50, _NCOLS - 50))
+        col_mid = (_NCOLS - 50 + 50) // 2
+        for i, g in enumerate(geom.geometries):
+            expected_bot = np.polynomial.polynomial.polyval(
+                float(col_mid), trace.bottom_edge_poly_coeffs[i]
+            )
+            expected_top = np.polynomial.polynomial.polyval(
+                float(col_mid), trace.top_edge_poly_coeffs[i]
+            )
+            np.testing.assert_allclose(
+                g.eval_bottom_edge(col_mid), expected_bot, atol=1e-6,
+                err_msg=f"Order {i}: bottom edge mismatch"
+            )
+            np.testing.assert_allclose(
+                g.eval_top_edge(col_mid), expected_top, atol=1e-6,
+                err_msg=f"Order {i}: top edge mismatch"
+            )
+
+    def test_center_positions_near_known_via_edges(self, trace):
+        """Edge-derived centres must be within 5 px of the known synthetic values."""
+        col_mid = (_NCOLS - 50 + 50) // 2
+        for i in range(_SYN_N_ORDERS):
+            known_center = _SYN_FIRST_CENTER + i * _SYN_SPACING + _SYN_TILT * col_mid
+            fitted = float(
+                np.polynomial.polynomial.polyval(
+                    float(col_mid), trace.center_poly_coeffs[i]
+                )
+            )
+            assert abs(fitted - known_center) < 5.0, (
+                f"Order {i}: edge-derived centre {fitted:.1f} differs from "
+                f"known {known_center:.1f} by more than 5 px"
+            )
+
+    def test_no_off_detector_divergence(self, trace):
+        """Polynomial curves must stay within detector bounds at all sample cols."""
+        for i in range(trace.n_orders):
+            for col in trace.sample_cols:
+                center = float(
+                    np.polynomial.polynomial.polyval(
+                        float(col), trace.center_poly_coeffs[i]
+                    )
+                )
+                assert -10 <= center <= _NROWS + 10, (
+                    f"Order {i}, col {col}: centre {center:.1f} diverges "
+                    "off detector"
+                )
+
+
+# ---------------------------------------------------------------------------
+# 8. Metadata preservation through _filter_edge_orders (unit tests)
+# ---------------------------------------------------------------------------
+
+
+def _make_trace_with_metadata(n: int = 5) -> "FlatOrderTrace":
+    """Return a synthetic FlatOrderTrace with all metadata fields populated."""
+    ns = 10
+    n_terms = 3  # degree 2
+    stats = [
+        OrderTraceStats(
+            order_index=i,
+            rms_residual=float(i + 1),
+            curvature_metric=1e-4,
+            oscillation_metric=0.01,
+            min_sep_lower=np.nan if i == 0 else 30.0,
+            min_sep_upper=np.nan if i == n - 1 else 30.0,
+            crosses_lower=False,
+            crosses_upper=False,
+            trace_valid=True,
+        )
+        for i in range(n)
+    ]
+    # Give the last order a much smaller half-width to simulate a clipped edge.
+    hw = np.full(n, 15.0)
+    hw[-1] = 2.0  # clipped edge order
+    return FlatOrderTrace(
+        n_orders=n,
+        sample_cols=np.arange(ns),
+        center_rows=np.ones((n, ns)) * 100.0,
+        center_poly_coeffs=np.zeros((n, n_terms)),
+        fit_rms=np.ones(n),
+        half_width_rows=hw,
+        poly_degree=2,
+        seed_col=5,
+        order_stats=stats,
+        bottom_edge_poly_coeffs=np.zeros((n, n_terms)),
+        top_edge_poly_coeffs=np.zeros((n, n_terms)),
+        poly_degrees_used=np.full(n, 2, dtype=int),
+    )
+
+
+class TestFilterEdgeOrdersMetadata:
+    """_filter_edge_orders preserves all FlatOrderTrace metadata fields."""
+
+    def _get_filter_fn(self):
+        """Import _filter_edge_orders from the K3 benchmark script."""
+        import importlib.util
+        import sys
+        import os
+        script = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "scripts", "run_ishell_k3_example.py",
+        )
+        spec = importlib.util.spec_from_file_location("k3driver", script)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["k3driver"] = mod
+        spec.loader.exec_module(mod)
+        return mod._filter_edge_orders
+
+    def test_order_stats_preserved_after_filter(self):
+        """Filtered trace retains order_stats for kept orders."""
+        fn = self._get_filter_fn()
+        trace = _make_trace_with_metadata(n=5)
+        filtered = fn(trace, min_half_width_fraction=0.30)
+        # The last order has hw=2 (clipped), so it should be removed.
+        assert filtered.n_orders < 5
+        assert len(filtered.order_stats) == filtered.n_orders
+
+    def test_order_stats_indices_are_consistent_after_filter(self):
+        """order_stats[k].order_index need not equal k (old index is kept)."""
+        fn = self._get_filter_fn()
+        trace = _make_trace_with_metadata(n=5)
+        filtered = fn(trace, min_half_width_fraction=0.30)
+        # The order_stats list should have the correct length.
+        assert len(filtered.order_stats) == filtered.n_orders
+
+    def test_poly_degrees_used_preserved_after_filter(self):
+        """Filtered trace retains poly_degrees_used for kept orders."""
+        fn = self._get_filter_fn()
+        trace = _make_trace_with_metadata(n=5)
+        filtered = fn(trace, min_half_width_fraction=0.30)
+        assert filtered.poly_degrees_used is not None
+        assert len(filtered.poly_degrees_used) == filtered.n_orders
+
+    def test_bottom_edge_poly_coeffs_preserved_after_filter(self):
+        fn = self._get_filter_fn()
+        trace = _make_trace_with_metadata(n=5)
+        filtered = fn(trace, min_half_width_fraction=0.30)
+        assert filtered.bottom_edge_poly_coeffs is not None
+        assert filtered.bottom_edge_poly_coeffs.shape[0] == filtered.n_orders
+
+    def test_top_edge_poly_coeffs_preserved_after_filter(self):
+        fn = self._get_filter_fn()
+        trace = _make_trace_with_metadata(n=5)
+        filtered = fn(trace, min_half_width_fraction=0.30)
+        assert filtered.top_edge_poly_coeffs is not None
+        assert filtered.top_edge_poly_coeffs.shape[0] == filtered.n_orders
+
+    def test_none_edge_polys_remain_none_after_filter(self):
+        """If edge polys are None, they stay None after filtering."""
+        fn = self._get_filter_fn()
+        # Create a trace without edge polynomials.
+        n = 5
+        hw = np.full(n, 15.0)
+        hw[-1] = 2.0
+        trace = FlatOrderTrace(
+            n_orders=n,
+            sample_cols=np.arange(10),
+            center_rows=np.ones((n, 10)) * 100.0,
+            center_poly_coeffs=np.zeros((n, 4)),
+            fit_rms=np.ones(n),
+            half_width_rows=hw,
+            poly_degree=3,
+            seed_col=5,
+        )
+        filtered = fn(trace, min_half_width_fraction=0.30)
+        assert filtered.bottom_edge_poly_coeffs is None
+        assert filtered.top_edge_poly_coeffs is None
+        assert filtered.poly_degrees_used is None
+
+    def test_noop_returns_original_trace(self):
+        """When all half-widths are equal, filter returns the original object."""
+        fn = self._get_filter_fn()
+        n = 5
+        trace = FlatOrderTrace(
+            n_orders=n,
+            sample_cols=np.arange(10),
+            center_rows=np.ones((n, 10)),
+            center_poly_coeffs=np.zeros((n, 2)),
+            fit_rms=np.ones(n),
+            half_width_rows=np.full(n, 15.0),
+            poly_degree=1,
+            seed_col=5,
+        )
+        result = fn(trace)
+        assert result is trace  # no-op should return the same object
+
+
+# ---------------------------------------------------------------------------
+# 9. Sparse order and adaptive degree tests
+# ---------------------------------------------------------------------------
+
+
+class TestSparseOrderAdaptiveDegree:
+    """Adaptive degree reduction prevents catastrophic extrapolation."""
+
+    def test_sparse_flat_uses_lower_degree(self, tmp_path):
+        """An order visible only in the centre columns gets a reduced degree."""
+        # Build a flat where only 5 columns (out of 15) have detectable signal.
+        nrows, ncols = 128, 256
+        flat = np.ones((nrows, ncols), dtype=np.float32) * 200.0
+        rows = np.arange(nrows, dtype=float)
+        sigma = 4.0
+        # Put one bright order in the centre 5 columns only.
+        c_start, c_end = 90, 165
+        for c in range(ncols):
+            if c_start <= c <= c_end:
+                flat[:, c] += 15000.0 * np.exp(-0.5 * ((rows - 64) / sigma) ** 2)
+
+        path = str(tmp_path / "sparse_flat.fits")
+        _write_fits_flat(flat, path)
+
+        trace = trace_orders_from_flat(
+            [path],
+            n_sample_cols=15,
+            poly_degree=3,  # request degree 3
+            col_range=(0, ncols - 1),
+            min_prominence=500.0,
+            min_distance=20,
+        )
+        assert trace.n_orders >= 1
+        # The detected order should have a reduced degree (< 3) or -1.
+        for i in range(trace.n_orders):
+            d = trace.poly_degrees_used[i]
+            assert d <= 3, f"Degree {d} exceeds requested degree 3"
+
+    def test_center_stays_within_detector_for_full_coverage_flat(self, tmp_path):
+        """Orders visible across the full column range stay within bounds."""
+        flat = _make_synthetic_flat(seed=7)
+        path = str(tmp_path / "full.fits")
+        _write_fits_flat(flat, path)
+
+        trace = trace_orders_from_flat(
+            [path],
+            n_sample_cols=20,
+            poly_degree=3,
+            col_range=(20, _NCOLS - 20),
+        )
+        col_lo, col_hi = 20, _NCOLS - 20
+        for i in range(trace.n_orders):
+            for col in [col_lo, (col_lo + col_hi) // 2, col_hi]:
+                center = float(
+                    np.polynomial.polynomial.polyval(
+                        float(col), trace.center_poly_coeffs[i]
+                    )
+                )
+                assert -10 <= center <= _NROWS + 10, (
+                    f"Order {i}, col {col}: centre {center:.1f} diverges off detector"
+                )

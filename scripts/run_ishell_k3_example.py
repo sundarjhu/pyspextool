@@ -705,6 +705,20 @@ def _filter_edge_orders(
         half_width_rows=trace.half_width_rows[keep_arr],
         poly_degree=trace.poly_degree,
         seed_col=trace.seed_col,
+        # Preserve all metadata so downstream code and QA tests can inspect it.
+        order_stats=[trace.order_stats[i] for i in keep_arr] if trace.order_stats else [],
+        bottom_edge_poly_coeffs=(
+            trace.bottom_edge_poly_coeffs[keep_arr]
+            if trace.bottom_edge_poly_coeffs is not None else None
+        ),
+        top_edge_poly_coeffs=(
+            trace.top_edge_poly_coeffs[keep_arr]
+            if trace.top_edge_poly_coeffs is not None else None
+        ),
+        poly_degrees_used=(
+            trace.poly_degrees_used[keep_arr]
+            if trace.poly_degrees_used is not None else None
+        ),
     )
 
 
@@ -720,12 +734,12 @@ def _plot_flat_orders(
     save: bool,
     prefix: str,
 ) -> None:
-    """Python scaffold QA: traced order centres overlaid on the combined flat.
+    """Python scaffold QA: traced order edges and centres on the combined flat.
 
-    The overlay shows **smooth polynomial curves** evaluated continuously
-    across the full column range of each order, so the fitted trace is
-    clearly visible.  Sparse sampled points are overlaid in a lighter
-    style for reference.
+    When edge polynomials are available (IDL-like tracing path), the plot
+    shows bottom edges, top edges, and centre lines for each order.  When
+    only centre tracing was performed (legacy path), only centres are shown.
+    Sampled raw positions are overlaid as faint dots for reference.
     """
     try:
         import matplotlib
@@ -745,15 +759,32 @@ def _plot_flat_orders(
             vmax=vmax,
         )
 
-        # Evaluate each order's centre polynomial continuously across columns
+        _have_edges = (
+            trace.bottom_edge_poly_coeffs is not None
+            and trace.top_edge_poly_coeffs is not None
+        )
+
+        # Evaluate polynomials continuously across the full column range.
         col_range = np.arange(
             int(trace.sample_cols[0]), int(trace.sample_cols[-1]) + 1
         )
         for i in range(trace.n_orders):
-            coeffs = trace.center_poly_coeffs[i]
-            centers_smooth = np.polynomial.polynomial.polyval(col_range, coeffs)
-            ax.plot(col_range, centers_smooth, lw=0.9, alpha=0.85)
-            # Overlay sampled points in a light grey for reference
+            center_coeffs = trace.center_poly_coeffs[i]
+            centers_smooth = np.polynomial.polynomial.polyval(col_range, center_coeffs)
+            ax.plot(col_range, centers_smooth, lw=0.9, alpha=0.85, color="yellow")
+
+            if _have_edges and np.all(np.isfinite(trace.bottom_edge_poly_coeffs[i])) \
+                    and np.all(np.isfinite(trace.top_edge_poly_coeffs[i])):
+                bot_smooth = np.polynomial.polynomial.polyval(
+                    col_range, trace.bottom_edge_poly_coeffs[i]
+                )
+                top_smooth = np.polynomial.polynomial.polyval(
+                    col_range, trace.top_edge_poly_coeffs[i]
+                )
+                ax.plot(col_range, bot_smooth, lw=0.5, alpha=0.6, color="cyan")
+                ax.plot(col_range, top_smooth, lw=0.5, alpha=0.6, color="cyan")
+
+            # Overlay raw sampled centre positions as faint dots.
             ax.plot(
                 trace.sample_cols,
                 trace.center_rows[i],
@@ -763,9 +794,10 @@ def _plot_flat_orders(
                 color="white",
             )
 
+        edge_legend = " + edges (cyan)" if _have_edges else ""
         ax.set_title(
-            "Python scaffold QA — K3 flat: traced order centres\n"
-            f"({trace.n_orders} science orders, smooth polynomial curves)"
+            f"iSHELL K3 flat: traced order centres (yellow){edge_legend}\n"
+            f"({trace.n_orders} science orders)"
         )
         ax.set_xlabel("Column (pixels)")
         ax.set_ylabel("Row (pixels)")
