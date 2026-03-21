@@ -881,6 +881,11 @@ def trace_orders_from_flat(
     compat_center_rows = np.full((n_orders, len(union_cols)), np.nan)
     for i, os_i in enumerate(order_samples):
         for j, col in enumerate(os_i.sample_cols):
+            # Only copy values within the UPDATED (post-fit restricted) xrange.
+            # Columns outside [x_start, x_end] correspond to extrapolated
+            # polynomial territory and must remain NaN in the compat arrays.
+            if not (os_i.x_start <= col <= os_i.x_end):
+                continue
             k = int(np.searchsorted(union_cols, col))
             if k < len(union_cols) and union_cols[k] == col:
                 compat_center_rows[i, k] = os_i.center_rows[j]
@@ -904,7 +909,8 @@ def trace_orders_from_flat(
             f"values {union_cols[bad_indices].tolist()} -> {union_cols[bad_indices + 1].tolist()}"
         )
     # Every finite entry in compat_center_rows must correspond to a column
-    # that actually exists in that order's own order_samples[i].sample_cols.
+    # that actually exists in that order's own order_samples[i].sample_cols
+    # AND lies within the post-fit restricted [x_start, x_end].
     for i, os_i in enumerate(order_samples):
         order_col_set = set(os_i.sample_cols.tolist())
         for k, col in enumerate(union_cols):
@@ -913,6 +919,12 @@ def trace_orders_from_flat(
                 raise RuntimeError(
                     f"compat_center_rows[{i}, {k}] is finite but column {col} "
                     f"is not in order_samples[{i}].sample_cols — construction bug."
+                )
+            if np.isfinite(val) and (col < os_i.x_start or col > os_i.x_end):
+                raise RuntimeError(
+                    f"compat_center_rows[{i}, {k}] is finite but column {col} "
+                    f"is outside post-fit xrange [{os_i.x_start}, {os_i.x_end}] "
+                    f"for order {i} — construction bug."
                 )
 
     # ------------------------------------------------------------------

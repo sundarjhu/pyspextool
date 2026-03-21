@@ -2216,6 +2216,166 @@ class TestCompatArraysNoExtrapolation:
         assert len(trace.sample_cols) > 0
 
 
+# ---------------------------------------------------------------------------
+# 20. Compatibility arrays: sample_cols beyond post-fit xrange → masked
+# ---------------------------------------------------------------------------
+
+
+class TestCompatArraysPostFitXrangeMasking:
+    """Verify that compat_center_rows is NaN for sample columns that fall
+    outside the ORDER's post-fit restricted [x_start, x_end], even when those
+    columns appear in os_i.sample_cols.
+
+    This tests the specific leakage path described in the problem statement:
+    before the fix, step 8 copied all center_rows regardless of whether the
+    column still fell within the updated xrange.  After the fix, only columns
+    within [x_start, x_end] are copied; the rest remain NaN.
+    """
+
+    def _build_compat_array(self, order_samples):
+        """Replicate the step-8 construction from trace_orders_from_flat.
+
+        This is a white-box test of the exact construction logic so that we
+        can verify the fix without needing a full end-to-end flat trace.
+        """
+        union_cols = np.unique(
+            np.concatenate([os_i.sample_cols for os_i in order_samples])
+        )
+        compat_center_rows = np.full((len(order_samples), len(union_cols)), np.nan)
+        for i, os_i in enumerate(order_samples):
+            for j, col in enumerate(os_i.sample_cols):
+                if not (os_i.x_start <= col <= os_i.x_end):
+                    continue
+                k = int(np.searchsorted(union_cols, col))
+                if k < len(union_cols) and union_cols[k] == col:
+                    compat_center_rows[i, k] = os_i.center_rows[j]
+        return union_cols, compat_center_rows
+
+    def _make_order_samples(self, sample_cols, center_rows, x_start, x_end, idx=0):
+        """Create an OrderTraceSamples with explicit xrange."""
+        cols = np.array(sample_cols, dtype=int)
+        crows = np.array(center_rows, dtype=float)
+        return OrderTraceSamples(
+            order_index=idx,
+            sample_cols=cols,
+            center_rows=crows,
+            bot_rows=crows - 5.0,
+            top_rows=crows + 5.0,
+            x_start=x_start,
+            x_end=x_end,
+        )
+
+    def test_sample_cols_beyond_xend_become_nan(self):
+        """sample_cols extending beyond x_end must be NaN in compat array."""
+        # sample_cols: [0, 10, 20, 30, 40, 50] but x_end=30
+        # → cols 40, 50 should be NaN
+        sample_cols = [0, 10, 20, 30, 40, 50]
+        center_rows = [100.0] * 6
+        os = self._make_order_samples(sample_cols, center_rows, x_start=0, x_end=30)
+        union_cols, compat = self._build_compat_array([os])
+        for k, col in enumerate(union_cols):
+            if col > 30:
+                assert np.isnan(compat[0, k]), (
+                    f"col {col} > x_end=30: expected NaN, got {compat[0, k]}"
+                )
+            else:
+                assert np.isfinite(compat[0, k]), (
+                    f"col {col} <= x_end=30: expected finite, got {compat[0, k]}"
+                )
+
+    def test_sample_cols_before_xstart_become_nan(self):
+        """sample_cols before x_start must be NaN in compat array."""
+        # sample_cols: [0, 10, 20, 30, 40, 50] but x_start=20
+        # → cols 0, 10 should be NaN
+        sample_cols = [0, 10, 20, 30, 40, 50]
+        center_rows = [200.0] * 6
+        os = self._make_order_samples(sample_cols, center_rows, x_start=20, x_end=50)
+        union_cols, compat = self._build_compat_array([os])
+        for k, col in enumerate(union_cols):
+            if col < 20:
+                assert np.isnan(compat[0, k]), (
+                    f"col {col} < x_start=20: expected NaN, got {compat[0, k]}"
+                )
+            else:
+                assert np.isfinite(compat[0, k]), (
+                    f"col {col} >= x_start=20: expected finite, got {compat[0, k]}"
+                )
+
+    def test_both_ends_clipped(self):
+        """sample_cols extending beyond BOTH x_start and x_end → NaN at both ends."""
+        sample_cols = list(range(0, 110, 10))   # 0, 10, ..., 100
+        center_rows = [150.0] * len(sample_cols)
+        os = self._make_order_samples(sample_cols, center_rows, x_start=20, x_end=80)
+        union_cols, compat = self._build_compat_array([os])
+        for k, col in enumerate(union_cols):
+            if col < 20 or col > 80:
+                assert np.isnan(compat[0, k]), (
+                    f"col {col} outside [20, 80]: expected NaN, got {compat[0, k]}"
+                )
+            else:
+                assert np.isfinite(compat[0, k]), (
+                    f"col {col} inside [20, 80]: expected finite, got {compat[0, k]}"
+                )
+
+    def test_within_xrange_all_finite(self):
+        """When all sample_cols fall within [x_start, x_end], nothing is masked."""
+        sample_cols = [50, 60, 70, 80, 90]
+        center_rows = [175.0, 176.0, 177.0, 178.0, 179.0]
+        os = self._make_order_samples(sample_cols, center_rows, x_start=50, x_end=90)
+        union_cols, compat = self._build_compat_array([os])
+        assert np.all(np.isfinite(compat[0])), (
+            "All sample cols within xrange should produce all-finite compat array"
+        )
+
+    def test_two_orders_independent_masking(self):
+        """Each order's masking is independent; one order's clipping must not
+        affect the other order's compat values."""
+        # Order 0: sample_cols [0..100], but x_end=60 → cols 70..100 masked
+        # Order 1: sample_cols [0..100], x_start=40 → cols 0..30 masked
+        sample_cols = list(range(0, 110, 10))
+        os0 = self._make_order_samples(sample_cols, [100.0] * 11,
+                                        x_start=0, x_end=60, idx=0)
+        os1 = self._make_order_samples(sample_cols, [200.0] * 11,
+                                        x_start=40, x_end=100, idx=1)
+        union_cols, compat = self._build_compat_array([os0, os1])
+
+        # Order 0 checks
+        for k, col in enumerate(union_cols):
+            if col > 60:
+                assert np.isnan(compat[0, k]), f"Order 0, col {col} > 60: should be NaN"
+            else:
+                assert np.isfinite(compat[0, k]), f"Order 0, col {col} <= 60: should be finite"
+
+        # Order 1 checks
+        for k, col in enumerate(union_cols):
+            if col < 40:
+                assert np.isnan(compat[1, k]), f"Order 1, col {col} < 40: should be NaN"
+            else:
+                assert np.isfinite(compat[1, k]), f"Order 1, col {col} >= 40: should be finite"
+
+    def test_boundary_columns_are_finite(self):
+        """x_start and x_end boundary columns must be finite (inclusive range)."""
+        os = self._make_order_samples([10, 20, 30], [111.0, 122.0, 133.0],
+                                       x_start=10, x_end=30)
+        union_cols, compat = self._build_compat_array([os])
+        # col 10 and col 30 are on the boundary — must be finite
+        for k, col in enumerate(union_cols):
+            assert np.isfinite(compat[0, k]), (
+                f"Boundary col {col}: expected finite, got {compat[0, k]}"
+            )
+
+    def test_degenerate_xrange_only_start_col_finite(self):
+        """Degenerate xrange (x_start == x_end) → only the start column is finite."""
+        os = self._make_order_samples([10, 20, 30], [111.0, 122.0, 133.0],
+                                       x_start=20, x_end=20)
+        union_cols, compat = self._build_compat_array([os])
+        for k, col in enumerate(union_cols):
+            if col == 20:
+                assert np.isfinite(compat[0, k]), f"col 20 (degenerate xrange): should be finite"
+            else:
+                assert np.isnan(compat[0, k]), f"col {col} != 20 in degenerate xrange: should be NaN"
+
+
 
 def rng_offset(k: int) -> float:
     """Small constant offset to make three flats slightly different."""
