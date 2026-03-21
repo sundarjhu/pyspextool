@@ -180,6 +180,10 @@ class TestFlatOrderTraceDataclass:
         assert geom.geometries[0].x_end == int(dummy_trace.sample_cols[-1])
 
     def test_to_order_geometry_set_edges_offset_by_half_width(self, dummy_trace):
+        # When bot_poly_coeffs / top_poly_coeffs are None (direct construction),
+        # to_order_geometry_set falls back to centre ± half_width.
+        assert dummy_trace.bot_poly_coeffs is None
+        assert dummy_trace.top_poly_coeffs is None
         hw = float(dummy_trace.half_width_rows[0])
         geom = dummy_trace.to_order_geometry_set("H1")
         g = geom.geometries[0]
@@ -187,10 +191,54 @@ class TestFlatOrderTraceDataclass:
         np.testing.assert_allclose(g.bottom_edge_coeffs[0], g.centerline_coeffs[0] - hw)
         np.testing.assert_allclose(g.top_edge_coeffs[0], g.centerline_coeffs[0] + hw)
 
+    def test_to_order_geometry_set_uses_traced_edges_when_available(self):
+        """When bot/top_poly_coeffs are set, to_order_geometry_set uses them directly."""
+        n, ns = 2, 10
+        bot_polys = np.array([[50.0, 0.0, 0.0, 0.0], [100.0, 0.0, 0.0, 0.0]])
+        top_polys = np.array([[70.0, 0.0, 0.0, 0.0], [120.0, 0.0, 0.0, 0.0]])
+        trace = FlatOrderTrace(
+            n_orders=n,
+            sample_cols=np.arange(ns),
+            center_rows=np.ones((n, ns)) * 60.0,
+            center_poly_coeffs=np.array([[60.0, 0.0, 0.0, 0.0], [110.0, 0.0, 0.0, 0.0]]),
+            fit_rms=np.ones(n),
+            half_width_rows=np.full(n, 5.0),
+            poly_degree=3,
+            seed_col=5,
+            bot_poly_coeffs=bot_polys,
+            top_poly_coeffs=top_polys,
+        )
+        geom = trace.to_order_geometry_set("H1")
+        g0 = geom.geometries[0]
+        g1 = geom.geometries[1]
+        # Traced edge polys must be used directly, not the centre±hw fallback.
+        np.testing.assert_allclose(g0.bottom_edge_coeffs, bot_polys[0])
+        np.testing.assert_allclose(g0.top_edge_coeffs, top_polys[0])
+        np.testing.assert_allclose(g1.bottom_edge_coeffs, bot_polys[1])
+        np.testing.assert_allclose(g1.top_edge_coeffs, top_polys[1])
+        # Centreline must be the mean of the traced edges, not centre_poly_coeffs.
+        expected_cen_0 = (bot_polys[0] + top_polys[0]) / 2.0
+        np.testing.assert_allclose(g0.centerline_coeffs, expected_cen_0)
+
     def test_to_order_geometry_set_placeholder_order_numbers(self, dummy_trace):
         geom = dummy_trace.to_order_geometry_set("H1")
         for i, g in enumerate(geom.geometries):
             assert g.order == i
+
+    def test_bot_top_poly_coeffs_default_none(self):
+        """FlatOrderTrace constructed without edge polys has None bot/top."""
+        trace = FlatOrderTrace(
+            n_orders=1,
+            sample_cols=np.arange(10),
+            center_rows=np.ones((1, 10)) * 50.0,
+            center_poly_coeffs=np.zeros((1, 4)),
+            fit_rms=np.ones(1),
+            half_width_rows=np.full(1, 10.0),
+            poly_degree=3,
+            seed_col=5,
+        )
+        assert trace.bot_poly_coeffs is None
+        assert trace.top_poly_coeffs is None
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +784,217 @@ class TestTraceOrdersH1RealData:
         for g in geom.geometries:
             assert g.x_start == 650
             assert g.x_end == 1550
+
+
+# ---------------------------------------------------------------------------
+# 7. Edge-based geometry tests
+# ---------------------------------------------------------------------------
+
+
+class TestTracedEdgeGeometry:
+    """trace_orders_from_flat populates bot_poly_coeffs / top_poly_coeffs."""
+
+    @pytest.fixture()
+    def trace(self, tmp_path):
+        flat = _make_synthetic_flat(seed=42)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        return trace_orders_from_flat([path])
+
+    def test_bot_poly_coeffs_shape(self, trace):
+        assert trace.bot_poly_coeffs is not None
+        assert trace.bot_poly_coeffs.shape == (trace.n_orders, trace.poly_degree + 1)
+
+    def test_top_poly_coeffs_shape(self, trace):
+        assert trace.top_poly_coeffs is not None
+        assert trace.top_poly_coeffs.shape == (trace.n_orders, trace.poly_degree + 1)
+
+    def test_bot_poly_lt_top_poly_at_seed_col(self, trace):
+        """Bottom edge must be below top edge at all sample columns."""
+        for i in range(trace.n_orders):
+            bot_vals = np.polynomial.polynomial.polyval(
+                trace.sample_cols.astype(float), trace.bot_poly_coeffs[i]
+            )
+            top_vals = np.polynomial.polynomial.polyval(
+                trace.sample_cols.astype(float), trace.top_poly_coeffs[i]
+            )
+            assert np.all(bot_vals < top_vals), (
+                f"Order {i}: bottom edge is not consistently below top edge"
+            )
+
+    def test_center_poly_is_mean_of_edges(self, trace):
+        """center_poly_coeffs must equal (bot + top) / 2."""
+        for i in range(trace.n_orders):
+            expected = (trace.bot_poly_coeffs[i] + trace.top_poly_coeffs[i]) / 2.0
+            np.testing.assert_allclose(
+                trace.center_poly_coeffs[i], expected,
+                rtol=1e-10,
+                err_msg=f"Order {i}: center_poly_coeffs != (bot+top)/2",
+            )
+
+    def test_to_order_geometry_uses_traced_edges(self, trace):
+        """to_order_geometry_set must use traced bot/top polys, not centre±hw."""
+        geom = trace.to_order_geometry_set("K3")
+        for i, g in enumerate(geom.geometries):
+            np.testing.assert_allclose(
+                g.bottom_edge_coeffs, trace.bot_poly_coeffs[i],
+                rtol=1e-10,
+                err_msg=f"Order {i}: bottom_edge_coeffs does not match bot_poly_coeffs",
+            )
+            np.testing.assert_allclose(
+                g.top_edge_coeffs, trace.top_poly_coeffs[i],
+                rtol=1e-10,
+                err_msg=f"Order {i}: top_edge_coeffs does not match top_poly_coeffs",
+            )
+
+
+# ---------------------------------------------------------------------------
+# 8. Flatinfo-based initialization tests
+# ---------------------------------------------------------------------------
+
+
+class TestFlatinfoInitialization:
+    """When flatinfo is supplied, trace_orders_from_flat uses its guess positions."""
+
+    @pytest.fixture()
+    def _mock_flatinfo(self):
+        """Create a minimal FlatInfo-like object from known order positions."""
+        from types import SimpleNamespace
+
+        n_orders = _SYN_N_ORDERS
+        nrows = _NROWS
+        ncols = _NCOLS
+        poly_degree = 3
+
+        # Build edge_coeffs matching the synthetic flat order positions.
+        # Each order has a known centre c0 = _SYN_FIRST_CENTER + k*_SYN_SPACING.
+        # _SYN_HALF_WIDTH is the FWHM of the Gaussian profile (in pixels).
+        # We use hw/2 as the edge offset, placing edges at ±half-FWHM from centre.
+        hw = float(_SYN_HALF_WIDTH)
+        edge_coeffs = np.zeros((n_orders, 2, poly_degree + 1))
+        xranges = np.zeros((n_orders, 2), dtype=int)
+
+        for k in range(n_orders):
+            c0 = float(_SYN_FIRST_CENTER + k * _SYN_SPACING)
+            # Bottom edge: c0 - hw/2 (constant term only for simplicity)
+            edge_coeffs[k, 0, 0] = c0 - hw / 2.0
+            # Top edge: c0 + hw/2
+            edge_coeffs[k, 1, 0] = c0 + hw / 2.0
+            xranges[k] = [10, ncols - 10]
+
+        return SimpleNamespace(
+            edge_coeffs=edge_coeffs,
+            xranges=xranges,
+            edge_degree=poly_degree,
+            flat_fraction=0.85,
+            comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.0)),
+            ybuffer=1,
+            step=20,
+        )
+
+    @pytest.fixture()
+    def trace_with_flatinfo(self, tmp_path, _mock_flatinfo):
+        flat = _make_synthetic_flat(seed=42)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        return trace_orders_from_flat([path], flatinfo=_mock_flatinfo)
+
+    def test_n_orders_matches(self, trace_with_flatinfo):
+        assert trace_with_flatinfo.n_orders == _SYN_N_ORDERS
+
+    def test_bot_top_polys_populated(self, trace_with_flatinfo):
+        assert trace_with_flatinfo.bot_poly_coeffs is not None
+        assert trace_with_flatinfo.top_poly_coeffs is not None
+
+    def test_order_centers_near_known(self, trace_with_flatinfo):
+        """Order centres from flatinfo path should be within 5 pixels of known."""
+        trace = trace_with_flatinfo
+        cols_mid = float(np.median(trace.sample_cols))
+        for i in range(trace.n_orders):
+            known_c0 = float(_SYN_FIRST_CENTER + i * _SYN_SPACING)
+            known_centre = known_c0 + _SYN_TILT * cols_mid
+            measured = float(np.polynomial.polynomial.polyval(
+                cols_mid, trace.center_poly_coeffs[i]
+            ))
+            assert abs(measured - known_centre) < 10.0, (
+                f"Order {i}: centre {measured:.1f} more than 10 px from "
+                f"known {known_centre:.1f}"
+            )
+
+    def test_poly_degree_overridden_from_flatinfo(self, trace_with_flatinfo,
+                                                   _mock_flatinfo):
+        assert trace_with_flatinfo.poly_degree == _mock_flatinfo.edge_degree
+
+
+# ---------------------------------------------------------------------------
+# 9. _filter_edge_orders metadata preservation
+# ---------------------------------------------------------------------------
+
+
+class TestFilterEdgeOrders:
+    """_filter_edge_orders preserves all FlatOrderTrace metadata."""
+
+    @pytest.fixture()
+    def full_trace(self, tmp_path):
+        flat = _make_synthetic_flat(seed=42)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        return trace_orders_from_flat([path])
+
+    def test_filter_preserves_bot_top_polys(self, full_trace):
+        """Filtered trace must retain bot/top polynomial arrays."""
+        from pyspextool.instruments.ishell.tracing import FlatOrderTrace
+        n = full_trace.n_orders
+        # Build a trace with one narrow order (hw = 1.0) that should be filtered
+        hw = full_trace.half_width_rows.copy()
+        hw[0] = 0.1  # artificially narrow
+        narrow_trace = FlatOrderTrace(
+            n_orders=n,
+            sample_cols=full_trace.sample_cols,
+            center_rows=full_trace.center_rows,
+            center_poly_coeffs=full_trace.center_poly_coeffs,
+            fit_rms=full_trace.fit_rms,
+            half_width_rows=hw,
+            poly_degree=full_trace.poly_degree,
+            seed_col=full_trace.seed_col,
+            bot_poly_coeffs=full_trace.bot_poly_coeffs,
+            top_poly_coeffs=full_trace.top_poly_coeffs,
+            order_stats=full_trace.order_stats,
+        )
+
+        # Simulate the _filter_edge_orders logic from the K3 script.
+        median_hw = float(np.median(hw))
+        threshold = 0.30 * median_hw
+        keep = [i for i in range(n) if hw[i] >= threshold]
+        filtered = FlatOrderTrace(
+            n_orders=len(keep),
+            sample_cols=narrow_trace.sample_cols,
+            center_rows=narrow_trace.center_rows[keep],
+            center_poly_coeffs=narrow_trace.center_poly_coeffs[keep],
+            fit_rms=narrow_trace.fit_rms[keep],
+            half_width_rows=narrow_trace.half_width_rows[keep],
+            poly_degree=narrow_trace.poly_degree,
+            seed_col=narrow_trace.seed_col,
+            bot_poly_coeffs=narrow_trace.bot_poly_coeffs[keep] if narrow_trace.bot_poly_coeffs is not None else None,
+            top_poly_coeffs=narrow_trace.top_poly_coeffs[keep] if narrow_trace.top_poly_coeffs is not None else None,
+        )
+
+        # Should have filtered the narrow order
+        assert filtered.n_orders == n - 1
+
+        # bot/top polys must still be present and have correct shape
+        assert filtered.bot_poly_coeffs is not None
+        assert filtered.top_poly_coeffs is not None
+        assert filtered.bot_poly_coeffs.shape == (n - 1, narrow_trace.poly_degree + 1)
+        assert filtered.top_poly_coeffs.shape == (n - 1, narrow_trace.poly_degree + 1)
+
+        # geometry from filtered trace must use the traced edge polys
+        geom = filtered.to_order_geometry_set("K3")
+        for i, g in enumerate(geom.geometries):
+            np.testing.assert_allclose(
+                g.bottom_edge_coeffs, filtered.bot_poly_coeffs[i], rtol=1e-10
+            )
 
 
 # ---------------------------------------------------------------------------

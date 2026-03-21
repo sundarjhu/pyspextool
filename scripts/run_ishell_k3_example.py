@@ -705,6 +705,14 @@ def _filter_edge_orders(
         half_width_rows=trace.half_width_rows[keep_arr],
         poly_degree=trace.poly_degree,
         seed_col=trace.seed_col,
+        bot_poly_coeffs=(
+            trace.bot_poly_coeffs[keep_arr]
+            if trace.bot_poly_coeffs is not None else None
+        ),
+        top_poly_coeffs=(
+            trace.top_poly_coeffs[keep_arr]
+            if trace.top_poly_coeffs is not None else None
+        ),
     )
 
 

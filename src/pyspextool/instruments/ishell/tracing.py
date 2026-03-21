@@ -1,97 +1,99 @@
 """
-Order-centre tracing from iSHELL flat-field frames.
+Order-edge and order-centre tracing from iSHELL flat-field frames.
 
 This module implements the first stage of the iSHELL 2DXD reduction
-scaffold: tracing echelle order centres from one or more median-combined
-QTH flat-field frames.  The result is a :class:`FlatOrderTrace` object
-containing:
+scaffold: tracing echelle order bottom/top edges from one or more
+median-combined QTH flat-field frames.  The result is a
+:class:`FlatOrderTrace` object containing:
 
-* the sampled centre-row positions at a set of detector columns,
-* low-order polynomial fits to those positions, and
-* estimated per-order half-widths.
+* the sampled bottom-edge and top-edge row positions at a set of detector
+  columns (the **primary traced quantities**, matching IDL),
+* robust polynomial fits to those edge positions (``bot_poly_coeffs``,
+  ``top_poly_coeffs``),
+* centre-line polynomial coefficients derived from the edge fits, and
+* estimated per-order half-widths derived from edge separation.
 
 The :class:`FlatOrderTrace` can be converted to an
 :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet` via its
 :meth:`~FlatOrderTrace.to_order_geometry_set` method, which feeds into the
-later 2DXD arc-line tracing stage.
+later 2DXD arc-line tracing and wavecal stages.
 
-Algorithm (faithful port of IDL ``mc_findorders``)
---------------------------------------------------
-1. **Load frames** – open each flat FITS file (PRIMARY extension, extension 0)
-   and median-combine to suppress read noise and hot pixels.
+IDL Caller Chain (iSHELL flat-field geometry)
+----------------------------------------------
+The IDL procedures relevant to iSHELL flat/order geometry, in call order:
 
-2. **Seed detection** – find order-centre peaks at a single seed column using
-   :func:`scipy.signal.find_peaks` with a prominence criterion.  These peaks
-   serve as initial position estimates (guess positions) for all orders.
+1. ``mc_ishellcals2dxd.pro`` (``ishellcals2dxd_mkflat`` sub-procedure) –
+   top-level iSHELL calibration driver.  Calls the following in sequence:
 
-3. **Sobel enhancement** – compute the spatial-gradient magnitude of the flat
-   image (equivalent to IDL's ``sobel()``).  The Sobel image is used to
-   locate precise edge positions via centre-of-mass.
+2. ``mc_readflatinfo(flatinfofile)`` – reads the reference
+   ``K3_flatinfo.fits`` (or other mode's flatinfo) file.  Returns a
+   structure containing stored reference ``edgecoeffs`` (shape
+   ``[degree+1, 2, norders]``), ``xranges``, ``guesspos``, plus
+   tracing parameters ``step``, ``flatfrac``, ``comwin``, ``ybuffer``,
+   ``slith_range``, ``edgedeg``.
 
-4. **Per-order column-by-column tracking** (IDL ``mc_findorders`` algorithm):
+3. ``mc_adjustguesspos(edgecoeffs, xranges, flat, omask, orders,
+   ycororder, ybuffer)`` – adjusts the reference guess positions by
+   performing a vertical cross-correlation between the stored order mask
+   and the new flat to measure any spatial shift.  Returns adjusted
+   ``guesspos`` and ``xranges``.
 
-   For each order independently:
+4. ``mc_findorders(flat, adj.guesspos, adj.xranges, step, slith_range,
+   edgedeg, ybuffer, flatfrac, comwin, edgecoeffs, xranges)`` – the
+   core tracing routine.  For each order it sweeps the sample columns,
+   tracks bottom and top edges via Sobel-image COM, fits robust
+   polynomials to each edge separately, and returns ``edgecoeffs``
+   (shape ``[degree+1, 2, norders]``) and ``xranges``.
 
-   a. Initialise a centre array with the seed position over a
-      ``±poly_degree``-wide region around the seed column index.
+The **output geometry product** from IDL is ``edgecoeffs`` —
+polynomials for the bottom edge (index 0) and top edge (index 1) of
+each order.  Centres are derived from the edges; they are not the
+primary fit target.
 
-   b. **Sweep left** from the seed column to the start of the column range.
-      At each sample column:
-
-      - Fit a low-order polynomial to existing centre positions to
-        predict the order centre (``y_guess``).
-      - Find the first row *above* ``y_guess`` where the flat flux falls
-        below ``intensity_fraction × flux_at_guess`` — this is the
-        approximate top-edge row.
-      - Find the last row *below* ``y_guess`` where flux falls below
-        the same threshold — this is the approximate bottom-edge row.
-      - Compute the centre-of-mass of the Sobel image within a
-        ``±com_half_width`` window around each approximate edge row to
-        obtain a sub-pixel edge position.
-      - If both edges are found and the slit height (top − bottom) lies
-        within ``slit_height_range`` (when provided), store the edge
-        positions and update the centre as ``(bottom + top) / 2``.
-      - If the slit height is *outside* the allowed range, skip this
-        column entirely (IDL ``goto cont1`` equivalent).
-      - If either edge is not found, fall back to ``y_guess`` as the
-        centre for this column.
-      - Stop tracking an individual edge if it reaches the detector
-        boundary (within ``ybuffer`` pixels).  Stop the sweep entirely
-        when both edges are lost.
-
-   c. **Sweep right** from ``seed_col + 1`` to the end, using the same
-      logic as the left sweep.
-
-5. **Polynomial fitting** – fit a degree-``poly_degree`` polynomial to
-   each order's tracked centre positions using robust least-squares
-   (equivalent to IDL ``mc_robustpoly1d``).  The
-   :func:`numpy.polynomial.polynomial.polyfit` convention is used:
-   ``coeffs[k]`` is the coefficient of ``x**k``.
-
-6. **Half-width estimation** – the half-maximum half-width of each order
-   peak in the seed-column profile is recorded as a proxy for order width.
-
-Relationship to the 2DXD arc-line tracing stage
+Algorithm (Python port of IDL ``mc_findorders``)
 -------------------------------------------------
-This module provides the *centre-line* geometry needed for the first step of
-2DXD rectification.  The subsequent steps (not yet implemented) are:
+1. **Load frames** – median-combine flat FITS files.
 
-* Edge tracing – refine bottom/top order edges from the flat profile.
-* Tilt and curvature measurement – measure spectral-line tilt and curvature
-  from arc-lamp frames using the order boundaries established here.
-* Wavelength calibration – identify arc lines and fit a wavelength solution.
-* Rectification – resample the raw 2D spectrum onto a
-  (wavelength × spatial) grid.
+2. **Order initialization**:
 
-What remains unimplemented
---------------------------
-* Per-order column-range trimming (all orders use the same ``col_range``).
-* Tilt, curvature, wavelength, and spatial calibration polynomials.
-* Full 2DXD rectification.
+   - *With flatinfo*: derive guess positions from the stored reference
+     ``edge_coeffs`` and ``xranges``, using ``flatinfo.step``,
+     ``flatinfo.flat_fraction``, etc.  This matches the IDL
+     ``mc_readflatinfo`` / ``mc_adjustguesspos`` path (without the
+     cross-correlation shift correction — see limitations below).
+   - *Without flatinfo (fallback)*: auto-detect order centres at a
+     single seed column via :func:`scipy.signal.find_peaks`.
 
-See :mod:`pyspextool.instruments.ishell.geometry` for the data structures
-used downstream and ``docs/ishell_order_tracing.md`` for the full design
-rationale.
+3. **Sobel enhancement** – compute gradient magnitude (IDL ``sobel()``).
+
+4. **Edge tracking** – for each order, sweep left then right from the
+   guess column, tracking bottom and top edges via flux threshold +
+   Sobel COM (IDL ``mc_findorders`` inner loop).
+
+5. **Polynomial fitting** – fit a robust polynomial to the **bottom
+   edge** array and a separate one to the **top edge** array (IDL
+   ``mc_robustpoly1d``).  Centres are derived from the fitted edges.
+
+IDL-to-Python fidelity status
+------------------------------
+**Matches IDL:**
+
+- Bottom and top edges are the primary tracked/fitted quantities
+- Sobel-image COM edge refinement
+- ``edges[k,j]`` stored and fitted (not centres)
+- Robust polynomial fitting for both edges
+- ``goto cont1`` / boundary-flag stop logic
+- Initialization window around guess column index
+
+**Does NOT fully match IDL:**
+
+- The ``mc_adjustguesspos`` cross-correlation shift correction is not
+  implemented.  When *flatinfo* is supplied, the stored reference edge
+  coefficients are used as-is to compute guess positions.
+- IDL uses per-order column ranges (``sranges``); this implementation
+  uses a single common column range for all orders.
+- Step-based column sampling is used when ``step`` is provided via
+  flatinfo; otherwise ``n_sample_cols`` evenly-spaced columns are used.
 """
 
 from __future__ import annotations
@@ -217,38 +219,36 @@ class FlatOrderTrace:
         Detector column indices at which cross-dispersion profiles were
         evaluated.
     center_rows : ndarray, shape (n_orders, n_sample)
-        Traced centre-row position at each sample column.  ``NaN`` marks
-        columns where the corresponding peak was not reliably detected.
+        Traced centre-row position at each sample column, derived from the
+        mean of bottom and top edge positions.  ``NaN`` marks columns where
+        edges were not reliably detected.
     center_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1)
-        Per-order polynomial coefficients for the centre-row trajectory.
-        Follows the ``numpy.polynomial.polynomial`` convention:
-        ``coeffs[k]`` is the coefficient of ``col**k``.
+        Per-order polynomial coefficients for the centre-row trajectory,
+        derived as the arithmetic mean of ``bot_poly_coeffs`` and
+        ``top_poly_coeffs``.  When ``bot_poly_coeffs`` is ``None`` (object
+        constructed without edge tracking), this is fitted directly to
+        ``center_rows``.  Follows the ``numpy.polynomial.polynomial``
+        convention: ``coeffs[k]`` is the coefficient of ``col**k``.
     fit_rms : ndarray, shape (n_orders,)
-        RMS of the polynomial residuals for each order, in pixels.  A value
-        of ``NaN`` indicates that the polynomial fit failed (too few valid
-        points).
+        RMS of the centre polynomial residuals for each order, in pixels.
     half_width_rows : ndarray, shape (n_orders,)
-        Estimated half-width (half-maximum) of each order peak, in pixels,
-        measured at the seed column.  This is a proxy for the order width
-        and is used to build edge polynomials in
-        :meth:`to_order_geometry_set`.
+        Estimated half-width of each order in pixels, derived from the mean
+        bottom-to-top edge separation at the guess/seed column.
     poly_degree : int
-        Degree of the fitted centre-line polynomials.
+        Degree of the fitted polynomials.
     seed_col : int
-        Detector column used to locate initial order-centre seeds.
+        Detector column used for initial seed detection (auto-detect mode)
+        or the midpoint of the guess column range (flatinfo mode).
+    bot_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1) or None
+        Per-order polynomial coefficients for the **bottom edge** of each
+        order.  This is the primary IDL output quantity (IDL
+        ``edgecoeffs[*,0,i]``).  ``None`` when the object was constructed
+        without edge tracking (e.g. directly in tests).
+    top_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1) or None
+        Per-order polynomial coefficients for the **top edge** of each
+        order (IDL ``edgecoeffs[*,1,i]``).  ``None`` as above.
     order_stats : list of OrderTraceStats
-        Per-order QA metrics computed immediately after polynomial fitting.
-        See :class:`OrderTraceStats` for the available fields.  Empty if
-        the result was constructed directly without calling
-        :func:`trace_orders_from_flat`.
-
-    Notes
-    -----
-    The optional fields ``tilt_coeffs``, ``curvature_coeffs``,
-    ``wave_coeffs``, and ``spatcal_coeffs`` inside each
-    :class:`~pyspextool.instruments.ishell.geometry.OrderGeometry` produced
-    by :meth:`to_order_geometry_set` are all ``None``; they are populated
-    by the wavecal step.
+        Per-order QA metrics.  Empty if constructed directly.
     """
 
     n_orders: int
@@ -259,6 +259,8 @@ class FlatOrderTrace:
     half_width_rows: np.ndarray
     poly_degree: int
     seed_col: int
+    bot_poly_coeffs: Optional[np.ndarray] = None
+    top_poly_coeffs: Optional[np.ndarray] = None
     order_stats: list[OrderTraceStats] = field(default_factory=list)
 
     def to_order_geometry_set(
@@ -268,25 +270,22 @@ class FlatOrderTrace:
     ) -> OrderGeometrySet:
         """Convert the tracing result to an :class:`OrderGeometrySet`.
 
-        .. warning::
-           The returned geometry is **provisional scaffolding**, not a
-           science-quality calibration.  Specifically:
+        When ``bot_poly_coeffs`` and ``top_poly_coeffs`` are available on
+        this object (produced by :func:`trace_orders_from_flat` with edge
+        tracking), the bottom and top edge polynomials are taken directly
+        from the fitted edge polynomials.  This matches the IDL path, where
+        ``edgecoeffs`` is the primary output of ``mc_findorders``.
 
-           * Only **order centres are traced from data**.  The bottom and
-             top edge polynomials are **approximated** by offsetting the
-             centre-line polynomial constant term by ``±half_width_rows``;
-             they are not independently fitted to the flat profile.
-           * Order numbers are **placeholder integers** (0, 1, 2, …) assigned
-             sequentially.  Real echelle order numbers are not yet assigned;
-             that requires the wavecal step.
-           * The geometry objects are intended for development and pipeline
-             scaffolding, not for final science-quality spectral rectification.
+        When ``bot_poly_coeffs`` / ``top_poly_coeffs`` are ``None`` (the
+        object was constructed directly without running the full tracing),
+        the edges are approximated as ``centre ± half_width_rows`` —
+        a fallback for backward-compatibility with code that builds
+        :class:`FlatOrderTrace` objects directly (e.g. in tests).
 
         Parameters
         ----------
         mode : str
-            iSHELL observing mode name (e.g. ``"H1"``).  Stored as metadata
-            in the returned :class:`OrderGeometrySet`.
+            iSHELL observing mode name (e.g. ``"H1"``).
         col_range : tuple of int (col_start, col_end), optional
             Column range applied uniformly to all orders.  Defaults to
             ``(sample_cols[0], sample_cols[-1])``.
@@ -303,13 +302,20 @@ class FlatOrderTrace:
 
         geometries = []
         for i in range(self.n_orders):
-            c = self.center_poly_coeffs[i].copy()
-            hw = float(self.half_width_rows[i])
-
-            bot_coeffs = c.copy()
-            top_coeffs = c.copy()
-            bot_coeffs[0] -= hw
-            top_coeffs[0] += hw
+            if self.bot_poly_coeffs is not None and self.top_poly_coeffs is not None:
+                # Use the directly-traced edge polynomials (IDL output path).
+                bot_coeffs = self.bot_poly_coeffs[i].copy()
+                top_coeffs = self.top_poly_coeffs[i].copy()
+            else:
+                # Fallback: approximate edges from centre ± half_width.
+                # Used when bot/top polynomials are not available (e.g. when
+                # this object was constructed directly in tests).
+                c = self.center_poly_coeffs[i].copy()
+                hw = float(self.half_width_rows[i])
+                bot_coeffs = c.copy()
+                top_coeffs = c.copy()
+                bot_coeffs[0] -= hw
+                top_coeffs[0] += hw
 
             geom = OrderGeometry(
                 order=i,
@@ -331,6 +337,7 @@ class FlatOrderTrace:
 def trace_orders_from_flat(
     flat_files: list[str],
     *,
+    flatinfo=None,
     n_sample_cols: int = 40,
     col_half_width: int = 10,
     poly_degree: int = 3,
@@ -345,90 +352,98 @@ def trace_orders_from_flat(
     slit_height_range: tuple[float, float] | None = None,
     ybuffer: int = 1,
 ) -> FlatOrderTrace:
-    """Trace echelle order centres from one or more iSHELL flat-field frames.
+    """Trace echelle order edges from one or more iSHELL flat-field frames.
 
-    The tracking algorithm is a faithful port of the IDL ``mc_findorders``
-    routine from Spextool.  For each detected order the algorithm sweeps
-    left and right from the seed column, predicting the centre position via
-    polynomial extrapolation and refining it via Sobel-image centre-of-mass
-    on the flat-profile edges.
+    When *flatinfo* is supplied, order initialization follows the IDL
+    ``mc_readflatinfo`` / ``mc_adjustguesspos`` path: guess positions are
+    derived from the stored reference edge polynomials in the flatinfo
+    FITS file, and tracing parameters (``intensity_fraction``,
+    ``com_half_width``, ``slit_height_range``, ``ybuffer``, ``poly_degree``)
+    are taken from the flatinfo fields, overriding any explicit keyword
+    arguments.
+
+    When *flatinfo* is ``None``, order centres are auto-detected at a
+    single seed column via :func:`scipy.signal.find_peaks` (generic
+    fallback mode).
+
+    In both cases the tracking algorithm follows IDL ``mc_findorders``:
+    for each order it sweeps left and right, tracking the **bottom and top
+    edges** via flux-threshold + Sobel-image COM, then fits a robust
+    polynomial to each edge separately.  The centre polynomial is derived
+    from the edge fits.
 
     Parameters
     ----------
     flat_files : list of str
         Paths to raw iSHELL FITS flat frames (PRIMARY extension is read).
-        When more than one file is provided the frames are median-combined
-        before tracing.
+        When more than one file is provided the frames are median-combined.
+    flatinfo : :class:`~pyspextool.instruments.ishell.calibrations.FlatInfo`, optional
+        Mode calibration metadata loaded from the flatinfo FITS file (e.g.
+        via :func:`~pyspextool.instruments.ishell.calibrations.read_flatinfo`).
+        When supplied:
+
+        - Order guess positions are computed from ``flatinfo.edge_coeffs``
+          and ``flatinfo.xranges`` (IDL ``mc_readflatinfo`` output).
+        - ``intensity_fraction``, ``com_half_width``, ``slit_height_range``,
+          ``ybuffer``, and ``poly_degree`` are overridden from the
+          corresponding ``flatinfo`` fields.
+        - Step-based column sampling uses ``flatinfo.step``.
+
+        When ``None`` (default), blind peak detection at the seed column
+        is used for order initialization.
     n_sample_cols : int, default 40
-        Number of evenly-spaced detector columns at which the order centre
-        is evaluated.
+        Number of evenly-spaced sample columns (used only when ``flatinfo``
+        is ``None`` or when ``flatinfo.step`` is 0).
     col_half_width : int, default 10
-        Half-width of the column band (in pixels) used to compute each
-        cross-dispersion profile for seed peak detection.
+        Half-width of the column band used for cross-dispersion profile
+        extraction during seed peak detection (fallback mode only).
     poly_degree : int, default 3
-        Degree of the polynomial fitted to each order's centre trajectory.
+        Degree of the polynomial fitted to the edges (overridden by
+        ``flatinfo.edge_degree`` when *flatinfo* is supplied).
     seed_col : int, optional
-        Detector column at which initial order positions are identified.
-        Defaults to the mid-point of *col_range*.
+        Seed column for auto-detect mode.  Defaults to mid-point of
+        *col_range*.  Ignored when *flatinfo* is supplied.
     col_range : tuple of int (col_start, col_end), optional
         Column range over which tracing is performed.  Defaults to the
         full detector width ``(0, ncols - 1)``.
     min_prominence : float, default 500.0
-        Minimum peak prominence (in detector counts) for seed detection.
+        Minimum peak prominence for seed detection (fallback mode only).
     min_distance : int, default 25
-        Minimum row separation between seed peaks.
+        Minimum row separation between seed peaks (fallback mode only).
     max_shift : float, default 15.0
-        Retained for API compatibility; not used in the IDL tracking
-        algorithm.
+        Retained for API compatibility; not used in the IDL tracking logic.
     sigma_clip : float, default 3.0
-        Robust-fit rejection threshold (in units of RMS) applied during the
-        final polynomial fit.  Corresponds to ``thresh`` in IDL
-        ``mc_robustpoly1d``.
+        Robust-fit rejection threshold (IDL ``mc_robustpoly1d`` ``thresh``
+        argument).
     intensity_fraction : float, default 0.85
-        Fraction of the centre flux used to locate the order edge.
-        Corresponds to ``frac`` / ``FLATFRAC`` in IDL ``mc_findorders``.
+        Fraction of the centre flux used to locate the order edge (IDL
+        ``frac`` / ``FLATFRAC``).  Overridden by ``flatinfo.flat_fraction``
+        when *flatinfo* is supplied.
     com_half_width : int, default 2
-        Half-width (pixels) of the centre-of-mass window applied to the
-        Sobel image to find the precise sub-pixel edge position.
-        Corresponds to ``halfwin = round(comwidth / 2)`` in IDL.
-    slit_height_range : tuple of float (min_height, max_height), optional
-        Allowed range for the slit height (top edge − bottom edge) in
-        pixels.  Columns whose measured slit height falls outside this
-        range are skipped (IDL ``goto cont1`` equivalent).  When ``None``
-        (default) no slit-height check is applied.
+        Half-width of the Sobel-image COM window in pixels (IDL
+        ``halfwin = round(comwidth/2)``).  Overridden by
+        ``round(flatinfo.comm_window / 2)`` when *flatinfo* is supplied.
+    slit_height_range : tuple of float (min, max), optional
+        Allowed slit-height range in pixels (IDL ``slith_pix``).
+        Overridden by ``flatinfo.slit_range_pixels`` when *flatinfo* is
+        supplied.  ``None`` disables the check.
     ybuffer : int, default 1
-        Number of detector-edge rows to exclude from edge tracking.
-        Corresponds to ``bufpix`` in IDL ``mc_findorders``.
+        Detector-edge buffer in rows (IDL ``bufpix``).  Overridden by
+        ``flatinfo.ybuffer`` when *flatinfo* is supplied.
 
     Returns
     -------
     :class:`FlatOrderTrace`
-        Tracing result with per-order polynomial coefficients, sampled
-        centre positions, RMS values, and half-width estimates.
+        Tracing result with per-order bottom/top edge polynomial
+        coefficients, derived centre coefficients, sampled positions,
+        RMS values, and half-width estimates.
 
     Raises
     ------
     ValueError
         If *flat_files* is empty.
     RuntimeError
-        If no order peaks are found at the seed column after applying
-        the prominence and distance criteria.
-
-    Notes
-    -----
-    The returned polynomial coefficients follow the
-    ``numpy.polynomial.polynomial`` convention: ``coeffs[k]`` is the
-    coefficient of ``col**k``.  Evaluate with
-    ``np.polynomial.polynomial.polyval(col, coeffs)``.
-
-    Examples
-    --------
-    >>> from pyspextool.instruments.ishell.io_utils import find_fits_files
-    >>> all_paths = find_fits_files("data/testdata/ishell_h1_calibrations/raw")
-    >>> flat_paths = [str(p) for p in all_paths if "flat" in p.name]
-    >>> trace = trace_orders_from_flat(flat_paths)
-    >>> print(f"Found {trace.n_orders} orders")
-    >>> geom = trace.to_order_geometry_set("H1")
+        If no order peaks are found (fallback mode only).
     """
     if not flat_files:
         raise ValueError("flat_files must not be empty.")
@@ -440,61 +455,124 @@ def trace_orders_from_flat(
     nrows, ncols = flat.shape
 
     # ------------------------------------------------------------------
-    # 2. Resolve column range and seed column
+    # 2. Override tracing parameters from flatinfo (IDL mc_readflatinfo path)
+    # ------------------------------------------------------------------
+    if flatinfo is not None:
+        # Use flatinfo fields where they override keyword arguments.
+        if flatinfo.edge_degree is not None:
+            poly_degree = int(flatinfo.edge_degree)
+        intensity_fraction = float(flatinfo.flat_fraction)
+        com_half_width = int(round(flatinfo.comm_window / 2))
+        slit_height_range = (
+            float(flatinfo.slit_range_pixels[0]),
+            float(flatinfo.slit_range_pixels[1]),
+        )
+        # Use ybuffer from flatinfo if present (FlatInfo may not have this field
+        # yet; fall back to 1 to match IDL's typical value).
+        ybuffer = max(1, int(getattr(flatinfo, "ybuffer", 1)))
+
+        logger.info(
+            "Using flatinfo parameters: poly_degree=%d, intensity_fraction=%.3f, "
+            "com_half_width=%d, slit_height_range=%s, ybuffer=%d",
+            poly_degree, intensity_fraction, com_half_width, slit_height_range, ybuffer,
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Resolve column range
     # ------------------------------------------------------------------
     if col_range is None:
         col_lo, col_hi = 0, ncols - 1
     else:
         col_lo, col_hi = int(col_range[0]), int(col_range[1])
 
-    if seed_col is None:
-        seed_col = (col_lo + col_hi) // 2
-    else:
-        seed_col = max(col_lo, min(col_hi, int(seed_col)))
-
     # ------------------------------------------------------------------
-    # 3. Find seed peaks at the central column
+    # 4. Compute guess positions and build sample columns
     # ------------------------------------------------------------------
-    seed_profile = _extract_cross_section(flat, seed_col, col_half_width)
-    seed_peaks = _find_order_peaks(seed_profile, min_distance, min_prominence)
-
-    if len(seed_peaks) == 0:
-        raise RuntimeError(
-            f"No order peaks found at seed column {seed_col} "
-            f"(prominence>{min_prominence}, distance>{min_distance}).  "
-            "Try reducing min_prominence or min_distance."
+    if flatinfo is not None and flatinfo.edge_coeffs is not None and flatinfo.xranges is not None:
+        # IDL path: derive guess positions from stored edge_coeffs + xranges.
+        # (mc_readflatinfo / mc_adjustguesspos logic, without cross-corr shift.)
+        guess_positions, guess_xranges = _compute_guess_positions_from_flatinfo(
+            flatinfo.edge_coeffs, flatinfo.xranges
         )
+        n_orders = len(guess_positions)
+        # seed_col = midpoint of all xranges (representative column for logging)
+        seed_col = int(np.round(np.mean(guess_xranges[:, 0] + guess_xranges[:, 1]) / 2.0))
+        # seed_profile is used only for half-width estimation; use col nearest seed_col
+        seed_profile = _extract_cross_section(flat, seed_col, col_half_width)
+        seed_peaks = np.array([gp[1] for gp in guess_positions])
 
-    n_orders = len(seed_peaks)
-    logger.info(
-        "Found %d order seeds at column %d: rows %s",
-        n_orders,
-        seed_col,
-        seed_peaks.tolist(),
-    )
+        # Build sample columns using step if provided, else n_sample_cols.
+        # IDL mc_findorders: starts = start+step-1, stops = stop-step+1,
+        # scols = findgen(fix((stops-starts)/step)+1)*step + starts
+        step = int(getattr(flatinfo, "step", 0))
+        if step > 0:
+            starts = col_lo + step - 1
+            stops = col_hi - step + 1
+            sample_cols = np.arange(starts, stops + 1, step)
+        else:
+            sample_cols = np.round(np.linspace(col_lo, col_hi, n_sample_cols)).astype(int)
 
-    # ------------------------------------------------------------------
-    # 4. Build evenly-spaced sample columns
-    # ------------------------------------------------------------------
-    sample_cols = np.round(
-        np.linspace(col_lo, col_hi, n_sample_cols)
-    ).astype(int)
-    sample_cols = np.unique(sample_cols)
+        sample_cols = np.unique(np.clip(sample_cols, col_lo, col_hi))
 
-    # ------------------------------------------------------------------
-    # 5. Trace each order across sample columns
-    # ------------------------------------------------------------------
-    center_rows = np.full((n_orders, len(sample_cols)), np.nan)
+        # Seed idx = column closest to the first guess column (use per-order later)
+        # For initialization we use the median guess column across orders.
+        median_guess_x = float(np.median([gp[0] for gp in guess_positions]))
+        seed_idx = int(np.argmin(np.abs(sample_cols - median_guess_x)))
 
-    # Find the index of the sample column closest to the seed column
-    seed_idx = int(np.argmin(np.abs(sample_cols - seed_col)))
+        logger.info(
+            "Flatinfo mode: %d orders, guess positions from stored edgecoeffs",
+            n_orders,
+        )
+    else:
+        # Fallback: auto-detect seed peaks at the central column.
+        if seed_col is None:
+            seed_col = (col_lo + col_hi) // 2
+        else:
+            seed_col = max(col_lo, min(col_hi, int(seed_col)))
+
+        seed_profile = _extract_cross_section(flat, seed_col, col_half_width)
+        seed_peaks = _find_order_peaks(seed_profile, min_distance, min_prominence)
+
+        if len(seed_peaks) == 0:
+            raise RuntimeError(
+                f"No order peaks found at seed column {seed_col} "
+                f"(prominence>{min_prominence}, distance>{min_distance}).  "
+                "Try reducing min_prominence or min_distance."
+            )
+
+        n_orders = len(seed_peaks)
+        guess_positions = None  # not used below in auto-detect mode
+
+        sample_cols = np.round(np.linspace(col_lo, col_hi, n_sample_cols)).astype(int)
+        sample_cols = np.unique(sample_cols)
+        seed_idx = int(np.argmin(np.abs(sample_cols - seed_col)))
+
+        logger.info(
+            "Auto-detect mode: %d order seeds at column %d: rows %s",
+            n_orders, seed_col, seed_peaks.tolist(),
+        )
 
     # ------------------------------------------------------------------
     # 5. Trace each order independently (IDL mc_findorders algorithm)
+    #    Primary tracked quantities: bottom edge and top edge at each column.
     # ------------------------------------------------------------------
+    center_rows = np.full((n_orders, len(sample_cols)), np.nan)
+    bot_rows = np.full((n_orders, len(sample_cols)), np.nan)
+    top_rows = np.full((n_orders, len(sample_cols)), np.nan)
+
+    # When flatinfo provides per-order guess columns, use the correct seed_idx
+    # for each order. Otherwise all orders share the same seed_idx.
+    if flatinfo is not None and guess_positions is not None:
+        order_seed_indices = [
+            int(np.argmin(np.abs(sample_cols - gp[0])))
+            for gp in guess_positions
+        ]
+    else:
+        order_seed_indices = [seed_idx] * n_orders
+
     _trace_all_orders(
-        flat, sample_cols, seed_idx, seed_peaks,
-        center_rows, poly_degree,
+        flat, sample_cols, order_seed_indices, seed_peaks,
+        center_rows, bot_rows, top_rows, poly_degree,
         ybuffer=ybuffer,
         intensity_fraction=intensity_fraction,
         com_half_width=com_half_width,
@@ -502,35 +580,70 @@ def trace_orders_from_flat(
     )
 
     # ------------------------------------------------------------------
-    # 6. Fit polynomials with robust least-squares (IDL mc_robustpoly1d)
+    # 6. Fit robust polynomials to bottom and top edges separately
+    #    (IDL: mc_robustpoly1d on edges[*,0] and edges[*,1])
     # ------------------------------------------------------------------
+    bot_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
+    top_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
     center_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
     fit_rms = np.full(n_orders, np.nan)
 
     for i in range(n_orders):
-        row_vals = center_rows[i]
-        good = np.isfinite(row_vals)
+        good_bot = np.isfinite(bot_rows[i])
+        good_top = np.isfinite(top_rows[i])
+        good_cen = np.isfinite(center_rows[i])
 
-        if good.sum() < poly_degree + 1:
-            logger.warning(
-                "Order %d: only %d valid sample points; polynomial fit skipped.",
-                i, good.sum(),
+        n_min = poly_degree + 1
+
+        if good_bot.sum() >= n_min:
+            b_coeffs, _ = _fit_poly_robust(
+                sample_cols[good_bot].astype(float),
+                bot_rows[i][good_bot],
+                poly_degree, sigma_clip,
             )
-            continue
+            bot_poly_coeffs[i] = b_coeffs
+        else:
+            logger.warning(
+                "Order %d: only %d valid bottom-edge points; "
+                "polynomial fit skipped.", i, good_bot.sum(),
+            )
+            bot_poly_coeffs[i][:] = np.nan
 
-        cols_fit = sample_cols[good].astype(float)
-        rows_fit = row_vals[good]
+        if good_top.sum() >= n_min:
+            t_coeffs, _ = _fit_poly_robust(
+                sample_cols[good_top].astype(float),
+                top_rows[i][good_top],
+                poly_degree, sigma_clip,
+            )
+            top_poly_coeffs[i] = t_coeffs
+        else:
+            logger.warning(
+                "Order %d: only %d valid top-edge points; "
+                "polynomial fit skipped.", i, good_top.sum(),
+            )
+            top_poly_coeffs[i][:] = np.nan
 
-        coeffs, rms = _fit_poly_robust(
-            cols_fit, rows_fit, poly_degree, sigma_clip,
+        # Centre polynomial = arithmetic mean of bot and top polynomials.
+        center_poly_coeffs[i] = (bot_poly_coeffs[i] + top_poly_coeffs[i]) / 2.0
+
+        # RMS of centre residuals against sampled centre positions.
+        if good_cen.sum() >= n_min:
+            pred = np.polynomial.polynomial.polyval(
+                sample_cols[good_cen].astype(float), center_poly_coeffs[i]
+            )
+            fit_rms[i] = float(np.std(center_rows[i][good_cen] - pred))
+
+    # ------------------------------------------------------------------
+    # 7. Estimate order half-widths
+    #    - Flatinfo mode: use edge separation (IDL slith_pix equivalent)
+    #    - Auto-detect mode: use profile-based FWHM/2 estimator
+    # ------------------------------------------------------------------
+    if flatinfo is not None:
+        half_width_rows = _estimate_half_widths_from_edges(
+            bot_rows, top_rows, order_seed_indices[0],
         )
-        center_poly_coeffs[i] = coeffs
-        fit_rms[i] = rms
-
-    # ------------------------------------------------------------------
-    # 7. Estimate order half-widths from the seed profile
-    # ------------------------------------------------------------------
-    half_width_rows = _estimate_half_widths(seed_profile, seed_peaks)
+    else:
+        half_width_rows = _estimate_half_widths(seed_profile, seed_peaks)
 
     # ------------------------------------------------------------------
     # 8. Compute per-order QA metrics
@@ -555,6 +668,8 @@ def trace_orders_from_flat(
         half_width_rows=half_width_rows,
         poly_degree=poly_degree,
         seed_col=seed_col,
+        bot_poly_coeffs=bot_poly_coeffs,
+        top_poly_coeffs=top_poly_coeffs,
         order_stats=order_stats,
     )
 
@@ -676,12 +791,50 @@ def _find_order_peaks(
     return peaks
 
 
+def _compute_guess_positions_from_flatinfo(
+    edge_coeffs: npt.NDArray,
+    xranges: npt.NDArray,
+) -> tuple[list[tuple[float, float]], npt.NDArray]:
+    """Compute IDL-style guess positions from stored edge polynomials.
+
+    Replicates the ``mc_readflatinfo`` and ``mc_adjustguesspos`` logic:
+    for each order, the guess x is the midpoint of its xrange, and the
+    guess y is the centre between the bottom and top edges at that x.
+
+    Parameters
+    ----------
+    edge_coeffs : ndarray, shape (n_orders, 2, n_terms)
+        Edge polynomial coefficients from ``FlatInfo.edge_coeffs``.
+        ``edge_coeffs[i, 0, :]`` = bottom edge, ``[i, 1, :]`` = top edge.
+    xranges : ndarray, shape (n_orders, 2)
+        Per-order column ranges ``[x_start, x_end]``.
+
+    Returns
+    -------
+    guess_positions : list of (x_guess, y_guess) tuples
+        One entry per order.
+    xranges : ndarray
+        The input xranges array (returned for convenience).
+    """
+    guess_positions = []
+    for i in range(len(edge_coeffs)):
+        x0, x1 = float(xranges[i, 0]), float(xranges[i, 1])
+        x_guess = (x0 + x1) / 2.0
+        bot_y = float(np.polynomial.polynomial.polyval(x_guess, edge_coeffs[i, 0, :]))
+        top_y = float(np.polynomial.polynomial.polyval(x_guess, edge_coeffs[i, 1, :]))
+        y_guess = (bot_y + top_y) / 2.0
+        guess_positions.append((x_guess, y_guess))
+    return guess_positions, xranges
+
+
 def _trace_all_orders(
     flat: npt.NDArray,
     sample_cols: npt.NDArray,
-    seed_idx: int,
+    order_seed_indices: list[int],
     seed_peaks: npt.NDArray,
     center_rows: npt.NDArray,
+    bot_rows: npt.NDArray,
+    top_rows: npt.NDArray,
     poly_degree: int,
     *,
     ybuffer: int = 1,
@@ -691,49 +844,36 @@ def _trace_all_orders(
 ) -> None:
     """Trace all orders using the IDL ``mc_findorders`` algorithm.
 
-    For each order independently, sweeps left then right from the seed
-    column.  At every sample column the order centre is predicted by a
-    polynomial fit to the centres already found, and the edges are
-    located by a flux-threshold search followed by a Sobel-image
+    For each order independently, sweeps left then right from the per-order
+    seed column index.  At every sample column the order centre is predicted
+    by a polynomial fit to the centres already found, and the **bottom and
+    top edges** are located by flux-threshold search followed by Sobel-image
     centre-of-mass refinement.
 
-    This is a faithful port of the IDL ``mc_findorders`` routine from the
-    Spextool package.  The control flow matches IDL exactly:
-
-    * The left sweep covers indices ``seed_idx`` down to ``0`` (inclusive),
-      so the seed column itself is re-evaluated during the left sweep.
-    * The right sweep covers indices ``seed_idx + 1`` to ``n_cols - 1``.
-    * When the measured slit height is outside *slit_height_range* the
-      column is skipped without updating the centre or modifying the
-      ``do_top``/``do_bot`` flags (IDL ``goto cont1``).
-    * When edge detection yields NaN, the centre falls back to the
-      extrapolated ``y_guess``.
-    * Tracking of an individual edge stops when it reaches within
-      *ybuffer* rows of the detector boundary; the sweep stops entirely
-      when both edges are lost.
+    The primary output quantities are the edge arrays ``bot_rows`` and
+    ``top_rows``.  The centre array ``center_rows`` is derived from them and
+    also used internally for column-to-column prediction.
 
     Parameters
     ----------
     flat : ndarray, shape (nrows, ncols)
         Flat-field image.
     sample_cols : ndarray of int
-        Column indices at which to evaluate the order centre.
-    seed_idx : int
-        Index into *sample_cols* of the seed column.
+        Column indices at which to evaluate the order edges.
+    order_seed_indices : list of int
+        Per-order index into *sample_cols* of the seed/guess column.
     seed_peaks : ndarray of float, shape (n_orders,)
         Initial order-centre row estimates at the seed column.
     center_rows : ndarray of float, shape (n_orders, n_sample)
-        Output array; filled in place.
+        Centre array; filled in place (used for prediction; derived from edges).
+    bot_rows : ndarray of float, shape (n_orders, n_sample)
+        Bottom-edge array; filled in place.
+    top_rows : ndarray of float, shape (n_orders, n_sample)
+        Top-edge array; filled in place.
     poly_degree : int
         Polynomial degree for the centre-extrapolation fits.
-    ybuffer : int, default 1
-        Detector-edge buffer in rows.
-    intensity_fraction : float, default 0.85
-        Fraction of the centre flux used as the edge threshold.
-    com_half_width : int, default 2
-        Half-width of the Sobel-image COM window in pixels.
-    slit_height_range : tuple (min, max) or None
-        Allowed slit height range in pixels.  ``None`` disables the check.
+    ybuffer, intensity_fraction, com_half_width, slit_height_range :
+        Passed through to edge-finding helpers.
     """
     n_orders = center_rows.shape[0]
     n_cols = len(sample_cols)
@@ -747,12 +887,18 @@ def _trace_all_orders(
     pred_deg = max(1, poly_degree - 2)
 
     for order_i in range(n_orders):
+        seed_idx = order_seed_indices[order_i]
+
         # Initialise the centre array.
         # IDL: cen[(gidx-degree):(gidx+degree)] = guesspos[1,i]
         cen = np.full(n_cols, np.nan)
         lo = max(0, seed_idx - poly_degree)
         hi = min(n_cols - 1, seed_idx + poly_degree)
         cen[lo: hi + 1] = float(seed_peaks[order_i])
+
+        # Edge arrays for this order.
+        bot = np.full(n_cols, np.nan)
+        top = np.full(n_cols, np.nan)
 
         # ----------------------------------------------------------------
         # Left sweep: k = seed_idx down to 0 (includes seed position).
@@ -765,16 +911,14 @@ def _trace_all_orders(
             fcol = flat[:, sample_cols[k]]
             rcol = sflat[:, sample_cols[k]]
 
-            # Predict centre from polynomial fit to existing cen values.
             y_guess_f, com_top, com_bot = _predict_and_find_edges(
                 cen, sample_cols, k, pred_deg, fcol, rcol, row,
                 nrows, ybuffer, intensity_fraction, com_half_width,
                 do_top, do_bot,
             )
 
-            # Update centre and stop-flags (IDL logic).
             cont = _update_centre_and_flags(
-                cen, k, y_guess_f, com_top, com_bot,
+                cen, bot, top, k, y_guess_f, com_top, com_bot,
                 nrows, ybuffer, slit_height_range,
                 do_top, do_bot,
             )
@@ -782,11 +926,10 @@ def _trace_all_orders(
                 break
             if cont == "continue":
                 continue
-            do_top, do_bot = cont  # updated flags
+            do_top, do_bot = cont
 
         # ----------------------------------------------------------------
         # Right sweep: k = seed_idx + 1 to n_cols - 1.
-        # IDL: for j = gidx+1, nscols-1 do begin; k = j
         # ----------------------------------------------------------------
         do_top = True
         do_bot = True
@@ -802,7 +945,7 @@ def _trace_all_orders(
             )
 
             cont = _update_centre_and_flags(
-                cen, k, y_guess_f, com_top, com_bot,
+                cen, bot, top, k, y_guess_f, com_top, com_bot,
                 nrows, ybuffer, slit_height_range,
                 do_top, do_bot,
             )
@@ -813,6 +956,8 @@ def _trace_all_orders(
             do_top, do_bot = cont
 
         center_rows[order_i] = cen
+        bot_rows[order_i] = bot
+        top_rows[order_i] = top
 
 
 def _compute_sobel_magnitude(flat: npt.NDArray) -> npt.NDArray:
@@ -917,6 +1062,8 @@ def _predict_and_find_edges(
 
 def _update_centre_and_flags(
     cen: npt.NDArray,
+    bot: npt.NDArray,
+    top: npt.NDArray,
     k: int,
     y_guess_f: float,
     com_top: float,
@@ -927,7 +1074,7 @@ def _update_centre_and_flags(
     do_top: bool,
     do_bot: bool,
 ) -> tuple[bool, bool] | str:
-    """Update *cen[k]* and return updated ``(do_top, do_bot)`` flags.
+    """Update ``cen[k]``, ``bot[k]``, ``top[k]`` and return updated flags.
 
     Returns the string ``"break"`` when the sweep should stop, or
     ``"continue"`` when the column should be skipped (IDL ``goto cont1``).
@@ -935,9 +1082,11 @@ def _update_centre_and_flags(
     Implements the exact IDL ``mc_findorders`` update logic:
 
     * If both edge COMs are finite and the slit height is within range:
-      update ``cen[k]`` and check boundary flags.
-    * If the slit height is *outside* range: skip (``goto cont1``).
-    * If either edge is NaN: fall back to ``y_guess_f`` and check flags.
+      store edges, update ``cen[k]``, and check boundary flags.
+    * If the slit height is *outside* range: skip (``goto cont1``);
+      edges remain NaN for this column.
+    * If either edge is NaN: store NaN edges and fall back to ``y_guess_f``
+      for the centre.
     """
     if do_top and do_bot and np.isfinite(com_bot) and np.isfinite(com_top):
         slit_h = abs(com_bot - com_top)
@@ -946,10 +1095,15 @@ def _update_centre_and_flags(
             or (slit_height_range[0] <= slit_h <= slit_height_range[1])
         )
         if height_ok:
+            # IDL: edges[k,*] = [com_bot, com_top]; cen[k] = (com_bot+com_top)/2
+            bot[k] = com_bot
+            top[k] = com_top
             cen[k] = (com_bot + com_top) / 2.0
             # Boundary checks – stop tracking an edge that reaches the border.
-            # Note: IDL uses `ge` (>=) for com_top upper bound and `gt` (>) for
-            # com_bot upper bound.  This intentional asymmetry is preserved here.
+            # IDL source:
+            #   if com_top le bufpix or com_top ge (nrows-1-bufpix) then dotop=0
+            #   if com_bot le bufpix or com_bot gt (nrows-1-bufpix) then dobot=0
+            # Note the intentional asymmetry: top uses `ge` (>=) while bot uses `gt` (>).
             if com_top <= ybuffer or com_top >= nrows - 1 - ybuffer:
                 do_top = False
             if com_bot <= ybuffer or com_bot > nrows - 1 - ybuffer:
@@ -958,14 +1112,15 @@ def _update_centre_and_flags(
                 return "break"
             return (do_top, do_bot)
         else:
-            # IDL: goto cont1 – skip column without updating cen or flags.
+            # IDL: goto cont1 – skip column; edges remain NaN.
             return "continue"
     else:
-        # Edge detection failed; fall back to extrapolated centre.
+        # Edge detection failed; IDL: edges[k,*] = [nan, nan]; cen[k] = y_guess
+        bot[k] = np.nan
+        top[k] = np.nan
         cen[k] = y_guess_f
         # Boundary checks on NaN edges are no-ops (np.isfinite guards).
-        # Note: IDL uses `ge` (>=) for com_top upper bound and `gt` (>) for
-        # com_bot upper bound.  This intentional asymmetry is preserved here.
+        # Same IDL asymmetry as above: top uses `ge` (>=), bot uses `gt` (>).
         if np.isfinite(com_top) and (com_top <= ybuffer or com_top >= nrows - 1 - ybuffer):
             do_top = False
         if np.isfinite(com_bot) and (com_bot <= ybuffer or com_bot > nrows - 1 - ybuffer):
@@ -1020,15 +1175,53 @@ def _fit_poly_robust(
     return coeffs, rms
 
 
+def _estimate_half_widths_from_edges(
+    bot_rows: npt.NDArray,
+    top_rows: npt.NDArray,
+    seed_idx: int,
+) -> npt.NDArray:
+    """Estimate per-order half-widths from the traced edge separation.
+
+    For each order, returns half the mean (top − bottom) edge separation
+    across the available sample columns near the seed index.
+
+    Parameters
+    ----------
+    bot_rows : ndarray, shape (n_orders, n_sample)
+        Bottom-edge row positions.
+    top_rows : ndarray, shape (n_orders, n_sample)
+        Top-edge row positions.
+    seed_idx : int
+        Index of the seed/guess sample column (used as a preference centre
+        for the local estimation window).
+
+    Returns
+    -------
+    ndarray of float, shape (n_orders,)
+        Estimated half-widths in pixels.
+    """
+    n_orders = bot_rows.shape[0]
+    half_widths = np.zeros(n_orders, dtype=float)
+
+    for i in range(n_orders):
+        sep = top_rows[i] - bot_rows[i]
+        valid = np.isfinite(sep) & (sep > 0)
+        if valid.sum() > 0:
+            half_widths[i] = float(np.mean(sep[valid]) / 2.0)
+        else:
+            half_widths[i] = 0.0
+
+    return half_widths
+
+
 def _estimate_half_widths(
     profile: npt.NDArray,
     peaks: npt.NDArray,
 ) -> npt.NDArray:
     """Estimate the half-maximum half-width of each order peak.
 
-    For each peak, the function walks outward from the peak until the
-    profile drops below the half-maximum level (relative to a local
-    baseline), then records the half-width.
+    This is a profile-based estimator used in the auto-detect fallback path.
+    For edge-tracked orders, prefer :func:`_estimate_half_widths_from_edges`.
 
     Parameters
     ----------
@@ -1050,12 +1243,10 @@ def _estimate_half_widths(
         peak_val = float(profile[pk])
         half_max = baseline + (peak_val - baseline) * 0.5
 
-        # Walk left to half-maximum
         left = int(pk)
         while left > 0 and profile[left] > half_max:
             left -= 1
 
-        # Walk right to half-maximum
         right = int(pk)
         while right < nrows - 1 and profile[right] > half_max:
             right += 1
