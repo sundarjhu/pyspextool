@@ -1469,14 +1469,41 @@ class TestOrderTraceSamples:
             assert isinstance(os_i.x_end, int)
             assert os_i.x_start <= os_i.x_end
 
-    def test_flatinfo_order_samples_cols_within_xrange(self, trace_flatinfo):
-        """In flatinfo mode, each order's sample_cols lie within its own xrange."""
+    def test_flatinfo_order_samples_cols_within_initial_xrange(self, trace_flatinfo):
+        """At construction time (pre-fit), sample_cols is built from the
+        initial flatinfo xranges, so every column lies within the initial
+        [x_start, x_end].
+
+        NOTE: this invariant is a PRE-FIT guarantee only.  After step 6a
+        (post-fit xrange restriction), x_start/x_end may be narrowed so that
+        sample_cols extends beyond [x_start, x_end].  The test fixture uses
+        constant polynomials that never overshoot, so step 6a does not clip
+        here and the pre-fit invariant happens to be preserved — but the
+        test cannot assert containment in general.
+
+        What IS always guaranteed post-fit:
+        - [x_start, x_end] is a valid non-degenerate range
+        - sample_cols is non-empty and strictly increasing
+        """
         for os_i in trace_flatinfo.order_samples:
+            assert len(os_i.sample_cols) > 0, (
+                f"Order {os_i.order_index}: sample_cols is empty"
+            )
+            assert os_i.x_start <= os_i.x_end, (
+                f"Order {os_i.order_index}: degenerate xrange "
+                f"[{os_i.x_start}, {os_i.x_end}]"
+            )
+            # In this fixture step 6a does NOT clip, so the pre-fit
+            # containment invariant is accidentally preserved.  We verify
+            # it only as a sanity check for the specific fixture; downstream
+            # code must not rely on it holding after a real post-fit clip.
             assert os_i.sample_cols[0] >= os_i.x_start, (
-                f"Order {os_i.order_index}: sample_cols starts before x_start"
+                f"Order {os_i.order_index}: pre-fit containment violated: "
+                f"sample_cols[0]={os_i.sample_cols[0]} < x_start={os_i.x_start}"
             )
             assert os_i.sample_cols[-1] <= os_i.x_end, (
-                f"Order {os_i.order_index}: sample_cols ends after x_end"
+                f"Order {os_i.order_index}: pre-fit containment violated: "
+                f"sample_cols[-1]={os_i.sample_cols[-1]} > x_end={os_i.x_end}"
             )
 
     def test_flatinfo_orders_may_have_different_sample_counts(self, tmp_path):
@@ -2375,6 +2402,260 @@ class TestCompatArraysPostFitXrangeMasking:
             else:
                 assert np.isnan(compat[0, k]), f"col {col} != 20 in degenerate xrange: should be NaN"
 
+
+# ---------------------------------------------------------------------------
+# 21. sample_cols vs post-fit xrange: semantic hardening
+# ---------------------------------------------------------------------------
+
+
+class TestSampleColsVsXrangeSemantics:
+    """Prove that sample_cols and [x_start, x_end] are distinct concepts.
+
+    Key invariants (codified by these tests):
+
+    * ``sample_cols`` = traced sampling grid, built from the initial flatinfo
+      xranges at construction time.  After step 6a (post-fit xrange
+      restriction), some entries MAY lie outside ``[x_start, x_end]``.
+    * ``[x_start, x_end]`` = FINAL post-fit valid domain.  This is the
+      authoritative range; any value computed outside it is extrapolated.
+    * The compat array ``FlatOrderTrace.center_rows`` contains NaN for any
+      column (even if present in ``sample_cols``) that lies outside
+      ``[x_start, x_end]``.
+    * ``to_order_geometry_set()`` reads ``order_xranges``, not
+      ``sample_cols`` bounds.
+
+    These tests exercise the pathological "tilted order near detector edge"
+    scenario from TestPostFitXrangeRestriction, where step 6a ACTUALLY clips
+    x_end well below the input xrange end.
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    _NROWS = 256
+    _NCOLS = 512
+    _C0 = 215.0
+    _TILT = 0.1
+    _HW = 10.0
+    _XSTART = 10
+    _XEND = 502   # = _NCOLS - 10
+
+    def _make_high_order_flat(self, tmp_path):
+        """Single order near the top of detector; step 6a will clip x_end."""
+        from types import SimpleNamespace
+
+        nrows = self._NROWS
+        ncols = self._NCOLS
+        c0, hw, tilt = self._C0, self._HW, self._TILT
+
+        edge_coeffs = np.zeros((1, 2, 2))
+        edge_coeffs[0, 0, 0] = c0 - hw   # bot constant
+        edge_coeffs[0, 0, 1] = tilt       # bot slope
+        edge_coeffs[0, 1, 0] = c0 + hw   # top constant
+        edge_coeffs[0, 1, 1] = tilt       # top slope
+        xranges_in = np.array([[self._XSTART, self._XEND]], dtype=int)
+
+        rng = np.random.default_rng(7)
+        flat = rng.normal(0.0, 50.0, size=(nrows, ncols)).astype(np.float32) + 200.0
+        rows = np.arange(nrows, dtype=float)
+        for j in range(ncols):
+            center = c0 + tilt * j
+            sigma = hw / 2.355
+            flat[:, j] += 10000.0 * np.exp(-0.5 * ((rows - center) / sigma) ** 2)
+
+        path = str(tmp_path / "high_order_flat.fits")
+        _write_fits_flat(flat, path)
+
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs,
+            xranges=xranges_in,
+            edge_degree=1,
+            flat_fraction=0.85,
+            comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.5)),
+            ybuffer=1,
+            step=20,
+            omask=None, ycororder=None,
+            orders=[0],
+        )
+        return path, fi, xranges_in
+
+    # ── 1. sample_cols may legitimately extend beyond post-fit xrange ────────
+
+    def test_sample_cols_extends_beyond_post_fit_xend(self, tmp_path):
+        """After step 6a clips x_end, sample_cols[-1] should still be at the
+        original input xrange end — NOT cut back to x_end.
+
+        This is the core semantic: sample_cols = original traced grid;
+        [x_start, x_end] = final valid domain (narrower when polynomial
+        overshoots detector).
+        """
+        path, fi, xranges_in = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        os0 = trace.order_samples[0]
+        x_end_final = trace.order_xranges[0, 1]
+
+        # step 6a must have actually clipped x_end
+        assert x_end_final < self._XEND, (
+            f"Expected step 6a to clip x_end below {self._XEND}, "
+            f"got {x_end_final} — test scenario may have changed."
+        )
+        # sample_cols must still include columns beyond the clipped x_end
+        assert os0.sample_cols[-1] > x_end_final, (
+            f"sample_cols[-1]={os0.sample_cols[-1]} <= x_end_final={x_end_final}; "
+            "sample_cols should reflect the original traced grid, not the "
+            "post-fit restricted xrange."
+        )
+
+    # ── 2. validity = xrange, not sample membership ──────────────────────────
+
+    def test_column_in_sample_cols_outside_xrange_is_invalid(self, tmp_path):
+        """Explicitly show that a column can be in sample_cols AND be invalid
+        because it lies outside [x_start, x_end].
+
+        This demonstrates the intended semantics: membership in sample_cols
+        does NOT imply validity.  The valid domain is ONLY [x_start, x_end].
+        """
+        path, fi, _ = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        os0 = trace.order_samples[0]
+        x_end_final = os0.x_end
+
+        # Find a sample column that is beyond x_end_final
+        beyond = os0.sample_cols[os0.sample_cols > x_end_final]
+        assert len(beyond) > 0, (
+            "No sample column beyond x_end_final — the high-order scenario "
+            "did not produce the expected post-fit clipping."
+        )
+        col = int(beyond[0])
+        # col is in sample_cols, but it is outside [x_start, x_end]
+        assert col > x_end_final, (
+            f"col {col} should be beyond x_end_final {x_end_final}"
+        )
+        # col is NOT valid (it lies outside the post-fit domain)
+        assert not (os0.x_start <= col <= os0.x_end), (
+            f"col {col} unexpectedly inside [x_start={os0.x_start}, "
+            f"x_end={os0.x_end}]"
+        )
+
+    # ── 3. compat arrays are NaN for sample cols outside xrange ──────────────
+
+    def test_compat_center_rows_nan_for_sample_cols_beyond_xend(self, tmp_path):
+        """In a real post-fit-clipped trace, compat center_rows must be NaN
+        for any sample column that lies beyond x_end_final.
+
+        This is an end-to-end version of the TestCompatArraysPostFitXrangeMasking
+        unit tests — it runs the full trace_orders_from_flat pipeline with a
+        scenario where step 6a ACTUALLY narrows x_end.
+        """
+        path, fi, _ = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+
+        for i, os_i in enumerate(trace.order_samples):
+            x_end_final = os_i.x_end
+            for k, col in enumerate(trace.sample_cols):
+                val = trace.center_rows[i, k]
+                if col > x_end_final:
+                    assert np.isnan(val), (
+                        f"Order {i}: center_rows[{i}, {k}] = {val:.2f} is finite "
+                        f"at col {col} which is beyond post-fit x_end={x_end_final}"
+                    )
+
+    def test_compat_finite_implies_within_xrange(self, tmp_path):
+        """Every finite entry in center_rows must lie within [x_start, x_end]."""
+        path, fi, _ = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+
+        for i, os_i in enumerate(trace.order_samples):
+            for k, col in enumerate(trace.sample_cols):
+                val = trace.center_rows[i, k]
+                if np.isfinite(val):
+                    assert os_i.x_start <= col <= os_i.x_end, (
+                        f"Order {i}: center_rows[{i}, {k}] = {val:.2f} is finite "
+                        f"but col {col} is outside [{os_i.x_start}, {os_i.x_end}]"
+                    )
+
+    # ── 4. to_order_geometry_set uses order_xranges, not sample_cols span ────
+
+    def test_geometry_x_end_equals_restricted_xrange_not_sample_cols_last(
+        self, tmp_path
+    ):
+        """to_order_geometry_set must use order_xranges for x_end, not
+        sample_cols[-1].
+
+        When step 6a clips x_end, sample_cols[-1] > x_end_final.  If
+        geometry mistakenly used sample_cols[-1] it would report a wider
+        (invalid) x_end.  This test verifies geometry.x_end == order_xranges
+        and is strictly less than sample_cols[-1].
+        """
+        path, fi, _ = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        geom = trace.to_order_geometry_set("K3")
+        g = geom.geometries[0]
+
+        x_end_xranges = int(trace.order_xranges[0, 1])
+        sample_cols_last = int(trace.sample_cols[-1])
+
+        # Geometry must come from order_xranges (restricted), not sample_cols
+        assert g.x_end == x_end_xranges, (
+            f"g.x_end={g.x_end} != order_xranges x_end={x_end_xranges}"
+        )
+        # Confirm the scenario is non-trivial: sample_cols extends beyond x_end
+        assert sample_cols_last > x_end_xranges, (
+            f"sample_cols[-1]={sample_cols_last} is not beyond "
+            f"x_end={x_end_xranges}; scenario did not produce clipping."
+        )
+        # Geometry must NOT use the wider sample_cols last column
+        assert g.x_end != sample_cols_last, (
+            f"geometry x_end={g.x_end} equals sample_cols[-1]={sample_cols_last}; "
+            "geometry is using the wrong (non-restricted) range."
+        )
+
+    # ── 5. regression: raw sample_cols as valid domain gives wrong answer ────
+
+    def test_regression_sample_cols_last_not_valid_x_end(self, tmp_path):
+        """Regression: using sample_cols[-1] as x_end instead of
+        order_xranges gives an incorrect (too wide) range after step 6a clips.
+
+        This test would FAIL if any downstream code substituted
+        ``trace.sample_cols[-1]`` for ``trace.order_xranges[i, 1]`` as the
+        order's valid x_end.
+        """
+        path, fi, xranges_in = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+
+        correct_x_end = int(trace.order_xranges[0, 1])
+        wrong_x_end = int(trace.sample_cols[-1])
+
+        # The two values must differ when step 6a has actually clipped.
+        assert correct_x_end < wrong_x_end, (
+            f"correct_x_end={correct_x_end} should be < wrong_x_end={wrong_x_end}; "
+            "step 6a clipping must have occurred for this regression to be meaningful."
+        )
+        # If code used wrong_x_end for the geometry, x_end would exceed the
+        # detector-safe limit.  Verify that the restricted range is safe.
+        nrows = self._NROWS
+        assert trace.bot_poly_coeffs is not None
+        bot_at_correct = np.polynomial.polynomial.polyval(
+            float(correct_x_end), trace.bot_poly_coeffs[0]
+        )
+        top_at_correct = np.polynomial.polynomial.polyval(
+            float(correct_x_end), trace.top_poly_coeffs[0]
+        )
+        top_at_wrong = np.polynomial.polynomial.polyval(
+            float(wrong_x_end), trace.top_poly_coeffs[0]
+        )
+        assert 0.0 < bot_at_correct < float(nrows - 1), (
+            "Edge polynomial is not within detector at correct x_end."
+        )
+        assert 0.0 < top_at_correct < float(nrows - 1), (
+            "Edge polynomial is not within detector at correct x_end."
+        )
+        # At wrong_x_end, the top edge polynomial must be outside [0, nrows-1]
+        # (that's why step 6a clipped it).
+        assert top_at_wrong >= float(nrows - 1) or top_at_wrong <= 0.0, (
+            f"top_at_wrong={top_at_wrong:.2f} is unexpectedly within detector "
+            f"at wrong_x_end={wrong_x_end}; scenario may have changed."
+        )
 
 
 def rng_offset(k: int) -> float:

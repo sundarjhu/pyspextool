@@ -242,7 +242,12 @@ class OrderTraceSamples:
     order_index : int
         Zero-based index of this order within the :class:`FlatOrderTrace`.
     sample_cols : ndarray, shape (n_samp,)
-        Column indices at which this order was traced.
+        Column indices at which this order was traced.  These are the
+        original sampling grid built from the initial flatinfo/input xranges.
+        **After post-fit xrange restriction (step 6a in
+        :func:`trace_orders_from_flat`), some entries may fall outside
+        ``[x_start, x_end]``.  The authoritative final valid domain is
+        ``[x_start, x_end]``, not the span of ``sample_cols``.**
     center_rows : ndarray, shape (n_samp,)
         Derived centre-row at each sampled column (mean of bot/top edges).
         NaN where edges were not reliably detected.
@@ -251,9 +256,14 @@ class OrderTraceSamples:
     top_rows : ndarray, shape (n_samp,)
         Top-edge row at each sampled column.  NaN where not detected.
     x_start : int
-        First column of the order's valid range (IDL ``xranges[0, i]``).
+        First column of the order's **final post-fit restricted valid range**
+        (IDL ``xranges[0, i]``).  Set during step 6a to ensure the fitted
+        edge polynomials stay within the detector.  May be larger than
+        ``sample_cols[0]`` when the polynomial overshoots at the low end.
     x_end : int
-        Last column of the order's valid range (IDL ``xranges[1, i]``).
+        Last column of the order's **final post-fit restricted valid range**
+        (IDL ``xranges[1, i]``).  May be smaller than ``sample_cols[-1]``
+        when the polynomial overshoots at the high end.
     """
 
     order_index: int
@@ -290,10 +300,12 @@ class FlatOrderTrace:
     center_rows : ndarray, shape (n_orders, n_sample)
         **Compatibility view — MUST NOT be used for internal computation.**
         Centre-row positions on the shared ``sample_cols`` grid; NaN for
-        columns outside each order's own traced range.  Derived from
-        ``order_samples`` after tracing.  All polynomial fitting, edge
-        detection, and geometry construction MUST use
-        ``order_samples[i].center_rows`` instead.
+        columns outside each order's post-fit restricted xrange
+        ``[x_start, x_end]``.  Columns that appear in an order's
+        ``sample_cols`` but lie outside its ``[x_start, x_end]`` are also
+        NaN here.  Derived from ``order_samples`` after tracing.  All
+        polynomial fitting, edge detection, and geometry construction MUST
+        use ``order_samples[i].center_rows`` instead.
     center_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1)
         Per-order polynomial coefficients for the centre-row trajectory,
         derived as the arithmetic mean of ``bot_poly_coeffs`` and
@@ -720,6 +732,14 @@ def trace_orders_from_flat(
     # ------------------------------------------------------------------
     # 5a. Validate order_samples — assert internal consistency invariants
     #     before any downstream computation uses them.
+    #
+    #     NOTE: the xrange check below (sample_cols within [x_start, x_end])
+    #     is a PRE-FIT invariant only.  At construction time (step 5),
+    #     sample_cols is built from the initial input xranges so it lies
+    #     within [x_start, x_end] by design.  After step 6a (post-fit
+    #     xrange restriction), x_start/x_end may be narrowed inward, making
+    #     some sample_cols entries legitimately outside [x_start, x_end].
+    #     Do NOT re-run this check after step 6a.
     # ------------------------------------------------------------------
     if len(order_samples) != n_orders:
         raise RuntimeError(
