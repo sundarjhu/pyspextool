@@ -1624,6 +1624,10 @@ def run_k3_example(
     FileNotFoundError
         If the raw directory does not exist or the required flat/arc files
         are absent.
+    RuntimeError
+        If the packaged flatinfo for the configured mode cannot be loaded.
+        Stage 1 uses the IDL-style ``mc_adjustguesspos`` path which requires
+        flatinfo; the benchmark will not silently fall back to auto-detection.
     TypeError
         If an unrecognised keyword argument is passed.
 
@@ -1749,13 +1753,22 @@ def run_k3_example(
 
     wavecalinfo = read_wavecalinfo(mode)
     line_list = read_line_list(mode)
-    flatinfo = read_flatinfo(mode)
+    try:
+        flatinfo = read_flatinfo(mode)
+    except (KeyError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            f"K3 benchmark: cannot load flatinfo for mode '{mode}' — "
+            "the IDL-style tracing path requires flatinfo and cannot proceed.\n"
+            f"  Underlying error: {exc}"
+        ) from exc
+    print(f"  Flatinfo loaded for mode {mode}")
 
     # ------------------------------------------------------------------
     # Stage 1: Flat/order tracing
     # ------------------------------------------------------------------
 
     _banner("Stage 1: Flat / order-centre tracing")
+    print(f"  Stage 1 tracing source: flatinfo / IDL-style path")
     flat_img = load_and_combine_flats(flat_files)
     # Pass packaged flatinfo so Stage 1 runs the IDL mc_adjustguesspos path
     # (guess-position cross-correlation + per-order xranges) rather than the
