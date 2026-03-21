@@ -211,8 +211,13 @@ class FlatInfo:
         Fraction of peak flux used to define order edges.
     comm_window : int
         Common-region window size in pixels.
-    image : numpy.ndarray, shape (2048, 2048)
-        Flat-field detector image.
+    image : numpy.ndarray, shape (2048, 2048) or None
+        Normalized flat-field image used for dividing science frames.
+        This is **not** stored in the packaged ``*_flatinfo.fits`` file;
+        that file contains only the reference order mask (see *omask*).
+        Callers that need a normalized flat (e.g. ``preprocess_science_frames``)
+        must populate this field separately after loading the written flat FITS.
+        ``None`` when the object is constructed via :func:`read_flatinfo`.
     xranges : numpy.ndarray, shape (n_orders, 2) or None
         Per-order column ranges ``[x_start, x_end]`` parsed from the
         ``OR{n}_XR`` header keywords.  ``None`` if the header does not
@@ -226,6 +231,19 @@ class FlatInfo:
     edge_degree : int or None
         Polynomial degree of the edge fits (``EDGEDEG`` header keyword).
         ``None`` if the keyword is absent.
+    omask : numpy.ndarray, shape (2048, 2048) or None
+        Reference order mask image (IDL ``omask`` from ``mc_readflatinfo``).
+        Each pixel contains the echelle order number of the order it belongs
+        to; inter-order pixels are 0.  This is the **primary data array**
+        stored in the primary FITS HDU of the packaged ``*_flatinfo.fits``
+        file.  Populated by :func:`read_flatinfo`.
+    ycororder : int or None
+        Order number used for the vertical cross-correlation in
+        ``mc_adjustguesspos`` (IDL ``YCORORDR`` header keyword).
+        ``None`` if the keyword is absent.
+    ybuffer : int
+        Number of detector-edge rows to exclude from edge tracking (IDL
+        ``YBUFFER`` header keyword).  Defaults to 1 if not in header.
     """
 
     mode: str
@@ -239,10 +257,13 @@ class FlatInfo:
     step: int
     flat_fraction: float
     comm_window: int
-    image: np.ndarray
+    image: Optional[np.ndarray] = None
     xranges: Optional[np.ndarray] = None
     edge_coeffs: Optional[np.ndarray] = None
     edge_degree: Optional[int] = None
+    omask: Optional[np.ndarray] = None
+    ycororder: Optional[int] = None
+    ybuffer: int = 1
 
     @property
     def n_orders(self) -> int:
@@ -599,6 +620,14 @@ def read_flatinfo(mode_name: str) -> FlatInfo:
             f"value {slit_range_raw!r} as a comma-separated pair of integers."
         ) from exc
 
+    # IDL mc_readflatinfo: the primary FITS HDU of *_flatinfo.fits IS the
+    # reference order mask (``omask``).  Each pixel contains the order number
+    # (e.g. 203–229 for K3) or 0 for inter-order pixels.
+    # There is no flat-field image in the flatinfo file; the ``image`` field
+    # is left as None and must be populated separately when a normalised flat
+    # is available (e.g. by preprocess_science_frames callers).
+    omask_arr = image.astype(int)
+
     return FlatInfo(
         mode=mode_name,
         orders=orders,
@@ -611,10 +640,13 @@ def read_flatinfo(mode_name: str) -> FlatInfo:
         step=int(hdr.get("STEP", 0)),
         flat_fraction=float(hdr.get("FLATFRAC", float("nan"))),
         comm_window=int(hdr.get("COMWIN", 0)),
-        image=image,
+        image=None,   # flatinfo.fits has no flat-field image; set separately
         xranges=_parse_order_xranges(hdr, orders),
         edge_coeffs=_parse_order_edge_coeffs(hdr, orders),
         edge_degree=int(hdr["EDGEDEG"]) if "EDGEDEG" in hdr else None,
+        omask=omask_arr,
+        ycororder=int(hdr["YCORORDR"]) if "YCORORDR" in hdr else None,
+        ybuffer=int(hdr.get("YBUFFER", 1)),
     )
 
 

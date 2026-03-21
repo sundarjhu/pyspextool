@@ -144,6 +144,7 @@ from pyspextool.instruments.ishell.calibration_fits import (  # noqa: E402
 from pyspextool.instruments.ishell.calibrations import (  # noqa: E402
     read_wavecalinfo,
     read_line_list,
+    read_flatinfo,
 )
 from pyspextool.instruments.ishell.io_utils import (  # noqa: E402
     find_fits_files,
@@ -705,6 +706,18 @@ def _filter_edge_orders(
         half_width_rows=trace.half_width_rows[keep_arr],
         poly_degree=trace.poly_degree,
         seed_col=trace.seed_col,
+        bot_poly_coeffs=(
+            trace.bot_poly_coeffs[keep_arr]
+            if trace.bot_poly_coeffs is not None else None
+        ),
+        top_poly_coeffs=(
+            trace.top_poly_coeffs[keep_arr]
+            if trace.top_poly_coeffs is not None else None
+        ),
+        order_xranges=(
+            trace.order_xranges[keep_arr]
+            if trace.order_xranges is not None else None
+        ),
     )
 
 
@@ -1736,6 +1749,7 @@ def run_k3_example(
 
     wavecalinfo = read_wavecalinfo(mode)
     line_list = read_line_list(mode)
+    flatinfo = read_flatinfo(mode)
 
     # ------------------------------------------------------------------
     # Stage 1: Flat/order tracing
@@ -1743,7 +1757,11 @@ def run_k3_example(
 
     _banner("Stage 1: Flat / order-centre tracing")
     flat_img = load_and_combine_flats(flat_files)
-    trace_raw = trace_orders_from_flat(flat_files)
+    # Pass packaged flatinfo so Stage 1 runs the IDL mc_adjustguesspos path
+    # (guess-position cross-correlation + per-order xranges) rather than the
+    # fallback auto-detect path.
+    trace_raw = trace_orders_from_flat(flat_files, flatinfo=flatinfo)
+    print(f"  Mode                   : {mode} (flatinfo IDL path)")
     print(f"  Orders detected (raw)  : {trace_raw.n_orders}")
 
     # Apply benchmark-only edge-order filter:
