@@ -273,14 +273,19 @@ class FlatOrderTrace:
         Length equals ``n_orders`` when populated by :func:`trace_orders_from_flat`;
         empty list when the object is constructed directly (backward-compatibility).
     sample_cols : ndarray, shape (n_sample,)
-        **Legacy compatibility field.**  Union of all per-order sample column
-        sets.  Populated from ``order_samples`` after tracing for callers
-        that expect a shared column grid.  Authoritative representation is
-        ``order_samples``; do not use this for per-order geometry.
+        **Compatibility view — MUST NOT be used for internal computation.**
+        Union of all per-order sample column sets, populated from
+        ``order_samples`` after tracing.  Exists only to satisfy callers that
+        expect a shared column grid.  All polynomial fitting, edge detection,
+        and geometry construction MUST use ``order_samples[i].sample_cols``
+        instead.
     center_rows : ndarray, shape (n_orders, n_sample)
-        **Legacy compatibility field.**  Centre-row positions on the shared
-        ``sample_cols`` grid.  NaN for columns outside each order's own range.
-        Derived from ``order_samples`` after tracing.
+        **Compatibility view — MUST NOT be used for internal computation.**
+        Centre-row positions on the shared ``sample_cols`` grid; NaN for
+        columns outside each order's own traced range.  Derived from
+        ``order_samples`` after tracing.  All polynomial fitting, edge
+        detection, and geometry construction MUST use
+        ``order_samples[i].center_rows`` instead.
     center_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1)
         Per-order polynomial coefficients for the centre-row trajectory,
         derived as the arithmetic mean of ``bot_poly_coeffs`` and
@@ -1724,9 +1729,20 @@ def _compute_order_trace_stats(
     n_orders = len(fit_rms)
     cols = sample_cols.astype(float)
 
+    # Defensive: assert that we only perform polynomial evaluation below —
+    # never indexing into raw traced-sample arrays (center_rows, bot_rows,
+    # top_rows).  This guard documents the contract and will fire if the
+    # function body is ever accidentally extended to use raw data.
+    assert isinstance(cols, np.ndarray) and cols.ndim == 1, (
+        "_compute_order_trace_stats: sample_cols must be a 1-D array used "
+        "for polynomial evaluation only — do not pass raw traced-sample arrays."
+    )
+
     # Pre-compute centre-row positions at all sample columns.
     # Use NaN rows where the polynomial fit failed so they do not
     # corrupt inter-order separation calculations.
+    # NOTE: the only operation on `cols` throughout this function is
+    # ``polyval(cols, coeffs)`` — no indexing into raw traced arrays occurs.
     center_vals = np.full((n_orders, len(cols)), np.nan)
     for i in range(n_orders):
         if np.isfinite(fit_rms[i]):
