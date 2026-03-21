@@ -1522,6 +1522,113 @@ class TestOrderTraceSamples:
 
 
 # ---------------------------------------------------------------------------
+# 16. Compatibility-array invariants
+# ---------------------------------------------------------------------------
+
+
+class TestCompatArrayInvariants:
+    """Defensive invariants on the union-grid compatibility arrays.
+
+    These tests verify that:
+    - compatibility arrays have the expected shape;
+    - union_cols is strictly increasing;
+    - every finite center_rows entry corresponds to a per-order column;
+    - the compatibility arrays are derived views, not authoritative inputs.
+    """
+
+    @pytest.fixture()
+    def trace(self, tmp_path):
+        flat = _make_synthetic_flat(seed=0)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        return trace_orders_from_flat([path])
+
+    # ── shape ──────────────────────────────────────────────────────────────
+
+    def test_compat_center_rows_shape(self, trace):
+        """compat center_rows shape matches (n_orders, len(sample_cols))."""
+        assert trace.center_rows.shape == (
+            trace.n_orders,
+            len(trace.sample_cols),
+        )
+
+    def test_union_cols_strictly_increasing(self, trace):
+        """sample_cols (union_cols) must be strictly increasing."""
+        cols = trace.sample_cols
+        if len(cols) > 1:
+            assert np.all(np.diff(cols) > 0), (
+                "sample_cols (union_cols) is not strictly increasing"
+            )
+
+    # ── derived vs authoritative ────────────────────────────────────────────
+
+    def test_finite_compat_entries_match_per_order_cols(self, trace):
+        """Every finite center_rows[i, k] must correspond to a column in
+        order_samples[i].sample_cols (i.e. it is derived, not invented)."""
+        for i, os_i in enumerate(trace.order_samples):
+            order_col_set = set(os_i.sample_cols.tolist())
+            for k, col in enumerate(trace.sample_cols):
+                val = trace.center_rows[i, k]
+                if np.isfinite(val):
+                    assert col in order_col_set, (
+                        f"center_rows[{i}, {k}] is finite but column {col} "
+                        f"is not in order_samples[{i}].sample_cols"
+                    )
+
+    def test_center_rows_nan_outside_order_range(self, trace):
+        """Columns outside an order's own range must be NaN in center_rows."""
+        for i, os_i in enumerate(trace.order_samples):
+            order_col_set = set(os_i.sample_cols.tolist())
+            for k, col in enumerate(trace.sample_cols):
+                if col not in order_col_set:
+                    assert np.isnan(trace.center_rows[i, k]), (
+                        f"center_rows[{i}, {k}] (col={col}) should be NaN "
+                        f"(not in order_samples[{i}].sample_cols)"
+                    )
+
+    def test_order_samples_cols_subset_of_union(self, trace):
+        """Every per-order sample column must appear in the union grid."""
+        union_set = set(trace.sample_cols.tolist())
+        for i, os_i in enumerate(trace.order_samples):
+            for col in os_i.sample_cols:
+                assert col in union_set, (
+                    f"order_samples[{i}] column {col} not found in union sample_cols"
+                )
+
+    # ── public dataclass API still works ───────────────────────────────────
+
+    def test_flat_order_trace_direct_construction_still_works(self):
+        """FlatOrderTrace can still be constructed directly (backward compat)."""
+        n = 2
+        sc = np.array([10, 20, 30])
+        cr = np.zeros((n, len(sc)))
+        coeffs = np.zeros((n, 2))
+        rms = np.array([0.1, 0.2])
+        hw = np.array([5.0, 5.0])
+        trace = FlatOrderTrace(
+            n_orders=n,
+            sample_cols=sc,
+            center_rows=cr,
+            center_poly_coeffs=coeffs,
+            fit_rms=rms,
+            half_width_rows=hw,
+            poly_degree=1,
+            seed_col=20,
+        )
+        assert trace.n_orders == n
+        assert trace.sample_cols is sc
+        assert trace.center_rows is cr
+
+    def test_sample_cols_is_1d(self, trace):
+        """sample_cols must be a 1-D array."""
+        assert trace.sample_cols.ndim == 1
+
+    def test_center_rows_is_2d(self, trace):
+        """center_rows must be a 2-D array."""
+        assert trace.center_rows.ndim == 2
+
+
+# ---------------------------------------------------------------------------
 # Private helpers used by the test fixtures
 # ---------------------------------------------------------------------------
 

@@ -715,6 +715,7 @@ def trace_orders_from_flat(
     # ------------------------------------------------------------------
     if len(order_samples) != n_orders:
         raise RuntimeError(
+            f"Internal consistency error after per-order tracing: "
             f"order_samples length {len(order_samples)} != n_orders {n_orders}"
         )
     for os_i in order_samples:
@@ -819,6 +820,36 @@ def trace_orders_from_flat(
             k = int(np.searchsorted(union_cols, col))
             if k < len(union_cols) and union_cols[k] == col:
                 compat_center_rows[i, k] = os_i.center_rows[j]
+
+    # ------------------------------------------------------------------
+    # 8a. Validate compatibility arrays — internal consistency invariants.
+    #     These checks guard against bugs in the compat-array construction
+    #     above; they do NOT validate user inputs.
+    # ------------------------------------------------------------------
+    if compat_center_rows.shape != (n_orders, len(union_cols)):
+        raise RuntimeError(
+            f"compat_center_rows shape {compat_center_rows.shape} does not match "
+            f"(n_orders={n_orders}, len(union_cols)={len(union_cols)})"
+        )
+    if len(union_cols) > 1 and not np.all(np.diff(union_cols) > 0):
+        bad_indices = np.where(np.diff(union_cols) <= 0)[0]
+        raise RuntimeError(
+            "union_cols is not strictly increasing after np.unique — "
+            "this should never happen and indicates a construction bug. "
+            f"First violation at indices {bad_indices.tolist()}: "
+            f"values {union_cols[bad_indices].tolist()} -> {union_cols[bad_indices + 1].tolist()}"
+        )
+    # Every finite entry in compat_center_rows must correspond to a column
+    # that actually exists in that order's own order_samples[i].sample_cols.
+    for i, os_i in enumerate(order_samples):
+        order_col_set = set(os_i.sample_cols.tolist())
+        for k, col in enumerate(union_cols):
+            val = compat_center_rows[i, k]
+            if np.isfinite(val) and col not in order_col_set:
+                raise RuntimeError(
+                    f"compat_center_rows[{i}, {k}] is finite but column {col} "
+                    f"is not in order_samples[{i}].sample_cols — construction bug."
+                )
 
     # ------------------------------------------------------------------
     # 9. Compute per-order QA metrics
