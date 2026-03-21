@@ -781,11 +781,13 @@ class TestTraceOrdersH1RealData:
         assert h1_trace.sample_cols.max() <= 1550
 
     def test_col_range_in_order_geometry(self, h1_trace):
-        # After the IDL-aligned post-fit xrange restriction (step 6a in
-        # trace_orders_from_flat), order_xranges may be narrower than the
-        # input col_range for orders whose fitted edge polynomial overshoots
-        # the detector at one end.  The geometry must therefore be checked
-        # for containment within the col_range, not equality.
+        # After the post-fit xrange restriction (step 6a in
+        # trace_orders_from_flat: fitted edge polynomials are evaluated and the
+        # order's [x_start, x_end] is narrowed to columns where BOTH edges stay
+        # within the detector), order_xranges may be narrower than the input
+        # col_range for orders whose polynomial overshoots at one end.
+        # The geometry must therefore be checked for containment within
+        # col_range, not equality.
         geom = h1_trace.to_order_geometry_set("H1", col_range=(650, 1550))
         for g in geom.geometries:
             assert g.x_start >= 650, (
@@ -1469,7 +1471,7 @@ class TestOrderTraceSamples:
             assert isinstance(os_i.x_end, int)
             assert os_i.x_start <= os_i.x_end
 
-    def test_flatinfo_order_samples_cols_within_initial_xrange(self, trace_flatinfo):
+    def test_flatinfo_order_samples_cols_within_xrange_prefit(self, trace_flatinfo):
         """At construction time (pre-fit), sample_cols is built from the
         initial flatinfo xranges, so every column lies within the initial
         [x_start, x_end].
@@ -2661,6 +2663,279 @@ class TestSampleColsVsXrangeSemantics:
 def rng_offset(k: int) -> float:
     """Small constant offset to make three flats slightly different."""
     return float(k) * 10.0
+
+
+# ---------------------------------------------------------------------------
+# 22. Explicit minimal tests: sample_cols=[10,20,30,40,50], x_start=20, x_end=40
+# ---------------------------------------------------------------------------
+
+
+class TestSampleColsVsXrangeExplicit:
+    """Targeted tests using the minimal explicit geometry:
+
+        sample_cols = [10, 20, 30, 40, 50]
+        x_start     = 20
+        x_end       = 40
+
+    All objects are constructed directly (no full pipeline call) to isolate
+    the semantic invariants from other tracing logic, making any failure easy
+    to diagnose.
+
+    Invariants under test:
+    1. sample_cols may extend beyond [x_start, x_end] — this is valid.
+    2. Membership in sample_cols does NOT imply validity.
+    3. FlatOrderTrace.center_rows is NaN at cols 10, 50 (outside xrange).
+    4. to_order_geometry_set() uses order_xranges, not sample_cols span.
+    5. Regression: if sample_cols were substituted for the valid domain,
+       geometry x_start/x_end would be wrong (10/50 instead of 20/40).
+    """
+
+    # ── canonical test geometry ───────────────────────────────────────────────
+    _SAMPLE_COLS = [10, 20, 30, 40, 50]
+    _CENTER_ROWS = [100.0, 110.0, 120.0, 130.0, 140.0]
+    _X_START = 20
+    _X_END = 40
+
+    def _make_order_samples(self) -> OrderTraceSamples:
+        """OrderTraceSamples with sample_cols=[10..50], x_start=20, x_end=40."""
+        cols = np.array(self._SAMPLE_COLS, dtype=int)
+        crows = np.array(self._CENTER_ROWS, dtype=float)
+        return OrderTraceSamples(
+            order_index=0,
+            sample_cols=cols,
+            center_rows=crows,
+            bot_rows=crows - 5.0,
+            top_rows=crows + 5.0,
+            x_start=self._X_START,
+            x_end=self._X_END,
+        )
+
+    def _build_compat(self, order_samples):
+        """Replicate the step-8 compat array construction from
+        trace_orders_from_flat.  Columns outside [x_start, x_end] stay NaN.
+        """
+        union_cols = np.unique(
+            np.concatenate([os_i.sample_cols for os_i in order_samples])
+        )
+        compat = np.full((len(order_samples), len(union_cols)), np.nan)
+        for i, os_i in enumerate(order_samples):
+            for j, col in enumerate(os_i.sample_cols):
+                if not (os_i.x_start <= col <= os_i.x_end):
+                    continue
+                k = int(np.searchsorted(union_cols, col))
+                if k < len(union_cols) and union_cols[k] == col:
+                    compat[i, k] = os_i.center_rows[j]
+        return union_cols, compat
+
+    def _make_flat_order_trace(self) -> FlatOrderTrace:
+        """Build a FlatOrderTrace from the explicit OrderTraceSamples.
+
+        compat arrays are built with the step-8 logic so that cols 10 and 50
+        are NaN.  order_xranges is set to [[20, 40]] so that
+        to_order_geometry_set() returns x_start=20, x_end=40.
+        """
+        os0 = self._make_order_samples()
+        union_cols, compat_center_rows = self._build_compat([os0])
+        # minimal polynomial: constant center at row 120
+        coeffs = np.array([[120.0, 0.0]])   # shape (1, 2)
+        return FlatOrderTrace(
+            n_orders=1,
+            sample_cols=union_cols,
+            center_rows=compat_center_rows,
+            center_poly_coeffs=coeffs,
+            fit_rms=np.array([0.5]),
+            half_width_rows=np.array([5.0]),
+            poly_degree=1,
+            seed_col=30,
+            order_samples=[os0],
+            order_xranges=np.array([[self._X_START, self._X_END]], dtype=int),
+        )
+
+    # ── TEST 1: construction with sample_cols beyond xrange is valid ──────────
+
+    def test_order_trace_samples_with_extra_cols_is_valid(self):
+        """Constructing OrderTraceSamples where sample_cols extends beyond
+        [x_start, x_end] must not raise — it is intentional, not corruption.
+
+        After step 6a (post-fit xrange restriction), sample_cols still holds
+        the original traced grid.  The reduced [x_start, x_end] is correct.
+        """
+        os = self._make_order_samples()
+        # Construction must succeed without any exception.
+        assert os.sample_cols.tolist() == self._SAMPLE_COLS
+        assert os.x_start == self._X_START
+        assert os.x_end == self._X_END
+        # sample_cols intentionally extends beyond both boundaries.
+        assert os.sample_cols[0] < os.x_start, (
+            "sample_cols[0] should be < x_start to make the test non-trivial"
+        )
+        assert os.sample_cols[-1] > os.x_end, (
+            "sample_cols[-1] should be > x_end to make the test non-trivial"
+        )
+
+    # ── TEST 2: membership != validity ───────────────────────────────────────
+
+    def test_sample_cols_membership_does_not_imply_validity(self):
+        """10 and 50 appear in sample_cols but lie outside [20, 40] — invalid.
+
+        Validity is determined solely by [x_start, x_end], not by presence
+        in sample_cols.
+        """
+        os = self._make_order_samples()
+        # Both 10 and 50 are in sample_cols.
+        assert 10 in os.sample_cols
+        assert 50 in os.sample_cols
+        # But neither is in the valid post-fit domain.
+        assert not (os.x_start <= 10 <= os.x_end), (
+            "10 should be outside valid domain [20, 40]"
+        )
+        assert not (os.x_start <= 50 <= os.x_end), (
+            "50 should be outside valid domain [20, 40]"
+        )
+        # Membership in [20, 30, 40] is valid by both tests.
+        for col in (20, 30, 40):
+            assert col in os.sample_cols
+            assert os.x_start <= col <= os.x_end, (
+                f"col {col} should be inside valid domain [20, 40]"
+            )
+
+    # ── TEST 3: compat arrays enforce xrange ──────────────────────────────────
+
+    def test_compat_nan_at_cols_outside_xrange(self):
+        """FlatOrderTrace.center_rows must be NaN at cols 10 and 50 (outside
+        [20, 40]), even though those columns appear in order_samples[0].sample_cols.
+
+        Finite entries are expected only at cols 20, 30, 40.
+        """
+        trace = self._make_flat_order_trace()
+        col_to_idx = {int(col): k for k, col in enumerate(trace.sample_cols)}
+        # Cols outside [20, 40] must be NaN.
+        for bad_col in (10, 50):
+            k = col_to_idx[bad_col]
+            val = trace.center_rows[0, k]
+            assert np.isnan(val), (
+                f"center_rows[0, k={k}] at col={bad_col} should be NaN "
+                f"(outside [20, 40]); got {val}"
+            )
+        # Cols inside [20, 40] must be finite.
+        for good_col in (20, 30, 40):
+            k = col_to_idx[good_col]
+            val = trace.center_rows[0, k]
+            assert np.isfinite(val), (
+                f"center_rows[0, k={k}] at col={good_col} should be finite "
+                f"(inside [20, 40]); got {val}"
+            )
+
+    def test_compat_finite_implies_within_xrange_explicit(self):
+        """Every finite center_rows[0, k] entry implies sample_cols[k] ∈ [20, 40].
+
+        Verifies the implication: finite → col ∈ [x_start, x_end].
+        The converse (col ∈ xrange → finite) holds for this fixture because
+        center_rows are non-NaN for all in-range sample columns.
+        """
+        trace = self._make_flat_order_trace()
+        os0 = trace.order_samples[0]
+        for k, col in enumerate(trace.sample_cols):
+            val = trace.center_rows[0, k]
+            if np.isfinite(val):
+                assert os0.x_start <= col <= os0.x_end, (
+                    f"Finite center_rows[0, k={k}] at col={col} but "
+                    f"col is outside [{os0.x_start}, {os0.x_end}]"
+                )
+
+    # ── TEST 4: geometry uses xrange, not sampling span ──────────────────────
+
+    def test_geometry_uses_order_xranges_not_sample_cols_span(self):
+        """to_order_geometry_set() must report x_start=20 and x_end=40,
+        not x_start=10 and x_end=50 (the sample_cols span).
+
+        sample_cols spans [10, 50] but order_xranges is [[20, 40]].
+        The geometry must come from order_xranges.
+        """
+        trace = self._make_flat_order_trace()
+        geom = trace.to_order_geometry_set("H1")
+        g = geom.geometries[0]
+
+        # Geometry must use order_xranges.
+        assert g.x_start == self._X_START, (
+            f"g.x_start={g.x_start} should be {self._X_START} (from order_xranges "
+            f"[{self._X_START}, {self._X_END}]); sample_cols[0]="
+            f"{int(trace.sample_cols[0])} — geometry must not use sample span"
+        )
+        assert g.x_end == self._X_END, (
+            f"g.x_end={g.x_end} should be {self._X_END} (from order_xranges); "
+            f"sample_cols[-1]={int(trace.sample_cols[-1])} — geometry must not "
+            "use sample span"
+        )
+        # The test is non-trivial: sample_cols span is wider than the valid xrange.
+        assert int(trace.sample_cols[0]) < self._X_START
+        assert int(trace.sample_cols[-1]) > self._X_END
+
+    def test_geometry_uses_order_samples_xrange_when_order_xranges_is_none(self):
+        """When order_xranges is None, to_order_geometry_set() falls back to
+        per-order x_start/x_end from order_samples — NOT sample_cols span.
+
+        This verifies the secondary fallback path also uses the valid domain.
+        """
+        os0 = self._make_order_samples()
+        union_cols, compat_center_rows = self._build_compat([os0])
+        coeffs = np.array([[120.0, 0.0]])
+        trace_no_xranges = FlatOrderTrace(
+            n_orders=1,
+            sample_cols=union_cols,
+            center_rows=compat_center_rows,
+            center_poly_coeffs=coeffs,
+            fit_rms=np.array([0.5]),
+            half_width_rows=np.array([5.0]),
+            poly_degree=1,
+            seed_col=30,
+            order_samples=[os0],
+            order_xranges=None,   # ← no order_xranges; fallback to order_samples
+        )
+        geom = trace_no_xranges.to_order_geometry_set("H1")
+        g = geom.geometries[0]
+        # Must still use x_start=20, x_end=40 from order_samples[0].
+        assert g.x_start == self._X_START, (
+            f"g.x_start={g.x_start} should be {self._X_START} from order_samples; "
+            f"sample_cols[0]={int(trace_no_xranges.sample_cols[0])}"
+        )
+        assert g.x_end == self._X_END, (
+            f"g.x_end={g.x_end} should be {self._X_END} from order_samples; "
+            f"sample_cols[-1]={int(trace_no_xranges.sample_cols[-1])}"
+        )
+
+    # ── TEST 5: regression — failure if sample_cols used as valid domain ──────
+
+    def test_regression_geometry_wrong_if_sample_cols_used_as_domain(self):
+        """Regression: substituting sample_cols[0]/[-1] for order_xranges would
+        give geometry x_start=10, x_end=50 instead of 20, 40.
+
+        This test FAILS if to_order_geometry_set() (or any callee) ever
+        substitutes ``trace.sample_cols[0]`` / ``trace.sample_cols[-1]`` for
+        the per-order valid xrange when order_xranges IS available.
+        """
+        trace = self._make_flat_order_trace()
+        geom = trace.to_order_geometry_set("H1")
+        g = geom.geometries[0]
+
+        # "Wrong" values that would appear if sample_cols were used.
+        wrong_x_start = int(trace.sample_cols[0])    # 10
+        wrong_x_end = int(trace.sample_cols[-1])     # 50
+
+        # Geometry must not equal the wrong (sample-cols-derived) values.
+        assert g.x_start != wrong_x_start, (
+            f"g.x_start={g.x_start} == sample_cols[0]={wrong_x_start}; "
+            "geometry is using sample_cols span instead of order_xranges"
+        )
+        assert g.x_end != wrong_x_end, (
+            f"g.x_end={g.x_end} == sample_cols[-1]={wrong_x_end}; "
+            "geometry is using sample_cols span instead of order_xranges"
+        )
+        # And must equal the correct (xrange-derived) values.
+        assert g.x_start == self._X_START
+        assert g.x_end == self._X_END
+
+
 
 
 def _write_three_flats(tmp_path, base=None) -> list[str]:
