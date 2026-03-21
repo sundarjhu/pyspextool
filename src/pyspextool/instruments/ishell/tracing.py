@@ -363,8 +363,14 @@ class FlatOrderTrace:
         :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet`
         """
         if col_range is None:
-            default_x_start = int(self.sample_cols[0])
-            default_x_end = int(self.sample_cols[-1])
+            if self.order_samples:
+                # Use first/last order x_start/x_end as representative range.
+                default_x_start = min(os_i.x_start for os_i in self.order_samples)
+                default_x_end = max(os_i.x_end for os_i in self.order_samples)
+            else:
+                # Backward-compat: direct-construction path (no order_samples).
+                default_x_start = int(self.sample_cols[0])
+                default_x_end = int(self.sample_cols[-1])
         else:
             default_x_start, default_x_end = int(col_range[0]), int(col_range[1])
 
@@ -699,6 +705,33 @@ def trace_orders_from_flat(
         ))
 
     # ------------------------------------------------------------------
+    # 5a. Validate order_samples — assert internal consistency invariants
+    #     before any downstream computation uses them.
+    # ------------------------------------------------------------------
+    if len(order_samples) != n_orders:
+        raise RuntimeError(
+            f"order_samples length {len(order_samples)} != n_orders {n_orders}"
+        )
+    for os_i in order_samples:
+        n = len(os_i.sample_cols)
+        if n == 0:
+            raise RuntimeError(f"Order {os_i.order_index}: empty sample_cols array")
+        if os_i.center_rows.shape != (n,) or os_i.bot_rows.shape != (n,) or os_i.top_rows.shape != (n,):
+            raise RuntimeError(
+                f"Order {os_i.order_index}: traced array shapes inconsistent with "
+                f"sample_cols length {n}"
+            )
+        if n > 1 and not np.all(np.diff(os_i.sample_cols) > 0):
+            raise RuntimeError(
+                f"Order {os_i.order_index}: sample_cols is not strictly increasing"
+            )
+        if os_i.sample_cols[0] < os_i.x_start or os_i.sample_cols[-1] > os_i.x_end:
+            raise RuntimeError(
+                f"Order {os_i.order_index}: sample_cols [{os_i.sample_cols[0]}, "
+                f"{os_i.sample_cols[-1]}] outside xrange [{os_i.x_start}, {os_i.x_end}]"
+            )
+
+    # ------------------------------------------------------------------
     # 6. Fit robust polynomials to bottom and top edges per order,
     #    using each order's own sample column array.
     #    (IDL: mc_robustpoly1d on edges[*,0] and edges[*,1])
@@ -751,28 +784,28 @@ def trace_orders_from_flat(
             fit_rms[i] = float(np.std(os_i.center_rows[good_cen] - pred))
 
     # ------------------------------------------------------------------
-    # 7. Estimate order half-widths from per-order edge samples
+    # 7. Estimate order half-widths directly from per-order edge samples.
+    #    No temporary 2D arrays: compute mean edge separation per order.
     # ------------------------------------------------------------------
     if flatinfo is not None:
-        # Use edge separation at the seed column of the first order as representative.
-        # Build temporary 2D arrays from per-order samples for the helper.
-        max_samp = max(len(os_i.sample_cols) for os_i in order_samples)
-        bot_rows_2d = np.full((n_orders, max_samp), np.nan)
-        top_rows_2d = np.full((n_orders, max_samp), np.nan)
+        # IDL path: use mean (top − bottom) edge separation for each order.
+        half_width_rows = np.zeros(n_orders, dtype=float)
         for i, os_i in enumerate(order_samples):
-            n = len(os_i.sample_cols)
-            bot_rows_2d[i, :n] = os_i.bot_rows
-            top_rows_2d[i, :n] = os_i.top_rows
-        half_width_rows = _estimate_half_widths_from_edges(
-            bot_rows_2d, top_rows_2d, order_seed_indices[0],
-        )
+            sep = os_i.top_rows - os_i.bot_rows
+            valid = np.isfinite(sep) & (sep > 0)
+            if valid.sum() > 0:
+                half_width_rows[i] = float(np.mean(sep[valid]) / 2.0)
+            else:
+                half_width_rows[i] = 0.0
     else:
         half_width_rows = _estimate_half_widths(seed_profile, seed_peaks)
 
     # ------------------------------------------------------------------
     # 8. Build legacy compatibility arrays: union sample_cols + 2D center_rows
     #    These are derived from order_samples for callers that still use the
-    #    shared-grid API.  They are NOT used internally for geometry.
+    #    shared-grid API.  They are NOT used internally for polynomial fitting,
+    #    edge logic, or geometry construction — only for backward compatibility
+    #    and QA polynomial evaluation (see step 9).
     # ------------------------------------------------------------------
     union_cols = np.unique(np.concatenate([os_i.sample_cols for os_i in order_samples]))
     compat_center_rows = np.full((n_orders, len(union_cols)), np.nan)
@@ -784,6 +817,9 @@ def trace_orders_from_flat(
 
     # ------------------------------------------------------------------
     # 9. Compute per-order QA metrics
+    #    _compute_order_trace_stats evaluates the fitted polynomials at the
+    #    supplied column array.  Passing union_cols is safe: it is used for
+    #    polynomial evaluation only, not for indexing raw traced arrays.
     # ------------------------------------------------------------------
     order_stats = _compute_order_trace_stats(
         center_poly_coeffs, fit_rms, union_cols,
