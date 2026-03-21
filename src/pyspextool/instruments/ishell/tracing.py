@@ -10,8 +10,10 @@ median-combined QTH flat-field frames.  The result is a
   columns (the **primary traced quantities**, matching IDL),
 * robust polynomial fits to those edge positions (``bot_poly_coeffs``,
   ``top_poly_coeffs``),
-* centre-line polynomial coefficients derived from the edge fits, and
-* estimated per-order half-widths derived from edge separation.
+* centre-line polynomial coefficients derived from the edge fits,
+* estimated per-order half-widths derived from edge separation, and
+* per-order valid column ranges (``order_xranges``), matching the IDL
+  ``xranges`` output of ``mc_adjustguesspos``.
 
 The :class:`FlatOrderTrace` can be converted to an
 :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet` via its
@@ -28,8 +30,8 @@ The IDL procedures relevant to iSHELL flat/order geometry, in call order:
 2. ``mc_readflatinfo(flatinfofile)`` – reads the reference
    ``K3_flatinfo.fits`` (or other mode's flatinfo) file.  Returns a
    structure containing stored reference ``edgecoeffs`` (shape
-   ``[degree+1, 2, norders]``), ``xranges``, ``guesspos``, plus
-   tracing parameters ``step``, ``flatfrac``, ``comwin``, ``ybuffer``,
+   ``[degree+1, 2, norders]``), ``xranges``, ``omask``, ``ycororder``,
+   ``ybuffer``, tracing parameters ``step``, ``flatfrac``, ``comwin``,
    ``slith_range``, ``edgedeg``.
 
 3. ``mc_adjustguesspos(edgecoeffs, xranges, flat, omask, orders,
@@ -40,8 +42,8 @@ The IDL procedures relevant to iSHELL flat/order geometry, in call order:
 
 4. ``mc_findorders(flat, adj.guesspos, adj.xranges, step, slith_range,
    edgedeg, ybuffer, flatfrac, comwin, edgecoeffs, xranges)`` – the
-   core tracing routine.  For each order it sweeps the sample columns,
-   tracks bottom and top edges via Sobel-image COM, fits robust
+   core tracing routine.  For each order it sweeps the per-order sample
+   columns, tracks bottom and top edges via Sobel-image COM, fits robust
    polynomials to each edge separately, and returns ``edgecoeffs``
    (shape ``[degree+1, 2, norders]``) and ``xranges``.
 
@@ -50,27 +52,35 @@ polynomials for the bottom edge (index 0) and top edge (index 1) of
 each order.  Centres are derived from the edges; they are not the
 primary fit target.
 
-Algorithm (Python port of IDL ``mc_findorders``)
--------------------------------------------------
+Algorithm (Python port)
+-----------------------
 1. **Load frames** – median-combine flat FITS files.
 
 2. **Order initialization**:
 
-   - *With flatinfo*: derive guess positions from the stored reference
-     ``edge_coeffs`` and ``xranges``, using ``flatinfo.step``,
-     ``flatinfo.flat_fraction``, etc.  This matches the IDL
-     ``mc_readflatinfo`` / ``mc_adjustguesspos`` path (without the
-     cross-correlation shift correction — see limitations below).
+   - *With flatinfo (full path)*: call :func:`_adjust_guess_positions` to
+     perform the IDL ``mc_adjustguesspos`` vertical cross-correlation
+     between the stored order mask and the new flat.  Requires
+     ``flatinfo.omask`` and ``flatinfo.ycororder`` to be populated.
+   - *With flatinfo (DEFAULT path)*: when ``omask`` or ``ycororder`` is
+     absent, use :func:`_compute_guess_positions_from_flatinfo` (IDL
+     ``mc_adjustguesspos /DEFAULT`` equivalent).
    - *Without flatinfo (fallback)*: auto-detect order centres at a
      single seed column via :func:`scipy.signal.find_peaks`.
 
-3. **Sobel enhancement** – compute gradient magnitude (IDL ``sobel()``).
+3. **Per-order sample columns** – in flatinfo mode, each order has its
+   own valid column range from the adjusted ``xranges``; the sweep is
+   restricted to that range.  In fallback mode all orders share a single
+   common column range.
 
-4. **Edge tracking** – for each order, sweep left then right from the
+4. **Sobel enhancement** – compute gradient magnitude (IDL ``sobel()``).
+
+5. **Edge tracking** – for each order, sweep left then right from the
    guess column, tracking bottom and top edges via flux threshold +
-   Sobel COM (IDL ``mc_findorders`` inner loop).
+   Sobel COM (IDL ``mc_findorders`` inner loop).  Only columns within
+   the order's valid xrange are traced.
 
-5. **Polynomial fitting** – fit a robust polynomial to the **bottom
+6. **Polynomial fitting** – fit a robust polynomial to the **bottom
    edge** array and a separate one to the **top edge** array (IDL
    ``mc_robustpoly1d``).  Centres are derived from the fitted edges.
 
@@ -84,16 +94,21 @@ IDL-to-Python fidelity status
 - Robust polynomial fitting for both edges
 - ``goto cont1`` / boundary-flag stop logic
 - Initialization window around guess column index
+- ``mc_adjustguesspos`` cross-correlation: vertical sweep over
+  ``nshifts = slith_pix * 1.8 + 1`` integer offsets; offset is subtracted
+  from all guess y-positions; per-order xranges recomputed with shifted edges
+- Per-order valid column ranges (``order_xranges``)
+- Per-order step-based sample column sets
 
 **Does NOT fully match IDL:**
 
-- The ``mc_adjustguesspos`` cross-correlation shift correction is not
-  implemented.  When *flatinfo* is supplied, the stored reference edge
-  coefficients are used as-is to compute guess positions.
-- IDL uses per-order column ranges (``sranges``); this implementation
-  uses a single common column range for all orders.
-- Step-based column sampling is used when ``step`` is provided via
-  flatinfo; otherwise ``n_sample_cols`` evenly-spaced columns are used.
+- IDL ``mc_findorders`` uses per-order column ranges (``sranges``) as its
+  inner sweep range; this Python version uses a common column index space
+  (the union of all per-order column arrays) and gates per-order validity
+  with boolean masks, which is functionally equivalent but not identical.
+- Step-based column sampling is used when ``flatinfo.step > 0``; otherwise
+  ``n_sample_cols`` evenly-spaced columns are used (no IDL equivalent for
+  that fallback).
 """
 
 from __future__ import annotations
@@ -247,6 +262,12 @@ class FlatOrderTrace:
     top_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1) or None
         Per-order polynomial coefficients for the **top edge** of each
         order (IDL ``edgecoeffs[*,1,i]``).  ``None`` as above.
+    order_xranges : ndarray, shape (n_orders, 2) or None
+        Per-order valid column ranges ``[x_start, x_end]``, matching the
+        IDL ``xranges[*,i]`` output of ``mc_adjustguesspos``.  When
+        flatinfo mode is used this is derived from the adjusted xranges.
+        In auto-detect mode it is ``None`` (all orders share the common
+        column range).
     order_stats : list of OrderTraceStats
         Per-order QA metrics.  Empty if constructed directly.
     """
@@ -261,6 +282,7 @@ class FlatOrderTrace:
     seed_col: int
     bot_poly_coeffs: Optional[np.ndarray] = None
     top_poly_coeffs: Optional[np.ndarray] = None
+    order_xranges: Optional[np.ndarray] = None
     order_stats: list[OrderTraceStats] = field(default_factory=list)
 
     def to_order_geometry_set(
@@ -282,12 +304,17 @@ class FlatOrderTrace:
         a fallback for backward-compatibility with code that builds
         :class:`FlatOrderTrace` objects directly (e.g. in tests).
 
+        When ``order_xranges`` is available, each order's ``x_start`` /
+        ``x_end`` is taken from the per-order range (matching IDL
+        ``xranges``).  Otherwise, *col_range* is applied to all orders.
+
         Parameters
         ----------
         mode : str
             iSHELL observing mode name (e.g. ``"H1"``).
         col_range : tuple of int (col_start, col_end), optional
-            Column range applied uniformly to all orders.  Defaults to
+            Column range applied uniformly to all orders when
+            ``order_xranges`` is ``None``.  Defaults to
             ``(sample_cols[0], sample_cols[-1])``.
 
         Returns
@@ -295,13 +322,21 @@ class FlatOrderTrace:
         :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet`
         """
         if col_range is None:
-            x_start = int(self.sample_cols[0])
-            x_end = int(self.sample_cols[-1])
+            default_x_start = int(self.sample_cols[0])
+            default_x_end = int(self.sample_cols[-1])
         else:
-            x_start, x_end = int(col_range[0]), int(col_range[1])
+            default_x_start, default_x_end = int(col_range[0]), int(col_range[1])
 
         geometries = []
         for i in range(self.n_orders):
+            # Per-order x-range: use order_xranges when available (IDL path).
+            if self.order_xranges is not None:
+                x_start = int(self.order_xranges[i, 0])
+                x_end = int(self.order_xranges[i, 1])
+            else:
+                x_start = default_x_start
+                x_end = default_x_end
+
             if self.bot_poly_coeffs is not None and self.top_poly_coeffs is not None:
                 # Use the directly-traced edge polynomials (IDL output path).
                 bot_coeffs = self.bot_poly_coeffs[i].copy()
@@ -489,40 +524,86 @@ def trace_orders_from_flat(
     # 4. Compute guess positions and build sample columns
     # ------------------------------------------------------------------
     if flatinfo is not None and flatinfo.edge_coeffs is not None and flatinfo.xranges is not None:
-        # IDL path: derive guess positions from stored edge_coeffs + xranges.
-        # (mc_readflatinfo / mc_adjustguesspos logic, without cross-corr shift.)
-        guess_positions, guess_xranges = _compute_guess_positions_from_flatinfo(
-            flatinfo.edge_coeffs, flatinfo.xranges
+        # IDL path: adjust guess positions via cross-correlation (mc_adjustguesspos),
+        # then build per-order sample columns respecting the adjusted xranges.
+        can_adjust = (
+            flatinfo.omask is not None
+            and flatinfo.ycororder is not None
+            and flatinfo.ycororder in flatinfo.orders
         )
+        if can_adjust:
+            guess_positions, guess_xranges = _adjust_guess_positions(
+                flatinfo.edge_coeffs,
+                flatinfo.xranges,
+                flat,
+                flatinfo.omask,
+                flatinfo.orders,
+                flatinfo.ycororder,
+                ybuffer,
+            )
+            logger.info(
+                "Flatinfo mode: %d orders, guess positions adjusted via "
+                "cross-correlation (ycororder=%d)",
+                len(guess_positions), flatinfo.ycororder,
+            )
+        else:
+            # DEFAULT branch: no omask or ycororder available; use reference
+            # positions unchanged (IDL mc_adjustguesspos /DEFAULT equivalent).
+            guess_positions, guess_xranges = _compute_guess_positions_from_flatinfo(
+                flatinfo.edge_coeffs, flatinfo.xranges
+            )
+            logger.info(
+                "Flatinfo mode: %d orders, guess positions from stored "
+                "edgecoeffs (no cross-correlation: omask or ycororder absent)",
+                len(guess_positions),
+            )
+
         n_orders = len(guess_positions)
-        # seed_col = midpoint of all xranges (representative column for logging)
+
+        # seed_col: representative column used for logging / half-width fallback
         seed_col = int(np.round(np.mean(guess_xranges[:, 0] + guess_xranges[:, 1]) / 2.0))
-        # seed_profile is used only for half-width estimation; use col nearest seed_col
         seed_profile = _extract_cross_section(flat, seed_col, col_half_width)
         seed_peaks = np.array([gp[1] for gp in guess_positions])
 
-        # Build sample columns using step if provided, else n_sample_cols.
-        # IDL mc_findorders: starts = start+step-1, stops = stop-step+1,
-        # scols = findgen(fix((stops-starts)/step)+1)*step + starts
+        # Build per-order sample column arrays.
+        # IDL mc_findorders: for each order, scols = start+step-1 : stop-step+1 by step.
         step = int(getattr(flatinfo, "step", 0))
-        if step > 0:
-            starts = col_lo + step - 1
-            stops = col_hi - step + 1
-            sample_cols = np.arange(starts, stops + 1, step)
-        else:
-            sample_cols = np.round(np.linspace(col_lo, col_hi, n_sample_cols)).astype(int)
+        order_sample_cols_list: list[npt.NDArray] = []
+        for i in range(n_orders):
+            x0_i = max(col_lo, int(guess_xranges[i, 0]))
+            x1_i = min(col_hi, int(guess_xranges[i, 1]))
+            if step > 0:
+                starts_i = x0_i + step - 1
+                stops_i = x1_i - step + 1
+                s_cols_i = np.arange(starts_i, stops_i + 1, step)
+            else:
+                s_cols_i = np.round(np.linspace(x0_i, x1_i, n_sample_cols)).astype(int)
+            s_cols_i = np.unique(np.clip(s_cols_i, x0_i, x1_i))
+            order_sample_cols_list.append(s_cols_i)
 
-        sample_cols = np.unique(np.clip(sample_cols, col_lo, col_hi))
+        # For the shared arrays we need a common set of sample columns that
+        # covers the union of all per-order sets.  Per-order tracing then
+        # only uses the subset relevant to each order.
+        all_cols_set = np.unique(np.concatenate(order_sample_cols_list))
+        sample_cols = all_cols_set
 
-        # Seed idx = column closest to the first guess column (use per-order later)
-        # For initialization we use the median guess column across orders.
-        median_guess_x = float(np.median([gp[0] for gp in guess_positions]))
-        seed_idx = int(np.argmin(np.abs(sample_cols - median_guess_x)))
+        # Per-order seed indices into sample_cols
+        order_seed_indices = [
+            int(np.argmin(np.abs(sample_cols - gp[0])))
+            for gp in guess_positions
+        ]
 
-        logger.info(
-            "Flatinfo mode: %d orders, guess positions from stored edgecoeffs",
-            n_orders,
-        )
+        # Per-order valid sample-column masks (only trace within order xrange)
+        order_col_masks: list[npt.NDArray] = []
+        for i in range(n_orders):
+            x0_i = int(guess_xranges[i, 0])
+            x1_i = int(guess_xranges[i, 1])
+            mask_i = (sample_cols >= x0_i) & (sample_cols <= x1_i)
+            order_col_masks.append(mask_i)
+
+        # Store the adjusted per-order xranges for downstream output
+        traced_xranges = guess_xranges.copy()
+
     else:
         # Fallback: auto-detect seed peaks at the central column.
         if seed_col is None:
@@ -541,11 +622,14 @@ def trace_orders_from_flat(
             )
 
         n_orders = len(seed_peaks)
-        guess_positions = None  # not used below in auto-detect mode
+        guess_positions = None
 
         sample_cols = np.round(np.linspace(col_lo, col_hi, n_sample_cols)).astype(int)
         sample_cols = np.unique(sample_cols)
         seed_idx = int(np.argmin(np.abs(sample_cols - seed_col)))
+        order_seed_indices = [seed_idx] * n_orders
+        order_col_masks = [np.ones(len(sample_cols), dtype=bool)] * n_orders
+        traced_xranges = None
 
         logger.info(
             "Auto-detect mode: %d order seeds at column %d: rows %s",
@@ -560,16 +644,6 @@ def trace_orders_from_flat(
     bot_rows = np.full((n_orders, len(sample_cols)), np.nan)
     top_rows = np.full((n_orders, len(sample_cols)), np.nan)
 
-    # When flatinfo provides per-order guess columns, use the correct seed_idx
-    # for each order. Otherwise all orders share the same seed_idx.
-    if flatinfo is not None and guess_positions is not None:
-        order_seed_indices = [
-            int(np.argmin(np.abs(sample_cols - gp[0])))
-            for gp in guess_positions
-        ]
-    else:
-        order_seed_indices = [seed_idx] * n_orders
-
     _trace_all_orders(
         flat, sample_cols, order_seed_indices, seed_peaks,
         center_rows, bot_rows, top_rows, poly_degree,
@@ -577,6 +651,7 @@ def trace_orders_from_flat(
         intensity_fraction=intensity_fraction,
         com_half_width=com_half_width,
         slit_height_range=slit_height_range,
+        order_col_masks=order_col_masks,
     )
 
     # ------------------------------------------------------------------
@@ -589,9 +664,11 @@ def trace_orders_from_flat(
     fit_rms = np.full(n_orders, np.nan)
 
     for i in range(n_orders):
-        good_bot = np.isfinite(bot_rows[i])
-        good_top = np.isfinite(top_rows[i])
-        good_cen = np.isfinite(center_rows[i])
+        # Use only valid-column samples for fitting (per-order xrange).
+        valid_mask = order_col_masks[i]
+        good_bot = np.isfinite(bot_rows[i]) & valid_mask
+        good_top = np.isfinite(top_rows[i]) & valid_mask
+        good_cen = np.isfinite(center_rows[i]) & valid_mask
 
         n_min = poly_degree + 1
 
@@ -604,7 +681,7 @@ def trace_orders_from_flat(
             bot_poly_coeffs[i] = b_coeffs
         else:
             logger.warning(
-                "Order %d: only %d valid bottom-edge points; "
+                "Order %d: only %d valid bottom-edge points within xrange; "
                 "polynomial fit skipped.", i, good_bot.sum(),
             )
             bot_poly_coeffs[i][:] = np.nan
@@ -618,7 +695,7 @@ def trace_orders_from_flat(
             top_poly_coeffs[i] = t_coeffs
         else:
             logger.warning(
-                "Order %d: only %d valid top-edge points; "
+                "Order %d: only %d valid top-edge points within xrange; "
                 "polynomial fit skipped.", i, good_top.sum(),
             )
             top_poly_coeffs[i][:] = np.nan
@@ -670,6 +747,7 @@ def trace_orders_from_flat(
         seed_col=seed_col,
         bot_poly_coeffs=bot_poly_coeffs,
         top_poly_coeffs=top_poly_coeffs,
+        order_xranges=traced_xranges,
         order_stats=order_stats,
     )
 
@@ -791,15 +869,199 @@ def _find_order_peaks(
     return peaks
 
 
+def _adjust_guess_positions(
+    edge_coeffs: npt.NDArray,
+    xranges: npt.NDArray,
+    flat: npt.NDArray,
+    omask: npt.NDArray,
+    orders: list[int],
+    ycororder: int,
+    ybuffer: int,
+) -> tuple[list[tuple[float, float]], npt.NDArray]:
+    """Adjust stored guess positions via cross-correlation.
+
+    This is a Python port of the IDL ``mc_adjustguesspos`` procedure from
+    Spextool.  It computes the vertical shift between the reference order
+    mask stored in the flatinfo FITS file and the raw flat being calibrated,
+    then subtracts that shift from the reference guess positions and
+    recomputes the per-order valid column ranges.
+
+    **Algorithm (IDL ``mc_adjustguesspos`` transliteration):**
+
+    1. Compute initial guess positions from the stored ``edge_coeffs`` and
+       ``xranges`` (midpoint x of each order; midpoint y between bot/top
+       edges at that x).  [IDL lines: ``guesspos[*,i]``]
+
+    2. Isolate ``ycororder`` in the mask (set all other order pixels to 0).
+
+    3. Clip a sub-image of ``flat`` and the binary mask for ``ycororder``
+       spanning ``[min(botedge) − slith_pix, max(topedge) + slith_pix]``
+       rows.
+
+    4. Sweep ``nshifts = int(slith_pix * 1.8) + 1`` integer vertical shifts
+       centred on zero.  For each shift *s*, compute the overlap integral
+       ``sum(flat_sub * roll(mask_sub, s))``.  The shift that maximises this
+       sum is the vertical offset of the raw flat relative to the reference
+       mask.
+
+    5. Subtract the detected shift from all guess y-positions and recompute
+       per-order valid column ranges (columns where both edges, shifted by
+       the offset, remain within ``[ybuffer, nrows − ybuffer − 1]``).
+
+    Parameters
+    ----------
+    edge_coeffs : ndarray, shape (n_orders, 2, n_terms)
+        Reference edge polynomial coefficients (``FlatInfo.edge_coeffs``).
+    xranges : ndarray, shape (n_orders, 2)
+        Reference per-order column ranges (``FlatInfo.xranges``).
+    flat : ndarray, shape (ncols, nrows) in IDL convention, (nrows, ncols) here
+        Raw flat-field image (not yet Sobel-enhanced).  The array is in
+        Python (row-major, rows=0 axis) convention.
+    omask : ndarray, shape (nrows, ncols)
+        Reference order mask (integer dtype; zero = inter-order).
+    orders : list of int
+        Echelle order numbers, in the same order as ``edge_coeffs``.
+    ycororder : int
+        Echelle order number to use for the cross-correlation.
+    ybuffer : int
+        Detector-edge buffer in rows.
+
+    Returns
+    -------
+    guess_positions : list of (x_guess, y_guess) tuples
+        Adjusted guess positions, one per order.
+    new_xranges : ndarray, shape (n_orders, 2)
+        Adjusted per-order valid column ranges.
+
+    Notes
+    -----
+    IDL uses column-major arrays (IDL ``image[col, row]``), so ``xranges``
+    refers to column indices and ``omask[col,row]``.  The Python arrays are
+    row-major (``flat[row, col]``), which is handled transparently because
+    the cross-correlation is purely row-based and the poly evaluations use
+    column as the independent variable.
+
+    The IDL ``nshifts = slith_pix * 1.8 + 1`` expression (IDL 2019-04-14
+    change to avoid picking up adjacent orders).
+    """
+    nrows, ncols = flat.shape
+    n_orders = len(orders)
+    polyval = np.polynomial.polynomial.polyval
+
+    # ------------------------------------------------------------------ #
+    # 1. Compute base guess positions from stored edge_coeffs + xranges    #
+    #    IDL: for i = 0,norders-1 do guesspos[*,i] = [x, (bot+top)/2]     #
+    # ------------------------------------------------------------------ #
+    guesspos_y = np.zeros(n_orders, dtype=float)
+    guesspos_x = np.zeros(n_orders, dtype=float)
+    for i in range(n_orders):
+        x0, x1 = float(xranges[i, 0]), float(xranges[i, 1])
+        x_guess = (x0 + x1) / 2.0
+        bot_y = float(polyval(x_guess, edge_coeffs[i, 0, :]))
+        top_y = float(polyval(x_guess, edge_coeffs[i, 1, :]))
+        guesspos_x[i] = x_guess
+        guesspos_y[i] = (bot_y + top_y) / 2.0
+
+    # ------------------------------------------------------------------ #
+    # 2. Isolate ycororder in the mask                                      #
+    #    IDL: z = where(omask ne ycororder); omask[z]=0; omask[good]=1      #
+    # ------------------------------------------------------------------ #
+    cor_idx = orders.index(ycororder)
+    binary_mask = (omask == ycororder).astype(np.float32)  # 0/1
+
+    # ------------------------------------------------------------------ #
+    # 3. Clip sub-image for ycororder                                       #
+    #    IDL: find max slit height for ycororder; clip flat/mask            #
+    # ------------------------------------------------------------------ #
+    x0_c, x1_c = int(xranges[cor_idx, 0]), int(xranges[cor_idx, 1])
+    cols_c = np.arange(x0_c, x1_c + 1)
+    bot_edge_c = polyval(cols_c.astype(float), edge_coeffs[cor_idx, 0, :])
+    top_edge_c = polyval(cols_c.astype(float), edge_coeffs[cor_idx, 1, :])
+    slith_pix = int(np.ceil(np.max(top_edge_c - bot_edge_c)))
+
+    botidx = max(0, int(np.round(np.min(bot_edge_c))) - slith_pix)
+    topidx = min(nrows - 1, int(np.round(np.max(top_edge_c))) + slith_pix)
+
+    subflat = flat[botidx: topidx + 1, :].astype(np.float32)    # (sub_rows, ncols)
+    submask = binary_mask[botidx: topidx + 1, :]                  # (sub_rows, ncols)
+    sub_nrows = subflat.shape[0]
+
+    # ------------------------------------------------------------------ #
+    # 4. Cross-correlation sweep                                            #
+    #    IDL: nshifts = slith_pix*1.8+1; shifts = indgen(nshifts)-nshifts/2#
+    # ------------------------------------------------------------------ #
+    nshifts = int(slith_pix * 1.8) + 1
+    half = nshifts // 2
+    shifts = np.arange(nshifts) - half   # centred integer shifts
+
+    overlap = np.zeros(nshifts, dtype=float)
+    for k, s in enumerate(shifts):
+        # IDL shift convention:
+        #   hbot = -s > 0  (max(-s, 0))
+        #   htop = (sub_nrows-1-s) < (sub_nrows-1)
+        #   mbot = s > 0
+        #   mtop = (sub_nrows-1+s) < (sub_nrows-1)
+        hbot = max(-s, 0)
+        htop = min(sub_nrows - 1 - s, sub_nrows - 1)
+        mbot = max(s, 0)
+        mtop = min(sub_nrows - 1 + s, sub_nrows - 1)
+        if htop < hbot or mtop < mbot:
+            continue
+        overlap[k] = float(np.sum(subflat[hbot: htop + 1, :] * submask[mbot: mtop + 1, :]))
+
+    offset = int(shifts[int(np.argmax(overlap))])
+    logger.debug(
+        "_adjust_guess_positions: ycororder=%d, slith_pix=%d, "
+        "nshifts=%d, detected offset=%d rows",
+        ycororder, slith_pix, nshifts, offset,
+    )
+
+    # ------------------------------------------------------------------ #
+    # 5. Subtract offset from guess y-positions                            #
+    #    IDL: guesspos[1,*] = guesspos[1,*] - offset                       #
+    # ------------------------------------------------------------------ #
+    guesspos_y -= offset
+
+    # ------------------------------------------------------------------ #
+    # 6. Recompute per-order xranges with shifted edges                    #
+    #    IDL: for each order: botedge-offset, topedge-offset;              #
+    #         keep cols where both within [ybuffer, nrows-ybuffer-1]       #
+    # ------------------------------------------------------------------ #
+    new_xranges = np.zeros_like(xranges)
+    for i in range(n_orders):
+        x0, x1 = int(xranges[i, 0]), int(xranges[i, 1])
+        cols_i = np.arange(x0, x1 + 1)
+        bot_i = polyval(cols_i.astype(float), edge_coeffs[i, 0, :]) - offset
+        top_i = polyval(cols_i.astype(float), edge_coeffs[i, 1, :]) - offset
+
+        valid = np.where(
+            (bot_i > ybuffer - 1) & (top_i < nrows - ybuffer - 1)
+        )[0]
+
+        if len(valid) == 0:
+            # All columns fall outside detector; keep original range.
+            logger.warning(
+                "_adjust_guess_positions: order index %d: no valid columns "
+                "after offset=%d; keeping original xrange.", i, offset,
+            )
+            new_xranges[i] = xranges[i]
+        else:
+            new_xranges[i, 0] = cols_i[valid[0]]
+            new_xranges[i, 1] = cols_i[valid[-1]]
+
+    guess_positions = [(float(guesspos_x[i]), float(guesspos_y[i])) for i in range(n_orders)]
+    return guess_positions, new_xranges
+
+
 def _compute_guess_positions_from_flatinfo(
     edge_coeffs: npt.NDArray,
     xranges: npt.NDArray,
 ) -> tuple[list[tuple[float, float]], npt.NDArray]:
     """Compute IDL-style guess positions from stored edge polynomials.
 
-    Replicates the ``mc_readflatinfo`` and ``mc_adjustguesspos`` logic:
-    for each order, the guess x is the midpoint of its xrange, and the
-    guess y is the centre between the bottom and top edges at that x.
+    This is the ``DEFAULT=True`` branch of IDL ``mc_adjustguesspos``:
+    compute initial guess positions from stored reference coefficients
+    without any cross-correlation shift adjustment.
 
     Parameters
     ----------
@@ -814,7 +1076,7 @@ def _compute_guess_positions_from_flatinfo(
     guess_positions : list of (x_guess, y_guess) tuples
         One entry per order.
     xranges : ndarray
-        The input xranges array (returned for convenience).
+        The input xranges array (returned unchanged).
     """
     guess_positions = []
     for i in range(len(edge_coeffs)):
@@ -841,6 +1103,7 @@ def _trace_all_orders(
     intensity_fraction: float = 0.85,
     com_half_width: int = 2,
     slit_height_range: tuple[float, float] | None = None,
+    order_col_masks: list[npt.NDArray] | None = None,
 ) -> None:
     """Trace all orders using the IDL ``mc_findorders`` algorithm.
 
@@ -874,11 +1137,20 @@ def _trace_all_orders(
         Polynomial degree for the centre-extrapolation fits.
     ybuffer, intensity_fraction, com_half_width, slit_height_range :
         Passed through to edge-finding helpers.
+    order_col_masks : list of bool ndarray of length n_cols, optional
+        Per-order boolean masks over *sample_cols*.  Only columns where
+        ``mask[k]`` is True are traced for that order; columns outside the
+        mask are left as NaN.  When ``None``, all sample columns are traced
+        for every order (equivalent to all-True masks).
     """
     n_orders = center_rows.shape[0]
     n_cols = len(sample_cols)
     nrows = flat.shape[0]
     row = np.arange(nrows, dtype=float)
+
+    # Default: all columns valid for every order
+    if order_col_masks is None:
+        order_col_masks = [np.ones(n_cols, dtype=bool)] * n_orders
 
     # Compute the Sobel gradient magnitude once for all orders.
     sflat = _compute_sobel_magnitude(flat)
@@ -900,6 +1172,8 @@ def _trace_all_orders(
         bot = np.full(n_cols, np.nan)
         top = np.full(n_cols, np.nan)
 
+        col_mask = order_col_masks[order_i]
+
         # ----------------------------------------------------------------
         # Left sweep: k = seed_idx down to 0 (includes seed position).
         # IDL: for j = 0, gidx do begin; k = gidx - j
@@ -908,6 +1182,8 @@ def _trace_all_orders(
         do_bot = True
 
         for k in range(seed_idx, -1, -1):
+            if not col_mask[k]:
+                continue   # column outside this order's valid xrange – skip
             fcol = flat[:, sample_cols[k]]
             rcol = sflat[:, sample_cols[k]]
 
@@ -935,6 +1211,8 @@ def _trace_all_orders(
         do_bot = True
 
         for k in range(seed_idx + 1, n_cols):
+            if not col_mask[k]:
+                continue   # column outside this order's valid xrange – skip
             fcol = flat[:, sample_cols[k]]
             rcol = sflat[:, sample_cols[k]]
 

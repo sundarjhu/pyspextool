@@ -226,6 +226,18 @@ class FlatInfo:
     edge_degree : int or None
         Polynomial degree of the edge fits (``EDGEDEG`` header keyword).
         ``None`` if the keyword is absent.
+    omask : numpy.ndarray, shape (2048, 2048) or None
+        Reference order mask image (IDL ``omask``).  Each pixel contains
+        the echelle order number of the order it belongs to; inter-order
+        pixels are 0.  Stored in the primary FITS image data of the
+        flatinfo file.  ``None`` if not available.
+    ycororder : int or None
+        Order number used for the vertical cross-correlation in
+        ``mc_adjustguesspos`` (IDL ``YCORORDR`` header keyword).
+        ``None`` if the keyword is absent.
+    ybuffer : int
+        Number of detector-edge rows to exclude from edge tracking (IDL
+        ``YBUFFER`` header keyword).  Defaults to 1 if not in header.
     """
 
     mode: str
@@ -243,6 +255,9 @@ class FlatInfo:
     xranges: Optional[np.ndarray] = None
     edge_coeffs: Optional[np.ndarray] = None
     edge_degree: Optional[int] = None
+    omask: Optional[np.ndarray] = None
+    ycororder: Optional[int] = None
+    ybuffer: int = 1
 
     @property
     def n_orders(self) -> int:
@@ -615,6 +630,10 @@ def read_flatinfo(mode_name: str) -> FlatInfo:
         xranges=_parse_order_xranges(hdr, orders),
         edge_coeffs=_parse_order_edge_coeffs(hdr, orders),
         edge_degree=int(hdr["EDGEDEG"]) if "EDGEDEG" in hdr else None,
+        # IDL mc_readflatinfo: primary FITS image is the reference order mask.
+        omask=image.astype(int),
+        ycororder=int(hdr["YCORORDR"]) if "YCORORDR" in hdr else None,
+        ybuffer=int(hdr.get("YBUFFER", 1)),
     )
 
 

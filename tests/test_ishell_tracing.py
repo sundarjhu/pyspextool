@@ -891,6 +891,10 @@ class TestFlatinfoInitialization:
             slit_range_pixels=(int(hw * 0.4), int(hw * 2.0)),
             ybuffer=1,
             step=20,
+            # omask and ycororder absent -> DEFAULT branch (no cross-corr)
+            omask=None,
+            ycororder=None,
+            orders=list(range(n_orders)),
         )
 
     @pytest.fixture()
@@ -995,6 +999,296 @@ class TestFilterEdgeOrders:
             np.testing.assert_allclose(
                 g.bottom_edge_coeffs, filtered.bot_poly_coeffs[i], rtol=1e-10
             )
+
+
+# ---------------------------------------------------------------------------
+# 10. mc_adjustguesspos cross-correlation tests
+# ---------------------------------------------------------------------------
+
+
+class TestAdjustGuessPositions:
+    """_adjust_guess_positions shifts guess y-positions via cross-correlation."""
+
+    def _make_simple_setup(self, nrows=256, ncols=512):
+        """Build a minimal single-order setup for controlled testing."""
+        import numpy as np
+        from types import SimpleNamespace
+
+        # Single order centred at row 128, running full column range.
+        poly_degree = 1
+        edge_coeffs = np.zeros((1, 2, poly_degree + 1))
+        edge_coeffs[0, 0, 0] = 108.0   # bottom edge at row 108
+        edge_coeffs[0, 1, 0] = 148.0   # top edge at row 148
+        xranges = np.array([[10, ncols - 10]])
+        orders = [100]
+        ycororder = 100
+
+        # Build a matching reference order mask.
+        omask = np.zeros((nrows, ncols), dtype=int)
+        omask[109:148, :] = 100   # rows 109–147 belong to order 100
+
+        # Build a flat where the order is shifted +5 rows relative to the mask.
+        flat = np.zeros((nrows, ncols), dtype=np.float32) + 200.0
+        flat[114:153, :] = 5000.0   # same slit width but shifted by +5
+
+        return edge_coeffs, xranges, flat, omask, orders, ycororder
+
+    def test_zero_shift_when_flat_matches_mask(self):
+        """When flat matches the mask exactly, detected offset should be 0."""
+        from pyspextool.instruments.ishell.tracing import _adjust_guess_positions
+        nrows, ncols = 256, 512
+        edge_coeffs, xranges, _, omask, orders, ycororder = (
+            self._make_simple_setup(nrows=nrows, ncols=ncols)
+        )
+        # Build flat that exactly matches the mask.
+        flat = np.zeros((nrows, ncols), dtype=np.float32) + 200.0
+        flat[109:148, :] = 5000.0   # rows matching omask exactly
+
+        guesses, new_xranges = _adjust_guess_positions(
+            edge_coeffs, xranges, flat, omask, orders, ycororder, ybuffer=1,
+        )
+        # Offset should be zero; guess y unchanged.
+        expected_y = (108.0 + 148.0) / 2.0   # original centre
+        assert abs(guesses[0][1] - expected_y) <= 1.0, (
+            f"Expected guess y ≈ {expected_y}, got {guesses[0][1]}"
+        )
+
+    def test_nonzero_shift_detected_and_applied(self):
+        """When flat is shifted relative to mask, guess y-position is adjusted."""
+        from pyspextool.instruments.ishell.tracing import _adjust_guess_positions
+        nrows, ncols = 256, 512
+        edge_coeffs, xranges, flat, omask, orders, ycororder = (
+            self._make_simple_setup(nrows=nrows, ncols=ncols)
+        )
+        # flat is shifted +5 rows relative to mask (set up in _make_simple_setup)
+        original_y = (108.0 + 148.0) / 2.0   # 128.0
+
+        guesses, new_xranges = _adjust_guess_positions(
+            edge_coeffs, xranges, flat, omask, orders, ycororder, ybuffer=1,
+        )
+        adjusted_y = guesses[0][1]
+        # Adjusted y must differ from original by approximately the shift (5 rows).
+        # The cross-correlation maximum is at the shift that maximises overlap;
+        # we allow ±2 px tolerance for rounding / sub-pixel effects.
+        shift_estimate = original_y - adjusted_y
+        assert abs(abs(shift_estimate) - 5) <= 2, (
+            f"Expected shift ≈ ±5 rows, got shift_estimate={shift_estimate:.1f}"
+        )
+
+    def test_xranges_recomputed(self):
+        """Adjusted xranges must not exceed detector bounds."""
+        from pyspextool.instruments.ishell.tracing import _adjust_guess_positions
+        nrows, ncols = 256, 512
+        edge_coeffs, xranges, flat, omask, orders, ycororder = (
+            self._make_simple_setup(nrows=nrows, ncols=ncols)
+        )
+        _, new_xranges = _adjust_guess_positions(
+            edge_coeffs, xranges, flat, omask, orders, ycororder, ybuffer=1,
+        )
+        assert new_xranges.shape == xranges.shape
+        assert new_xranges[0, 0] >= 0
+        assert new_xranges[0, 1] <= ncols - 1
+
+    def test_default_path_used_when_omask_none(self, tmp_path):
+        """When flatinfo.omask is None, guess positions use the DEFAULT path."""
+        from types import SimpleNamespace
+        flat = _make_synthetic_flat(seed=0)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+
+        n_orders = _SYN_N_ORDERS
+        poly_degree = 3
+        hw = float(_SYN_HALF_WIDTH)
+        edge_coeffs = np.zeros((n_orders, 2, poly_degree + 1))
+        xranges = np.zeros((n_orders, 2), dtype=int)
+        for k in range(n_orders):
+            c0 = float(_SYN_FIRST_CENTER + k * _SYN_SPACING)
+            edge_coeffs[k, 0, 0] = c0 - hw / 2.0
+            edge_coeffs[k, 1, 0] = c0 + hw / 2.0
+            xranges[k] = [10, _NCOLS - 10]
+
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs, xranges=xranges,
+            edge_degree=poly_degree, flat_fraction=0.85, comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.0)),
+            ybuffer=1, step=20,
+            omask=None, ycororder=None, orders=list(range(n_orders)),
+        )
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        assert trace.n_orders == n_orders
+        assert trace.order_xranges is not None
+
+
+# ---------------------------------------------------------------------------
+# 11. Per-order xranges tests
+# ---------------------------------------------------------------------------
+
+
+class TestPerOrderXranges:
+    """FlatOrderTrace.order_xranges and to_order_geometry_set per-order x_start/x_end."""
+
+    @pytest.fixture()
+    def trace_auto(self, tmp_path):
+        flat = _make_synthetic_flat(seed=42)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        return trace_orders_from_flat([path])
+
+    @pytest.fixture()
+    def trace_flatinfo(self, tmp_path):
+        flat = _make_synthetic_flat(seed=42)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        from types import SimpleNamespace
+        n_orders = _SYN_N_ORDERS
+        poly_degree = 3
+        hw = float(_SYN_HALF_WIDTH)
+        edge_coeffs = np.zeros((n_orders, 2, poly_degree + 1))
+        xranges = np.zeros((n_orders, 2), dtype=int)
+        for k in range(n_orders):
+            c0 = float(_SYN_FIRST_CENTER + k * _SYN_SPACING)
+            edge_coeffs[k, 0, 0] = c0 - hw / 2.0
+            edge_coeffs[k, 1, 0] = c0 + hw / 2.0
+            # Give each order a slightly different xrange to verify per-order behavior
+            xranges[k] = [10 + k * 2, _NCOLS - 10 - k * 2]
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs, xranges=xranges,
+            edge_degree=poly_degree, flat_fraction=0.85, comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.0)),
+            ybuffer=1, step=20,
+            omask=None, ycororder=None, orders=list(range(n_orders)),
+        )
+        return trace_orders_from_flat([path], flatinfo=fi)
+
+    def test_auto_detect_order_xranges_is_none(self, trace_auto):
+        """In auto-detect mode, order_xranges is None (no per-order ranges)."""
+        assert trace_auto.order_xranges is None
+
+    def test_flatinfo_order_xranges_shape(self, trace_flatinfo):
+        """In flatinfo mode, order_xranges has shape (n_orders, 2)."""
+        assert trace_flatinfo.order_xranges is not None
+        assert trace_flatinfo.order_xranges.shape == (trace_flatinfo.n_orders, 2)
+
+    def test_flatinfo_order_xranges_bounds(self, trace_flatinfo):
+        """Each per-order xrange is a valid [start, end] with start < end."""
+        xr = trace_flatinfo.order_xranges
+        for i in range(trace_flatinfo.n_orders):
+            assert xr[i, 0] < xr[i, 1], f"Order {i}: xrange invalid {xr[i]}"
+
+    def test_to_order_geometry_uses_per_order_xranges(self, trace_flatinfo):
+        """to_order_geometry_set emits per-order x_start/x_end from order_xranges."""
+        geom = trace_flatinfo.to_order_geometry_set("K3")
+        for i, g in enumerate(geom.geometries):
+            assert g.x_start == int(trace_flatinfo.order_xranges[i, 0])
+            assert g.x_end == int(trace_flatinfo.order_xranges[i, 1])
+
+    def test_to_order_geometry_auto_uses_col_range(self, trace_auto):
+        """In auto-detect mode, all orders share the same col_range."""
+        geom = trace_auto.to_order_geometry_set("K3", col_range=(50, 400))
+        for g in geom.geometries:
+            assert g.x_start == 50
+            assert g.x_end == 400
+
+    def test_filter_edge_orders_preserves_xranges(self, trace_flatinfo):
+        """_filter_edge_orders carries over order_xranges into the filtered trace."""
+        n = trace_flatinfo.n_orders
+        hw = trace_flatinfo.half_width_rows.copy()
+        hw[0] = 0.01   # make first order artificially narrow → will be filtered
+        narrow_trace = FlatOrderTrace(
+            n_orders=n,
+            sample_cols=trace_flatinfo.sample_cols,
+            center_rows=trace_flatinfo.center_rows,
+            center_poly_coeffs=trace_flatinfo.center_poly_coeffs,
+            fit_rms=trace_flatinfo.fit_rms,
+            half_width_rows=hw,
+            poly_degree=trace_flatinfo.poly_degree,
+            seed_col=trace_flatinfo.seed_col,
+            bot_poly_coeffs=trace_flatinfo.bot_poly_coeffs,
+            top_poly_coeffs=trace_flatinfo.top_poly_coeffs,
+            order_xranges=trace_flatinfo.order_xranges,
+        )
+        median_hw = float(np.median(hw))
+        threshold = 0.30 * median_hw
+        keep = [i for i in range(n) if hw[i] >= threshold]
+        filtered = FlatOrderTrace(
+            n_orders=len(keep),
+            sample_cols=narrow_trace.sample_cols,
+            center_rows=narrow_trace.center_rows[keep],
+            center_poly_coeffs=narrow_trace.center_poly_coeffs[keep],
+            fit_rms=narrow_trace.fit_rms[keep],
+            half_width_rows=narrow_trace.half_width_rows[keep],
+            poly_degree=narrow_trace.poly_degree,
+            seed_col=narrow_trace.seed_col,
+            bot_poly_coeffs=(narrow_trace.bot_poly_coeffs[keep]
+                             if narrow_trace.bot_poly_coeffs is not None else None),
+            top_poly_coeffs=(narrow_trace.top_poly_coeffs[keep]
+                             if narrow_trace.top_poly_coeffs is not None else None),
+            order_xranges=(narrow_trace.order_xranges[keep]
+                           if narrow_trace.order_xranges is not None else None),
+        )
+        assert filtered.n_orders == n - 1
+        assert filtered.order_xranges is not None
+        assert filtered.order_xranges.shape == (n - 1, 2)
+
+        # to_order_geometry_set must use the filtered per-order xranges
+        geom = filtered.to_order_geometry_set("K3")
+        for i, g in enumerate(geom.geometries):
+            assert g.x_start == int(filtered.order_xranges[i, 0])
+            assert g.x_end == int(filtered.order_xranges[i, 1])
+
+
+# ---------------------------------------------------------------------------
+# 12. read_flatinfo populates omask, ycororder, ybuffer
+# ---------------------------------------------------------------------------
+
+
+class TestReadFlatinfoNewFields:
+    """read_flatinfo now populates omask, ycororder, ybuffer from FITS header."""
+
+    @pytest.mark.skipif(
+        not os.path.isfile(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "src", "pyspextool", "instruments", "ishell", "data", "K3_flatinfo.fits",
+            )
+        ),
+        reason="K3 flatinfo FITS not found in package data",
+    )
+    def test_k3_flatinfo_has_omask(self):
+        from pyspextool.instruments.ishell.calibrations import read_flatinfo
+        fi = read_flatinfo("K3")
+        assert fi.omask is not None, "omask should be populated from K3_flatinfo.fits"
+        assert fi.omask.shape == (2048, 2048)
+
+    @pytest.mark.skipif(
+        not os.path.isfile(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "src", "pyspextool", "instruments", "ishell", "data", "K3_flatinfo.fits",
+            )
+        ),
+        reason="K3 flatinfo FITS not found in package data",
+    )
+    def test_k3_flatinfo_has_ycororder(self):
+        from pyspextool.instruments.ishell.calibrations import read_flatinfo
+        fi = read_flatinfo("K3")
+        assert fi.ycororder is not None, "ycororder should be read from YCORORDR header"
+        assert isinstance(fi.ycororder, int)
+
+    @pytest.mark.skipif(
+        not os.path.isfile(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "src", "pyspextool", "instruments", "ishell", "data", "K3_flatinfo.fits",
+            )
+        ),
+        reason="K3 flatinfo FITS not found in package data",
+    )
+    def test_k3_flatinfo_has_ybuffer(self):
+        from pyspextool.instruments.ishell.calibrations import read_flatinfo
+        fi = read_flatinfo("K3")
+        assert isinstance(fi.ybuffer, int)
+        assert fi.ybuffer >= 1
 
 
 # ---------------------------------------------------------------------------

@@ -713,6 +713,10 @@ def _filter_edge_orders(
             trace.top_poly_coeffs[keep_arr]
             if trace.top_poly_coeffs is not None else None
         ),
+        order_xranges=(
+            trace.order_xranges[keep_arr]
+            if trace.order_xranges is not None else None
+        ),
     )
 
 
