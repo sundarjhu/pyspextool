@@ -234,11 +234,21 @@ class TestReadFlatInfo:
         assert result.mode == mode
 
     @pytest.mark.parametrize("mode", SUPPORTED_MODES)
-    def test_image_shape(self, mode):
-        """Flat image must have the iSHELL detector shape (2048×2048)."""
+    def test_image_is_none(self, mode):
+        """read_flatinfo sets image=None: the flatinfo file has no flat-field image."""
         result = read_flatinfo(mode)
-        assert result.image.shape == _DETECTOR_SHAPE, (
-            f"Mode '{mode}': expected {_DETECTOR_SHAPE}, got {result.image.shape}"
+        assert result.image is None, (
+            f"Mode '{mode}': read_flatinfo should set image=None; "
+            f"the *_flatinfo.fits primary HDU is the order mask, not a flat image."
+        )
+
+    @pytest.mark.parametrize("mode", SUPPORTED_MODES)
+    def test_omask_shape(self, mode):
+        """omask must have the iSHELL detector shape (2048×2048)."""
+        result = read_flatinfo(mode)
+        assert result.omask is not None, f"Mode '{mode}': omask should be populated"
+        assert result.omask.shape == _DETECTOR_SHAPE, (
+            f"Mode '{mode}': expected {_DETECTOR_SHAPE}, got {result.omask.shape}"
         )
 
     @pytest.mark.parametrize("mode", SUPPORTED_MODES)

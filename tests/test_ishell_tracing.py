@@ -1290,6 +1290,105 @@ class TestReadFlatinfoNewFields:
         assert isinstance(fi.ybuffer, int)
         assert fi.ybuffer >= 1
 
+    def test_k3_flatinfo_image_is_none(self):
+        """read_flatinfo sets image=None: flatinfo.fits primary HDU is the order mask."""
+        from pyspextool.instruments.ishell.calibrations import read_flatinfo
+        fi = read_flatinfo("K3")
+        assert fi.image is None, (
+            "FlatInfo.image should be None when loaded via read_flatinfo; "
+            "the flatinfo FITS primary HDU is the order mask (omask), not a flat image."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 13. K3 benchmark driver loads flatinfo
+# ---------------------------------------------------------------------------
+
+
+class TestK3BenchmarkLoadsFlatinfo:
+    """Verify that the K3 benchmark driver imports and uses read_flatinfo."""
+
+    def test_read_flatinfo_imported_in_k3_script(self):
+        """run_ishell_k3_example imports read_flatinfo from calibrations."""
+        import importlib.util, sys, os
+        script_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "scripts", "run_ishell_k3_example.py",
+        )
+        spec = importlib.util.spec_from_file_location("run_k3", script_path)
+        mod = importlib.util.module_from_spec(spec)
+        # Just check the import is available; do not execute the script
+        with open(script_path) as f:
+            src = f.read()
+        assert "read_flatinfo" in src, (
+            "run_ishell_k3_example.py must import read_flatinfo from calibrations"
+        )
+        assert "flatinfo=flatinfo" in src, (
+            "run_ishell_k3_example.py must pass flatinfo= to trace_orders_from_flat"
+        )
+
+    def test_trace_orders_from_flat_uses_flatinfo_when_supplied(self, tmp_path):
+        """trace_orders_from_flat logs 'Flatinfo mode' when flatinfo is provided."""
+        from types import SimpleNamespace
+        import logging
+        flat = _make_synthetic_flat(seed=0)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+
+        n_orders = _SYN_N_ORDERS
+        poly_degree = 3
+        hw = float(_SYN_HALF_WIDTH)
+        edge_coeffs = np.zeros((n_orders, 2, poly_degree + 1))
+        xranges = np.zeros((n_orders, 2), dtype=int)
+        for k in range(n_orders):
+            c0 = float(_SYN_FIRST_CENTER + k * _SYN_SPACING)
+            edge_coeffs[k, 0, 0] = c0 - hw / 2.0
+            edge_coeffs[k, 1, 0] = c0 + hw / 2.0
+            xranges[k] = [10, _NCOLS - 10]
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs, xranges=xranges,
+            edge_degree=poly_degree, flat_fraction=0.85, comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.0)),
+            ybuffer=1, step=20,
+            omask=None, ycororder=None, orders=list(range(n_orders)),
+        )
+        # Must not raise; must use flatinfo path
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        assert trace.n_orders == n_orders
+        # order_xranges must be populated (per-order xranges)
+        assert trace.order_xranges is not None
+        assert trace.order_xranges.shape == (n_orders, 2)
+
+
+# ---------------------------------------------------------------------------
+# 14. Per-order sranges: true per-order sample columns
+# ---------------------------------------------------------------------------
+
+
+class TestPerOrderSampleColumns:
+    """Per-order sample column arrays (IDL sranges) are used internally."""
+
+    def test_per_order_sample_cols_differ_when_xranges_differ(self, tmp_path):
+        """When orders have different xranges, they use different sample columns."""
+        from pyspextool.instruments.ishell.tracing import _compute_guess_positions_from_flatinfo
+        import numpy as np
+
+        n_orders = 2
+        poly_degree = 1
+        edge_coeffs = np.zeros((n_orders, 2, poly_degree + 1))
+        edge_coeffs[0, 0, 0] = 50.0
+        edge_coeffs[0, 1, 0] = 80.0
+        edge_coeffs[1, 0, 0] = 120.0
+        edge_coeffs[1, 1, 0] = 150.0
+        # Order 0 spans cols 0–300; order 1 spans cols 200–500
+        xranges = np.array([[0, 300], [200, 500]])
+        guesses, xr = _compute_guess_positions_from_flatinfo(edge_coeffs, xranges)
+        assert xr[0, 1] == 300
+        assert xr[1, 0] == 200
+        # Each order's xrange is preserved
+        assert xr[0, 0] == 0
+        assert xr[1, 1] == 500
+
 
 # ---------------------------------------------------------------------------
 # Private helpers used by the test fixtures

@@ -581,25 +581,16 @@ def trace_orders_from_flat(
             s_cols_i = np.unique(np.clip(s_cols_i, x0_i, x1_i))
             order_sample_cols_list.append(s_cols_i)
 
-        # For the shared arrays we need a common set of sample columns that
-        # covers the union of all per-order sets.  Per-order tracing then
-        # only uses the subset relevant to each order.
-        all_cols_set = np.unique(np.concatenate(order_sample_cols_list))
-        sample_cols = all_cols_set
+        # Shared output column array = union of all per-order sample columns.
+        # Each order is traced on its own s_cols_i array (IDL sranges approach);
+        # results are mapped back to this shared index space for the public API.
+        sample_cols = np.unique(np.concatenate(order_sample_cols_list))
 
-        # Per-order seed indices into sample_cols
+        # Per-order seed indices into sample_cols (used only for seed_col reporting)
         order_seed_indices = [
             int(np.argmin(np.abs(sample_cols - gp[0])))
             for gp in guess_positions
         ]
-
-        # Per-order valid sample-column masks (only trace within order xrange)
-        order_col_masks: list[npt.NDArray] = []
-        for i in range(n_orders):
-            x0_i = int(guess_xranges[i, 0])
-            x1_i = int(guess_xranges[i, 1])
-            mask_i = (sample_cols >= x0_i) & (sample_cols <= x1_i)
-            order_col_masks.append(mask_i)
 
         # Store the adjusted per-order xranges for downstream output
         traced_xranges = guess_xranges.copy()
@@ -623,12 +614,12 @@ def trace_orders_from_flat(
 
         n_orders = len(seed_peaks)
         guess_positions = None
+        order_sample_cols_list = None  # all orders use sample_cols directly
 
         sample_cols = np.round(np.linspace(col_lo, col_hi, n_sample_cols)).astype(int)
         sample_cols = np.unique(sample_cols)
         seed_idx = int(np.argmin(np.abs(sample_cols - seed_col)))
         order_seed_indices = [seed_idx] * n_orders
-        order_col_masks = [np.ones(len(sample_cols), dtype=bool)] * n_orders
         traced_xranges = None
 
         logger.info(
@@ -639,6 +630,8 @@ def trace_orders_from_flat(
     # ------------------------------------------------------------------
     # 5. Trace each order independently (IDL mc_findorders algorithm)
     #    Primary tracked quantities: bottom edge and top edge at each column.
+    #    In flatinfo mode: each order uses its own per-order sample columns
+    #    (IDL sranges); results are mapped back to the shared column space.
     # ------------------------------------------------------------------
     center_rows = np.full((n_orders, len(sample_cols)), np.nan)
     bot_rows = np.full((n_orders, len(sample_cols)), np.nan)
@@ -651,7 +644,7 @@ def trace_orders_from_flat(
         intensity_fraction=intensity_fraction,
         com_half_width=com_half_width,
         slit_height_range=slit_height_range,
-        order_col_masks=order_col_masks,
+        order_sample_cols_list=order_sample_cols_list,
     )
 
     # ------------------------------------------------------------------
@@ -664,11 +657,12 @@ def trace_orders_from_flat(
     fit_rms = np.full(n_orders, np.nan)
 
     for i in range(n_orders):
-        # Use only valid-column samples for fitting (per-order xrange).
-        valid_mask = order_col_masks[i]
-        good_bot = np.isfinite(bot_rows[i]) & valid_mask
-        good_top = np.isfinite(top_rows[i]) & valid_mask
-        good_cen = np.isfinite(center_rows[i]) & valid_mask
+        # Use only columns that were actually traced for this order (non-NaN).
+        # Since per-order tracing now operates on true per-order column arrays,
+        # columns outside the order's range are NaN in the output arrays.
+        good_bot = np.isfinite(bot_rows[i])
+        good_top = np.isfinite(top_rows[i])
+        good_cen = np.isfinite(center_rows[i])
 
         n_min = poly_degree + 1
 
@@ -681,7 +675,7 @@ def trace_orders_from_flat(
             bot_poly_coeffs[i] = b_coeffs
         else:
             logger.warning(
-                "Order %d: only %d valid bottom-edge points within xrange; "
+                "Order %d: only %d valid bottom-edge points; "
                 "polynomial fit skipped.", i, good_bot.sum(),
             )
             bot_poly_coeffs[i][:] = np.nan
@@ -695,7 +689,7 @@ def trace_orders_from_flat(
             top_poly_coeffs[i] = t_coeffs
         else:
             logger.warning(
-                "Order %d: only %d valid top-edge points within xrange; "
+                "Order %d: only %d valid top-edge points; "
                 "polynomial fit skipped.", i, good_top.sum(),
             )
             top_poly_coeffs[i][:] = np.nan
@@ -1089,6 +1083,111 @@ def _compute_guess_positions_from_flatinfo(
     return guess_positions, xranges
 
 
+def _trace_single_order(
+    flat: npt.NDArray,
+    sflat: npt.NDArray,
+    s_cols: npt.NDArray,
+    seed_idx: int,
+    y_seed: float,
+    poly_degree: int,
+    *,
+    ybuffer: int = 1,
+    intensity_fraction: float = 0.85,
+    com_half_width: int = 2,
+    slit_height_range: tuple[float, float] | None = None,
+) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
+    """Trace one order on its own per-order sample column array.
+
+    This is the IDL ``mc_findorders`` inner loop for a single order, operating
+    on the per-order column range (``sranges[*,i]`` in IDL), not a shared
+    union of all-order columns.
+
+    Parameters
+    ----------
+    flat : ndarray, shape (nrows, ncols)
+        Flat-field image.
+    sflat : ndarray, shape (nrows, ncols)
+        Sobel gradient magnitude image (pre-computed).
+    s_cols : ndarray of int, shape (n_samp,)
+        Per-order sample column indices (IDL ``sranges`` for this order).
+    seed_idx : int
+        Index into *s_cols* of the seed/guess column.
+    y_seed : float
+        Seed row (order centre estimate at the seed column).
+    poly_degree : int
+        Polynomial degree for centre-extrapolation fits.
+    ybuffer, intensity_fraction, com_half_width, slit_height_range :
+        Passed through to edge-finding helpers.
+
+    Returns
+    -------
+    cen : ndarray of float, shape (n_samp,)
+    bot : ndarray of float, shape (n_samp,)
+    top : ndarray of float, shape (n_samp,)
+        Traced centre, bottom-edge, and top-edge positions at each column in
+        *s_cols*.  NaN for columns where tracing was not reliable.
+    """
+    n_samp = len(s_cols)
+    nrows = flat.shape[0]
+    row = np.arange(nrows, dtype=float)
+    pred_deg = max(1, poly_degree - 2)
+
+    cen = np.full(n_samp, np.nan)
+    bot = np.full(n_samp, np.nan)
+    top = np.full(n_samp, np.nan)
+
+    # Initialise centre window around the seed index.
+    lo = max(0, seed_idx - poly_degree)
+    hi = min(n_samp - 1, seed_idx + poly_degree)
+    cen[lo: hi + 1] = y_seed
+
+    # Left sweep (seed_idx → 0, inclusive)
+    do_top = True
+    do_bot = True
+    for k in range(seed_idx, -1, -1):
+        fcol = flat[:, s_cols[k]]
+        rcol = sflat[:, s_cols[k]]
+        y_guess_f, com_top, com_bot = _predict_and_find_edges(
+            cen, s_cols, k, pred_deg, fcol, rcol, row,
+            nrows, ybuffer, intensity_fraction, com_half_width,
+            do_top, do_bot,
+        )
+        cont = _update_centre_and_flags(
+            cen, bot, top, k, y_guess_f, com_top, com_bot,
+            nrows, ybuffer, slit_height_range,
+            do_top, do_bot,
+        )
+        if cont == "break":
+            break
+        if cont == "continue":
+            continue
+        do_top, do_bot = cont
+
+    # Right sweep (seed_idx+1 → n_samp-1)
+    do_top = True
+    do_bot = True
+    for k in range(seed_idx + 1, n_samp):
+        fcol = flat[:, s_cols[k]]
+        rcol = sflat[:, s_cols[k]]
+        y_guess_f, com_top, com_bot = _predict_and_find_edges(
+            cen, s_cols, k, pred_deg, fcol, rcol, row,
+            nrows, ybuffer, intensity_fraction, com_half_width,
+            do_top, do_bot,
+        )
+        cont = _update_centre_and_flags(
+            cen, bot, top, k, y_guess_f, com_top, com_bot,
+            nrows, ybuffer, slit_height_range,
+            do_top, do_bot,
+        )
+        if cont == "break":
+            break
+        if cont == "continue":
+            continue
+        do_top, do_bot = cont
+
+    return cen, bot, top
+
+
 def _trace_all_orders(
     flat: npt.NDArray,
     sample_cols: npt.NDArray,
@@ -1103,32 +1202,31 @@ def _trace_all_orders(
     intensity_fraction: float = 0.85,
     com_half_width: int = 2,
     slit_height_range: tuple[float, float] | None = None,
-    order_col_masks: list[npt.NDArray] | None = None,
+    order_sample_cols_list: list[npt.NDArray] | None = None,
 ) -> None:
     """Trace all orders using the IDL ``mc_findorders`` algorithm.
 
-    For each order independently, sweeps left then right from the per-order
-    seed column index.  At every sample column the order centre is predicted
-    by a polynomial fit to the centres already found, and the **bottom and
-    top edges** are located by flux-threshold search followed by Sobel-image
-    centre-of-mass refinement.
+    When *order_sample_cols_list* is provided, each order is traced on its own
+    per-order sample column array (the IDL ``sranges`` approach).  Results are
+    mapped back into the shared *center_rows* / *bot_rows* / *top_rows* output
+    arrays (indexed against *sample_cols*; NaN for columns not in an order's
+    range).
 
-    The primary output quantities are the edge arrays ``bot_rows`` and
-    ``top_rows``.  The centre array ``center_rows`` is derived from them and
-    also used internally for column-to-column prediction.
+    When *order_sample_cols_list* is ``None``, all orders share *sample_cols*
+    directly (fallback / auto-detect mode).
 
     Parameters
     ----------
     flat : ndarray, shape (nrows, ncols)
         Flat-field image.
     sample_cols : ndarray of int
-        Column indices at which to evaluate the order edges.
+        Shared column index array for the output arrays.
     order_seed_indices : list of int
         Per-order index into *sample_cols* of the seed/guess column.
     seed_peaks : ndarray of float, shape (n_orders,)
         Initial order-centre row estimates at the seed column.
     center_rows : ndarray of float, shape (n_orders, n_sample)
-        Centre array; filled in place (used for prediction; derived from edges).
+        Centre array; filled in place.
     bot_rows : ndarray of float, shape (n_orders, n_sample)
         Bottom-edge array; filled in place.
     top_rows : ndarray of float, shape (n_orders, n_sample)
@@ -1136,106 +1234,52 @@ def _trace_all_orders(
     poly_degree : int
         Polynomial degree for the centre-extrapolation fits.
     ybuffer, intensity_fraction, com_half_width, slit_height_range :
-        Passed through to edge-finding helpers.
-    order_col_masks : list of bool ndarray of length n_cols, optional
-        Per-order boolean masks over *sample_cols*.  Only columns where
-        ``mask[k]`` is True are traced for that order; columns outside the
-        mask are left as NaN.  When ``None``, all sample columns are traced
-        for every order (equivalent to all-True masks).
+        Passed through to the single-order tracing helper.
+    order_sample_cols_list : list of int ndarrays, optional
+        Per-order sample column arrays (IDL ``sranges``).  When provided,
+        each order is traced on its own column set; results are mapped back
+        to the shared *sample_cols* index space.  ``None`` → all orders use
+        *sample_cols* directly (auto-detect fallback).
     """
     n_orders = center_rows.shape[0]
-    n_cols = len(sample_cols)
     nrows = flat.shape[0]
-    row = np.arange(nrows, dtype=float)
-
-    # Default: all columns valid for every order
-    if order_col_masks is None:
-        order_col_masks = [np.ones(n_cols, dtype=bool)] * n_orders
 
     # Compute the Sobel gradient magnitude once for all orders.
     sflat = _compute_sobel_magnitude(flat)
 
-    # Degree used for the centre-prediction polynomial (IDL: 1 > (degree-2)).
-    pred_deg = max(1, poly_degree - 2)
-
     for order_i in range(n_orders):
-        seed_idx = order_seed_indices[order_i]
+        # Per-order column array: IDL sranges[*,i] approach
+        if order_sample_cols_list is not None:
+            s_cols_i = order_sample_cols_list[order_i]
+            # Seed index within this order's own column array
+            guess_col = sample_cols[order_seed_indices[order_i]]
+            seed_idx_i = int(np.argmin(np.abs(s_cols_i - guess_col)))
+        else:
+            s_cols_i = sample_cols
+            seed_idx_i = order_seed_indices[order_i]
 
-        # Initialise the centre array.
-        # IDL: cen[(gidx-degree):(gidx+degree)] = guesspos[1,i]
-        cen = np.full(n_cols, np.nan)
-        lo = max(0, seed_idx - poly_degree)
-        hi = min(n_cols - 1, seed_idx + poly_degree)
-        cen[lo: hi + 1] = float(seed_peaks[order_i])
+        cen_i, bot_i, top_i = _trace_single_order(
+            flat, sflat, s_cols_i, seed_idx_i, float(seed_peaks[order_i]),
+            poly_degree,
+            ybuffer=ybuffer,
+            intensity_fraction=intensity_fraction,
+            com_half_width=com_half_width,
+            slit_height_range=slit_height_range,
+        )
 
-        # Edge arrays for this order.
-        bot = np.full(n_cols, np.nan)
-        top = np.full(n_cols, np.nan)
-
-        col_mask = order_col_masks[order_i]
-
-        # ----------------------------------------------------------------
-        # Left sweep: k = seed_idx down to 0 (includes seed position).
-        # IDL: for j = 0, gidx do begin; k = gidx - j
-        # ----------------------------------------------------------------
-        do_top = True
-        do_bot = True
-
-        for k in range(seed_idx, -1, -1):
-            if not col_mask[k]:
-                continue   # column outside this order's valid xrange – skip
-            fcol = flat[:, sample_cols[k]]
-            rcol = sflat[:, sample_cols[k]]
-
-            y_guess_f, com_top, com_bot = _predict_and_find_edges(
-                cen, sample_cols, k, pred_deg, fcol, rcol, row,
-                nrows, ybuffer, intensity_fraction, com_half_width,
-                do_top, do_bot,
-            )
-
-            cont = _update_centre_and_flags(
-                cen, bot, top, k, y_guess_f, com_top, com_bot,
-                nrows, ybuffer, slit_height_range,
-                do_top, do_bot,
-            )
-            if cont == "break":
-                break
-            if cont == "continue":
-                continue
-            do_top, do_bot = cont
-
-        # ----------------------------------------------------------------
-        # Right sweep: k = seed_idx + 1 to n_cols - 1.
-        # ----------------------------------------------------------------
-        do_top = True
-        do_bot = True
-
-        for k in range(seed_idx + 1, n_cols):
-            if not col_mask[k]:
-                continue   # column outside this order's valid xrange – skip
-            fcol = flat[:, sample_cols[k]]
-            rcol = sflat[:, sample_cols[k]]
-
-            y_guess_f, com_top, com_bot = _predict_and_find_edges(
-                cen, sample_cols, k, pred_deg, fcol, rcol, row,
-                nrows, ybuffer, intensity_fraction, com_half_width,
-                do_top, do_bot,
-            )
-
-            cont = _update_centre_and_flags(
-                cen, bot, top, k, y_guess_f, com_top, com_bot,
-                nrows, ybuffer, slit_height_range,
-                do_top, do_bot,
-            )
-            if cont == "break":
-                break
-            if cont == "continue":
-                continue
-            do_top, do_bot = cont
-
-        center_rows[order_i] = cen
-        bot_rows[order_i] = bot
-        top_rows[order_i] = top
+        if order_sample_cols_list is not None:
+            # Map per-order results back to the shared sample_cols index space.
+            # For each column in s_cols_i, find its index in sample_cols and store.
+            for j, col in enumerate(s_cols_i):
+                k = int(np.searchsorted(sample_cols, col))
+                if k < len(sample_cols) and sample_cols[k] == col:
+                    center_rows[order_i, k] = cen_i[j]
+                    bot_rows[order_i, k] = bot_i[j]
+                    top_rows[order_i, k] = top_i[j]
+        else:
+            center_rows[order_i] = cen_i
+            bot_rows[order_i] = bot_i
+            top_rows[order_i] = top_i
 
 
 def _compute_sobel_magnitude(flat: npt.NDArray) -> npt.NDArray:
