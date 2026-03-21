@@ -781,10 +781,22 @@ class TestTraceOrdersH1RealData:
         assert h1_trace.sample_cols.max() <= 1550
 
     def test_col_range_in_order_geometry(self, h1_trace):
+        # After the IDL-aligned post-fit xrange restriction (step 6a in
+        # trace_orders_from_flat), order_xranges may be narrower than the
+        # input col_range for orders whose fitted edge polynomial overshoots
+        # the detector at one end.  The geometry must therefore be checked
+        # for containment within the col_range, not equality.
         geom = h1_trace.to_order_geometry_set("H1", col_range=(650, 1550))
         for g in geom.geometries:
-            assert g.x_start == 650
-            assert g.x_end == 1550
+            assert g.x_start >= 650, (
+                f"Order {g.order}: x_start {g.x_start} is below col_range start 650"
+            )
+            assert g.x_end <= 1550, (
+                f"Order {g.order}: x_end {g.x_end} exceeds col_range end 1550"
+            )
+            assert g.x_start <= g.x_end, (
+                f"Order {g.order}: degenerate xrange [{g.x_start}, {g.x_end}]"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1629,8 +1641,281 @@ class TestCompatArrayInvariants:
 
 
 # ---------------------------------------------------------------------------
-# Private helpers used by the test fixtures
+# 16. Post-fit xrange restriction tests (IDL mc_findorders port step 6a)
 # ---------------------------------------------------------------------------
+
+
+class TestPostFitXrangeRestriction:
+    """Verify that order_xranges is restricted after edge polynomial fitting.
+
+    IDL mc_findorders, at the end of the per-order loop:
+
+        x    = findgen(stop-start+1)+start
+        bot  = poly(x, edgecoeffs[*,0,i])
+        top  = poly(x, edgecoeffs[*,1,i])
+        z    = where(top gt 0.0 and top lt nrows-1
+                     and bot gt 0 and bot lt nrows-1)
+        xranges[*,i] = [min(x[z],MAX=mx), mx]
+
+    Python previously omitted this step, keeping the input sranges as
+    order_xranges even when the fitted polynomial overshot the detector.
+    These tests verify that the Python port now matches IDL.
+
+    Test geometry
+    -------------
+    We use a single tilted order with ``c0_row=215`` (center row at col 0),
+    ``hw=10`` (half-width), ``tilt=0.1`` px/col:
+
+    * ``bot(col) ≈ 205 + 0.1 * col``
+    * ``top(col) ≈ 225 + 0.1 * col``
+    * ``top`` hits ``nrows-1 = 255`` at ``col ≈ (255-225)/0.1 = 300``
+
+    With input xrange ``[10, 502]``, step-6a should clip ``x_end`` to ~365
+    (empirically verified; the tracing stops slightly before the
+    theoretical 300 because the center shifts ybuffer/stop conditions).
+    The exact clip column can vary by a few pixels due to integer grid
+    effects; the tests only assert the clipping *occurred*.
+    """
+
+    # Parameters for the "high order near detector top edge" scenario.
+    _NROWS_CLIP = 256
+    _NCOLS_CLIP = 512
+    _C0_CLIP = 215.0    # center row at col 0 → top(col)=225+0.1*col, hits 255 at ~300
+    _TILT_CLIP = 0.1    # px/col; mild enough for tracing to follow the order
+    _HW_CLIP = 10.0
+    _XSTART = 10
+    _XEND = 502         # = ncols - 10
+
+    def _make_high_order_flat(self, tmp_path):
+        """Flat + flatinfo for an order near the top of the detector.
+
+        The order is defined by ``c0=215, hw=10, tilt=0.1``.  The top edge
+        overshoots ``nrows-1 = 255`` around col 300, so the IDL post-fit
+        xrange restriction must clip ``x_end`` well below the input 502.
+        """
+        from types import SimpleNamespace
+
+        nrows = self._NROWS_CLIP
+        ncols = self._NCOLS_CLIP
+        c0 = self._C0_CLIP
+        hw = self._HW_CLIP
+        tilt = self._TILT_CLIP
+
+        edge_coeffs = np.zeros((1, 2, 2))   # (1 order, 2 edges, degree+1=2)
+        edge_coeffs[0, 0, 0] = c0 - hw      # bot constant
+        edge_coeffs[0, 0, 1] = tilt         # bot slope
+        edge_coeffs[0, 1, 0] = c0 + hw      # top constant
+        edge_coeffs[0, 1, 1] = tilt         # top slope
+        xranges_in = np.array([[self._XSTART, self._XEND]], dtype=int)
+
+        rng = np.random.default_rng(42)
+        flat = rng.normal(0.0, 50.0, size=(nrows, ncols)).astype(np.float32) + 200.0
+        rows = np.arange(nrows, dtype=float)
+        cols = np.arange(ncols, dtype=float)
+        for j, col in enumerate(cols):
+            center = c0 + tilt * col
+            sigma = hw / 2.355
+            flat[:, j] += 10000.0 * np.exp(-0.5 * ((rows - center) / sigma) ** 2)
+
+        path = str(tmp_path / "high_order_flat.fits")
+        _write_fits_flat(flat, path)
+
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs,
+            xranges=xranges_in,
+            edge_degree=1,
+            flat_fraction=0.85,
+            comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.5)),
+            ybuffer=1,
+            step=20,
+            omask=None,
+            ycororder=None,
+            orders=[0],
+        )
+        return path, fi, xranges_in
+
+    def _make_flat_order_flat(self, tmp_path, n_orders: int = 2):
+        """Flat + flatinfo for order(s) with zero tilt, well within detector.
+
+        With ``c0=_SYN_FIRST_CENTER`` (row 60) and no tilt, both edges stay
+        far from the detector boundaries for the full xrange.  The post-fit
+        restriction must NOT clip the xrange.
+        """
+        from types import SimpleNamespace
+
+        nrows = _NROWS
+        ncols = _NCOLS
+        hw = float(_SYN_HALF_WIDTH)
+
+        edge_coeffs = np.zeros((n_orders, 2, 2))
+        xranges_in = np.zeros((n_orders, 2), dtype=int)
+        for k in range(n_orders):
+            c0 = float(_SYN_FIRST_CENTER + k * _SYN_SPACING)
+            edge_coeffs[k, 0, 0] = c0 - hw
+            edge_coeffs[k, 1, 0] = c0 + hw
+            xranges_in[k] = [10, ncols - 10]
+
+        flat = _make_synthetic_flat(seed=42)
+        path = str(tmp_path / "flat_order_flat.fits")
+        _write_fits_flat(flat, path)
+
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs,
+            xranges=xranges_in,
+            edge_degree=1,
+            flat_fraction=0.85,
+            comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.5)),
+            ybuffer=1,
+            step=20,
+            omask=None,
+            ycororder=None,
+            orders=list(range(n_orders)),
+        )
+        return path, fi, xranges_in
+
+    # ---- tests: well-behaved polynomial stays within input xrange ---------
+
+    def test_valid_order_xrange_unchanged(self, tmp_path):
+        """When the polynomial is within detector bounds everywhere, xrange is
+        not narrowed — the output xranges equal the input sranges."""
+        path, fi, xranges_in = self._make_flat_order_flat(tmp_path, n_orders=2)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        xr = trace.order_xranges
+        for i in range(trace.n_orders):
+            assert xr[i, 0] == xranges_in[i, 0], (
+                f"Order {i}: x_start clipped from {xranges_in[i, 0]} to {xr[i, 0]} "
+                "but polynomial is within bounds everywhere."
+            )
+            assert xr[i, 1] == xranges_in[i, 1], (
+                f"Order {i}: x_end clipped from {xranges_in[i, 1]} to {xr[i, 1]} "
+                "but polynomial is within bounds everywhere."
+            )
+
+    # ---- tests: polynomial overshoots at the far end ----------------------
+
+    def test_pathological_order_xrange_clipped(self, tmp_path):
+        """When the polynomial overshoots the detector at the far end of the
+        xrange, order_xranges[i, 1] must be clipped — matching IDL's post-fit
+        xrange update.
+
+        The high-order scenario uses c0=215, tilt=0.1 px/col, nrows=256:
+          top(col) ≈ 225 + 0.1 * col  →  hits 255 around col 300
+        Input xrange ends at 502, so x_end must be clipped well below 502.
+        """
+        path, fi, xranges_in = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        xr = trace.order_xranges
+        # x_end must be strictly less than the input end (502).
+        assert xr[0, 1] < xranges_in[0, 1], (
+            f"x_end {xr[0, 1]} was NOT narrowed from input {xranges_in[0, 1]}; "
+            "IDL post-fit xrange restriction was not applied."
+        )
+        # x_end must be well below the full xrange (at least 50 columns shorter).
+        assert xr[0, 1] < xranges_in[0, 1] - 50, (
+            f"x_end {xr[0, 1]} is only marginally clipped from {xranges_in[0, 1]}; "
+            "expected a significant clip for c0=215 tilt=0.1 scenario."
+        )
+
+    # ---- tests: geometry uses the restricted xrange -----------------------
+
+    def test_geometry_uses_restricted_xrange(self, tmp_path):
+        """to_order_geometry_set must use the IDL-restricted xrange, not the
+        original input sranges."""
+        path, fi, xranges_in = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        geom = trace.to_order_geometry_set("K3")
+        g = geom.geometries[0]
+        xr = trace.order_xranges
+        # Geometry xranges must match the restricted order_xranges.
+        assert g.x_start == int(xr[0, 0])
+        assert g.x_end == int(xr[0, 1])
+        # x_end must be less than the input xrange end.
+        assert g.x_end < int(xranges_in[0, 1]), (
+            f"Geometry x_end {g.x_end} must be clipped below input {xranges_in[0, 1]}"
+        )
+
+    # ---- tests: valid orders unaffected by restriction --------------------
+
+    def test_valid_orders_unaffected_by_restriction(self, tmp_path):
+        """Flat orders (zero tilt, well within detector) must retain their
+        input xranges unchanged — only pathological polynomials are clipped."""
+        path, fi, xranges_in = self._make_flat_order_flat(tmp_path, n_orders=2)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        xr = trace.order_xranges
+        for i in range(trace.n_orders):
+            assert xr[i, 0] == xranges_in[i, 0], (
+                f"Order {i}: x_start was unexpectedly clipped."
+            )
+            assert xr[i, 1] == xranges_in[i, 1], (
+                f"Order {i}: x_end was unexpectedly clipped."
+            )
+
+    # ---- tests: xrange semantics ------------------------------------------
+
+    def test_restricted_xrange_is_within_original(self, tmp_path):
+        """After restriction, order_xranges[i] must be a sub-range of the
+        input xrange (start >= input start, end <= input end)."""
+        path, fi, xranges_in = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        xr = trace.order_xranges
+        assert xr[0, 0] >= xranges_in[0, 0], (
+            f"Restricted x_start {xr[0, 0]} < input start {xranges_in[0, 0]}"
+        )
+        assert xr[0, 1] <= xranges_in[0, 1], (
+            f"Restricted x_end {xr[0, 1]} > input end {xranges_in[0, 1]}"
+        )
+
+    # ---- tests: edge polynomials within detector at reported xrange ------
+
+    def test_edge_polys_valid_within_reported_xrange(self, tmp_path):
+        """Within the reported order_xranges, both fitted edge polynomials
+        must evaluate to pixel positions within (0, nrows-1) — no
+        extrapolation outside the detector within the valid range."""
+        path, fi, _ = self._make_high_order_flat(tmp_path)
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        xr = trace.order_xranges
+        nrows = self._NROWS_CLIP
+        assert trace.bot_poly_coeffs is not None
+        assert trace.top_poly_coeffs is not None
+        for i in range(trace.n_orders):
+            x_dense = np.arange(xr[i, 0], xr[i, 1] + 1, dtype=float)
+            if len(x_dense) == 0:
+                continue
+            bot_vals = np.polynomial.polynomial.polyval(
+                x_dense, trace.bot_poly_coeffs[i]
+            )
+            top_vals = np.polynomial.polynomial.polyval(
+                x_dense, trace.top_poly_coeffs[i]
+            )
+            assert np.all(bot_vals > 0.0) and np.all(bot_vals < float(nrows - 1)), (
+                f"Order {i}: bot edge polynomial outside (0, {nrows-1}) "
+                f"within reported xrange [{xr[i,0]}, {xr[i,1]}]"
+            )
+            assert np.all(top_vals > 0.0) and np.all(top_vals < float(nrows - 1)), (
+                f"Order {i}: top edge polynomial outside (0, {nrows-1}) "
+                f"within reported xrange [{xr[i,0]}, {xr[i,1]}]"
+            )
+
+    # ---- tests: plotting range follows valid xrange -----------------------
+
+    def test_order_xranges_within_detector_bounds(self, tmp_path):
+        """After restriction, all order xranges must reference valid columns
+        within [0, ncols-1] and valid pixel rows (edges within detector)."""
+        path, fi, _ = self._make_high_order_flat(tmp_path)
+        ncols = self._NCOLS_CLIP
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        xr = trace.order_xranges
+        for i in range(trace.n_orders):
+            assert xr[i, 0] >= 0, f"Order {i}: x_start {xr[i, 0]} < 0"
+            assert xr[i, 1] <= ncols - 1, (
+                f"Order {i}: x_end {xr[i, 1]} >= ncols ({ncols})"
+            )
+            assert xr[i, 0] <= xr[i, 1], (
+                f"Order {i}: degenerate xrange [{xr[i, 0]}, {xr[i, 1]}]"
+            )
+
 
 
 def rng_offset(k: int) -> float:

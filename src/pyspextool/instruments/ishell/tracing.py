@@ -99,6 +99,10 @@ IDL-to-Python fidelity status
   from all guess y-positions; per-order xranges recomputed with shifted edges
 - Per-order valid column ranges (``order_xranges``)
 - Per-order step-based sample column sets
+- Post-fit xrange restriction: after edge polynomial fitting, ``order_xranges``
+  is narrowed to only those columns where BOTH fitted edges evaluate to valid
+  pixel positions (``0 < edge < nrows-1``), matching IDL's end-of-loop
+  ``where(top gt 0 and top lt nrows-1 and bot gt 0 and bot lt nrows-1)`` block
 
 **Does NOT fully match IDL:**
 
@@ -788,6 +792,62 @@ def trace_orders_from_flat(
                 os_i.sample_cols[good_cen].astype(float), center_poly_coeffs[i]
             )
             fit_rms[i] = float(np.std(os_i.center_rows[good_cen] - pred))
+
+    # ------------------------------------------------------------------
+    # 6a. Update per-order xranges from fitted edge polynomials.
+    #     IDL mc_findorders (verbatim port of the end-of-order-loop block):
+    #
+    #       x = findgen(stop-start+1)+start   ; all integer cols in srange
+    #       bot = poly(x, edgecoeffs[*,0,i])
+    #       top = poly(x, edgecoeffs[*,1,i])
+    #       z = where(top gt 0.0 and top lt nrows-1
+    #                 and bot gt 0 and bot lt nrows-1)
+    #       xranges[*,i] = [min(x[z],MAX=max), max]
+    #
+    #     i.e. restrict xrange to columns where BOTH fitted edge polynomials
+    #     evaluate to strictly valid pixel positions (inside [0, nrows-1]).
+    #     This prevents a pathological polynomial (one that shoots outside
+    #     the detector at one end of the input xrange) from being applied
+    #     over that extrapolated, unsupported region.
+    #
+    #     Python mismatch that this corrects: before this step the Python
+    #     code carried the input sranges straight through to order_xranges
+    #     without ever evaluating whether the fitted polynomial remained
+    #     within the detector.  IDL always performs this restriction.
+    # ------------------------------------------------------------------
+    for i, os_i in enumerate(order_samples):
+        b_coeffs = bot_poly_coeffs[i]
+        t_coeffs = top_poly_coeffs[i]
+        if np.any(np.isnan(b_coeffs)) or np.any(np.isnan(t_coeffs)):
+            # Fit failed — keep original xrange (degenerate fallback,
+            # matching IDL's implicit cancel-on-failure behaviour).
+            logger.warning(
+                "Order %d: edge fit has NaN coefficients; xrange not updated.", i,
+            )
+            continue
+        # Evaluate on every integer column in the order's current xrange
+        # (IDL: x = findgen(stop-start+1)+start).
+        x_dense = np.arange(os_i.x_start, os_i.x_end + 1, dtype=float)
+        bot_vals = np.polynomial.polynomial.polyval(x_dense, b_coeffs)
+        top_vals = np.polynomial.polynomial.polyval(x_dense, t_coeffs)
+        # IDL condition: top gt 0.0 and top lt nrows-1 and bot gt 0 and bot lt nrows-1
+        valid_mask = (
+            (bot_vals > 0.0) & (bot_vals < float(nrows - 1)) &
+            (top_vals > 0.0) & (top_vals < float(nrows - 1))
+        )
+        valid_x = x_dense[valid_mask].astype(int)
+        if len(valid_x) > 0:
+            os_i.x_start = int(valid_x[0])
+            os_i.x_end = int(valid_x[-1])
+        else:
+            # No valid columns — set degenerate range matching IDL's
+            # initialisation (xranges[0,i] = sranges[0,i], xranges[1,i] = sranges[0,i]).
+            logger.warning(
+                "Order %d: fitted edge polynomials evaluate outside detector in "
+                "all columns [%d, %d]; setting degenerate xrange.",
+                i, os_i.x_start, os_i.x_end,
+            )
+            os_i.x_end = os_i.x_start  # degenerate: start == end
 
     # ------------------------------------------------------------------
     # 7. Estimate order half-widths directly from per-order edge samples.
