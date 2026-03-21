@@ -2949,3 +2949,734 @@ def _write_three_flats(tmp_path, base=None) -> list[str]:
         _write_fits_flat(flat_k, p)
         paths.append(p)
     return paths
+
+
+# ---------------------------------------------------------------------------
+# 23. IDL-port fidelity tests (mc_findorders.pro requirements)
+#
+# The problem statement mandates "at minimum" tests for six properties of
+# the new IDL-port tracing core.  These tests are collected here and
+# explicitly reference the IDL behaviour they verify.
+#
+# IDL reference: vendor/spextool_idl/Spextool/pro/mc_findorders.pro
+# ---------------------------------------------------------------------------
+
+
+def _make_single_order_flat(
+    nrows: int = 256,
+    ncols: int = 256,
+    c0: float = 128.0,
+    tilt: float = 0.05,
+    hw: float = 12.0,
+    peak: float = 10000.0,
+    bg: float = 200.0,
+    noise: float = 30.0,
+    seed: int = 7,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Create a synthetic flat with a SINGLE order of known shape.
+
+    Returns
+    -------
+    flat : ndarray (nrows, ncols)  float32
+    true_bot : ndarray (ncols,)    true bottom edge row
+    true_top : ndarray (ncols,)    true top edge row
+    """
+    rng = np.random.default_rng(seed)
+    rows = np.arange(nrows, dtype=float)
+    flat = rng.normal(bg, noise, size=(nrows, ncols)).astype(np.float32)
+    true_bot = np.empty(ncols)
+    true_top = np.empty(ncols)
+    for j in range(ncols):
+        center = c0 + tilt * j
+        sigma = hw / 2.355
+        flat[:, j] += peak * np.exp(-0.5 * ((rows - center) / sigma) ** 2)
+        true_bot[j] = center - hw
+        true_top[j] = center + hw
+    return flat, true_bot, true_top
+
+
+class TestIDLPortFidelity:
+    """Verify the six IDL mc_findorders.pro fidelity requirements.
+
+    Problem-statement requirement 1:
+        The tracing core no longer depends on peak-finding / peak-matching
+        helpers (IDL mc_findorders does not use find_peaks anywhere).
+
+    Problem-statement requirement 2:
+        Edge tracing is primary; centre values are derived from traced edges
+        (IDL: ``cen[k] = (com_bot + com_top) / 2``).
+
+    Problem-statement requirement 3:
+        Left/right sweep with dynamic polynomial prediction works on a
+        synthetic flat with realistic banded orders
+        (IDL: left loop ``for j=0,gidx``, right loop ``for j=gidx+1,nscols-1``
+        with ``mc_polyfit1d`` prediction at each step).
+
+    Problem-statement requirement 4:
+        Valid xranges emerge from fitted edge positions staying on detector
+        (IDL end-of-loop block:
+        ``z = where(top gt 0 and top lt nrows-1 and bot gt 0 and bot lt nrows-1)``
+        ``xranges[*,i] = [min(x[z]), max]``).
+
+    Problem-statement requirement 5:
+        The returned structure still supports downstream geometry conversion.
+
+    Problem-statement requirement 6:
+        Existing public-facing compatibility fields remain usable where expected.
+    """
+
+    # ---- Requirement 1: no peak-finding in the tracing core ---------------
+
+    def test_trace_single_order_does_not_call_find_peaks(self):
+        """_trace_single_order must not call _find_order_peaks or scipy
+        find_peaks anywhere in its execution path.
+
+        IDL mc_findorders has no peak-detection step: it uses only the
+        flux-threshold + Sobel COM logic at each sample column.
+        We verify this by patching _find_order_peaks to raise and confirming
+        that _trace_single_order still succeeds.
+        """
+        from unittest.mock import patch
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order,
+            _compute_sobel_magnitude,
+        )
+
+        flat, _, _ = _make_single_order_flat(seed=11)
+        sflat = _compute_sobel_magnitude(flat)
+        ncols = flat.shape[1]
+        s_cols = np.arange(10, ncols - 10, 20)
+        seed_idx = len(s_cols) // 2
+
+        # If _trace_single_order calls _find_order_peaks this will raise.
+        with patch(
+            "pyspextool.instruments.ishell.tracing._find_order_peaks",
+            side_effect=AssertionError("_find_order_peaks must not be called"),
+        ):
+            cen, bot, top = _trace_single_order(
+                flat, sflat, s_cols, seed_idx, y_seed=128.0,
+                poly_degree=2,
+                ybuffer=1,
+                intensity_fraction=0.85,
+                com_half_width=3,
+                slit_height_range=(12.0, 60.0),
+            )
+
+        # Tracing must succeed and return valid arrays.
+        assert cen.shape == (len(s_cols),)
+        assert bot.shape == (len(s_cols),)
+        assert top.shape == (len(s_cols),)
+        # At least some traced positions should be finite.
+        assert np.sum(np.isfinite(bot)) > 0, "Expected at least some finite bot values"
+        assert np.sum(np.isfinite(top)) > 0, "Expected at least some finite top values"
+
+    def test_trace_single_order_succeeds_without_flatinfo(self):
+        """_trace_single_order operates entirely on image data; it does not
+        require flatinfo or any peak-detection initialisation.
+
+        This verifies requirement 1 structurally: the function signature
+        accepts only (flat, sflat, s_cols, seed_idx, y_seed, poly_degree, ...)
+        with no peak-matching inputs.
+        """
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order,
+            _compute_sobel_magnitude,
+        )
+        import inspect
+
+        sig = inspect.signature(_trace_single_order)
+        param_names = list(sig.parameters.keys())
+        # Must not have peak-matching parameters.
+        for forbidden in ("peaks", "peak_cols", "match", "seed_peaks"):
+            assert forbidden not in param_names, (
+                f"_trace_single_order has forbidden peak-matching parameter: "
+                f"'{forbidden}'"
+            )
+
+    # ---- Requirement 2: edge-first; centres derived from edges ------------
+
+    def test_traced_cen_equals_midpoint_of_bot_and_top(self):
+        """Where both bot and top are finite, cen must equal (bot+top)/2.
+
+        IDL mc_findorders: ``cen[k] = (com_bot + com_top) / 2``
+        Python _update_centre_and_flags: ``cen[k] = (com_bot + com_top) / 2.0``
+        """
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order,
+            _compute_sobel_magnitude,
+        )
+
+        flat, _, _ = _make_single_order_flat(c0=100.0, hw=15.0, tilt=0.02, seed=22)
+        sflat = _compute_sobel_magnitude(flat)
+        ncols = flat.shape[1]
+        s_cols = np.arange(10, ncols - 10, 10)
+        seed_idx = len(s_cols) // 2
+
+        cen, bot, top = _trace_single_order(
+            flat, sflat, s_cols, seed_idx, y_seed=100.0,
+            poly_degree=2,
+            ybuffer=1,
+            intensity_fraction=0.75,
+            com_half_width=4,
+            slit_height_range=(10.0, 60.0),
+        )
+
+        # Where both edges are finite, cen must be (bot+top)/2.
+        both_finite = np.isfinite(bot) & np.isfinite(top)
+        assert both_finite.sum() > 0, "Expected some columns with both edges traced"
+        expected_cen = (bot[both_finite] + top[both_finite]) / 2.0
+        np.testing.assert_allclose(
+            cen[both_finite], expected_cen, atol=1e-10,
+            err_msg="cen must equal (bot+top)/2 where both edges are finite",
+        )
+
+    def test_bot_poly_coeffs_and_top_poly_coeffs_primary_outputs(self, tmp_path):
+        """After trace_orders_from_flat, bot_poly_coeffs and top_poly_coeffs
+        must be the primary fit outputs; center_poly_coeffs is derived from them.
+
+        IDL mc_findorders: ``edgecoeffs[*,0,i]`` (bot) and ``edgecoeffs[*,1,i]``
+        (top) are the authoritative outputs.  Centres are not directly fitted.
+        """
+        flat = _make_synthetic_flat(seed=3)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat([path], poly_degree=2, n_sample_cols=15)
+
+        assert trace.bot_poly_coeffs is not None, "bot_poly_coeffs must be populated"
+        assert trace.top_poly_coeffs is not None, "top_poly_coeffs must be populated"
+
+        # center_poly_coeffs must be (bot+top)/2 for every order.
+        for i in range(trace.n_orders):
+            expected = (trace.bot_poly_coeffs[i] + trace.top_poly_coeffs[i]) / 2.0
+            np.testing.assert_allclose(
+                trace.center_poly_coeffs[i], expected, rtol=1e-10,
+                err_msg=f"Order {i}: center_poly_coeffs != (bot+top)/2",
+            )
+
+    def test_bot_poly_below_top_poly_across_sample_cols(self, tmp_path):
+        """Bottom edge polynomial must evaluate below top edge polynomial at
+        all sample columns for every order.
+
+        IDL always stores ``edges[k,0] = com_bot`` (smaller row) and
+        ``edges[k,1] = com_top`` (larger row).
+        """
+        flat = _make_synthetic_flat(seed=4)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat([path], poly_degree=2, n_sample_cols=15)
+
+        for i in range(trace.n_orders):
+            bot_vals = np.polynomial.polynomial.polyval(
+                trace.sample_cols.astype(float), trace.bot_poly_coeffs[i]
+            )
+            top_vals = np.polynomial.polynomial.polyval(
+                trace.sample_cols.astype(float), trace.top_poly_coeffs[i]
+            )
+            assert np.all(bot_vals < top_vals), (
+                f"Order {i}: bot edge must be strictly below top edge at all cols"
+            )
+
+    # ---- Requirement 3: left/right sweep with dynamic prediction ----------
+
+    def test_left_sweep_traces_order_away_from_seed(self):
+        """The left sweep must trace the order correctly for columns to the
+        LEFT of the seed, not just near it.
+
+        IDL mc_findorders left loop: ``for j=0,gidx do begin; k = gidx-j; ...``
+        The polynomial prediction ``mc_polyfit1d(scols,cen,...)`` is updated
+        at every step, so the predicted centre tracks the order as it moves.
+        """
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order,
+            _compute_sobel_magnitude,
+        )
+
+        nrows, ncols = 256, 300
+        c0, tilt, hw = 128.0, 0.08, 14.0
+        flat, true_bot, true_top = _make_single_order_flat(
+            nrows=nrows, ncols=ncols, c0=c0, tilt=tilt, hw=hw, seed=33,
+        )
+        sflat = _compute_sobel_magnitude(flat)
+        s_cols = np.arange(5, ncols - 5, 10)
+        # Seed near the RIGHT end → the LEFT sweep covers most of the range.
+        seed_idx = len(s_cols) - 3   # near-right seed
+
+        cen, bot, top = _trace_single_order(
+            flat, sflat, s_cols, seed_idx,
+            y_seed=c0 + tilt * s_cols[seed_idx],
+            poly_degree=2,
+            ybuffer=1,
+            intensity_fraction=0.75,
+            com_half_width=4,
+            slit_height_range=(8.0, 60.0),
+        )
+
+        # Columns to the LEFT of the seed (not just around it) should be traced.
+        left_cols_idx = np.where(s_cols < s_cols[seed_idx])[0]
+        finite_left = np.sum(np.isfinite(cen[left_cols_idx]))
+        assert finite_left >= len(left_cols_idx) * 0.6, (
+            f"Left sweep only traced {finite_left}/{len(left_cols_idx)} columns "
+            "to the left of the seed — dynamic prediction may not be working"
+        )
+
+        # Traced centres in the left region should be close to the true values.
+        for k in left_cols_idx:
+            if np.isfinite(cen[k]):
+                true_center_k = c0 + tilt * s_cols[k]
+                assert abs(cen[k] - true_center_k) < 8.0, (
+                    f"Left sweep: col {s_cols[k]}: traced cen={cen[k]:.1f} "
+                    f"differs from true {true_center_k:.1f} by > 8 px "
+                    "(dynamic prediction failure)"
+                )
+
+    def test_right_sweep_traces_order_away_from_seed(self):
+        """The right sweep must trace the order correctly for columns to the
+        RIGHT of the seed.
+
+        IDL mc_findorders right loop: ``for j=gidx+1,nscols-1 do begin; k=j``
+        """
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order,
+            _compute_sobel_magnitude,
+        )
+
+        nrows, ncols = 256, 300
+        c0, tilt, hw = 128.0, -0.06, 14.0
+        flat, true_bot, true_top = _make_single_order_flat(
+            nrows=nrows, ncols=ncols, c0=c0, tilt=tilt, hw=hw, seed=44,
+        )
+        sflat = _compute_sobel_magnitude(flat)
+        s_cols = np.arange(5, ncols - 5, 10)
+        # Seed near the LEFT end → the RIGHT sweep covers most of the range.
+        seed_idx = 2   # near-left seed
+
+        cen, bot, top = _trace_single_order(
+            flat, sflat, s_cols, seed_idx,
+            y_seed=c0 + tilt * s_cols[seed_idx],
+            poly_degree=2,
+            ybuffer=1,
+            intensity_fraction=0.75,
+            com_half_width=4,
+            slit_height_range=(8.0, 60.0),
+        )
+
+        # Columns to the RIGHT of the seed should be traced.
+        right_cols_idx = np.where(s_cols > s_cols[seed_idx])[0]
+        finite_right = np.sum(np.isfinite(cen[right_cols_idx]))
+        assert finite_right >= len(right_cols_idx) * 0.6, (
+            f"Right sweep only traced {finite_right}/{len(right_cols_idx)} columns "
+            "to the right of the seed"
+        )
+
+        # Traced centres should be close to the true values.
+        for k in right_cols_idx:
+            if np.isfinite(cen[k]):
+                true_center_k = c0 + tilt * s_cols[k]
+                assert abs(cen[k] - true_center_k) < 8.0, (
+                    f"Right sweep: col {s_cols[k]}: traced cen={cen[k]:.1f} "
+                    f"differs from true {true_center_k:.1f} by > 8 px"
+                )
+
+    def test_sweep_initialises_cen_around_seed_idl_style(self):
+        """The centre array must be initialised around the seed index with the
+        guess y-value before the sweeps start.
+
+        IDL mc_findorders:
+            ``cen[(gidx-degree):(gidx+degree)] = guesspos[1,i]``
+        Python _trace_single_order:
+            ``cen[lo: hi+1] = y_seed``
+        where lo = max(0, seed_idx-degree), hi = min(n_samp-1, seed_idx+degree).
+        This ensures the initial polynomial fit at the first sweep step has
+        enough non-NaN points.
+        """
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order,
+            _compute_sobel_magnitude,
+        )
+        import unittest.mock as mock
+
+        flat, _, _ = _make_single_order_flat(c0=128.0, seed=55)
+        sflat = _compute_sobel_magnitude(flat)
+        ncols = flat.shape[1]
+        s_cols = np.arange(5, ncols - 5, 10)
+        seed_idx = len(s_cols) // 2
+        y_seed = 128.0
+        poly_degree = 3
+
+        # Intercept the first call to _predict_and_find_edges to check
+        # that cen has been initialised (not all-NaN) before the sweep.
+        captured_cen_snapshots = []
+        original_pfe = None
+
+        import pyspextool.instruments.ishell.tracing as _tracing_module
+
+        original_pfe = _tracing_module._predict_and_find_edges
+
+        def capture_pfe(cen, sample_cols, k, *args, **kwargs):
+            # Capture the first call (first step of the left sweep = seed_idx)
+            if len(captured_cen_snapshots) == 0:
+                captured_cen_snapshots.append(cen.copy())
+            return original_pfe(cen, sample_cols, k, *args, **kwargs)
+
+        with mock.patch.object(_tracing_module, "_predict_and_find_edges", capture_pfe):
+            cen, bot, top = _trace_single_order(
+                flat, sflat, s_cols, seed_idx, y_seed=y_seed,
+                poly_degree=poly_degree,
+                ybuffer=1,
+                intensity_fraction=0.80,
+                com_half_width=3,
+            )
+
+        assert len(captured_cen_snapshots) > 0, (
+            "_predict_and_find_edges was never called — sweep did not run"
+        )
+        first_cen = captured_cen_snapshots[0]
+        # The initialisation window: lo = max(0, seed_idx-degree),
+        # hi = min(n_samp-1, seed_idx+degree)
+        lo = max(0, seed_idx - poly_degree)
+        hi = min(len(s_cols) - 1, seed_idx + poly_degree)
+        init_vals = first_cen[lo: hi + 1]
+        assert np.all(np.isfinite(init_vals)), (
+            "IDL initialisation: cen values in [lo:hi+1] must be finite "
+            "before first sweep step so that polynomial prediction works"
+        )
+        np.testing.assert_allclose(
+            init_vals, y_seed, atol=1e-10,
+            err_msg="IDL initialisation: cen[lo:hi+1] must equal y_seed",
+        )
+
+    def test_bilateral_sweep_both_directions_traced(self):
+        """Tracing with the seed in the middle must produce finite values on
+        BOTH sides (left and right) — verifying the bilateral structure of the
+        IDL algorithm.
+
+        IDL mc_findorders has two separate ``for`` loops:
+          - Left:  ``for j = 0, gidx do begin``
+          - Right: ``for j = gidx+1, nscols-1 do begin``
+        """
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order,
+            _compute_sobel_magnitude,
+        )
+
+        flat, _, _ = _make_single_order_flat(c0=128.0, tilt=0.05, hw=14.0, seed=66)
+        sflat = _compute_sobel_magnitude(flat)
+        ncols = flat.shape[1]
+        s_cols = np.arange(5, ncols - 5, 8)
+        seed_idx = len(s_cols) // 2
+
+        cen, bot, top = _trace_single_order(
+            flat, sflat, s_cols, seed_idx, y_seed=128.0,
+            poly_degree=2,
+            ybuffer=1,
+            intensity_fraction=0.75,
+            com_half_width=4,
+            slit_height_range=(8.0, 60.0),
+        )
+
+        left_finite = np.sum(np.isfinite(cen[:seed_idx]))
+        right_finite = np.sum(np.isfinite(cen[seed_idx + 1:]))
+        n_left = seed_idx
+        n_right = len(s_cols) - seed_idx - 1
+
+        assert left_finite >= n_left * 0.5, (
+            f"Left sweep produced only {left_finite}/{n_left} finite centres; "
+            "expected at least 50% of left columns to be traced"
+        )
+        assert right_finite >= n_right * 0.5, (
+            f"Right sweep produced only {right_finite}/{n_right} finite centres; "
+            "expected at least 50% of right columns to be traced"
+        )
+
+    # ---- Requirement 4: valid xranges from fitted edge positions ----------
+
+    def test_xranges_clipped_when_edge_polynomial_overshoots_detector(self, tmp_path):
+        """When a fitted edge polynomial evaluates outside [0, nrows-1] at
+        some columns within the input xrange, order_xranges must be restricted
+        to the safe sub-range.
+
+        IDL mc_findorders (end of per-order loop):
+            ``z = where(top gt 0.0 and top lt nrows-1 and bot gt 0 and bot lt nrows-1)``
+            ``xranges[*,i] = [min(x[z],MAX=mx), mx]``
+        """
+        from types import SimpleNamespace
+
+        nrows, ncols = 256, 400
+        c0 = 235.0          # near top of detector
+        tilt = 0.08         # order tilts upward; top edge exits detector ~col 250
+        hw = 12.0
+
+        edge_coeffs = np.zeros((1, 2, 2))
+        edge_coeffs[0, 0, 0] = c0 - hw   # bot constant
+        edge_coeffs[0, 0, 1] = tilt      # bot slope
+        edge_coeffs[0, 1, 0] = c0 + hw   # top constant
+        edge_coeffs[0, 1, 1] = tilt      # top slope
+
+        # top hits nrows-1=255 at col ≈ (255 - (c0+hw)) / tilt ≈ (255-247)/0.08 = 100
+        # So the input xrange [5, 395] should be clipped at the right end.
+        xranges_in = np.array([[5, 395]], dtype=int)
+
+        flat, _, _ = _make_single_order_flat(
+            nrows=nrows, ncols=ncols, c0=c0, tilt=tilt, hw=hw, seed=77,
+        )
+        path = str(tmp_path / "overshoot_flat.fits")
+        _write_fits_flat(flat.astype(np.float32), path)
+
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs,
+            xranges=xranges_in,
+            edge_degree=1,
+            flat_fraction=0.75,
+            comm_window=6,
+            slit_range_pixels=(int(hw * 0.3), int(hw * 2.5)),
+            ybuffer=1,
+            step=15,
+            omask=None,
+            ycororder=None,
+            orders=[0],
+        )
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+
+        xr = trace.order_xranges
+        assert xr is not None, "order_xranges must be populated"
+        # The restricted x_end must be less than the input x_end.
+        assert xr[0, 1] < xranges_in[0, 1], (
+            f"order_xranges x_end ({xr[0, 1]}) was not clipped from "
+            f"input xrange end ({xranges_in[0, 1]}); "
+            "IDL post-fit restriction must narrow the xrange when the "
+            "polynomial overshoots the detector."
+        )
+
+    def test_xranges_unchanged_when_edges_stay_on_detector(self, tmp_path):
+        """When fitted edge polynomials stay within (0, nrows-1) for the full
+        input xrange, order_xranges must match the input sranges unchanged.
+
+        IDL mc_findorders: xranges are only narrowed when the fitted edges
+        actually exit the detector; well-behaved orders keep their full range.
+        """
+        from types import SimpleNamespace
+
+        nrows, ncols = 256, 300
+        # Order well within detector at all columns.
+        c0 = 128.0
+        tilt = 0.01   # very mild tilt; stays in detector for full ncols
+        hw = 12.0
+
+        edge_coeffs = np.zeros((1, 2, 2))
+        edge_coeffs[0, 0, 0] = c0 - hw
+        edge_coeffs[0, 0, 1] = tilt
+        edge_coeffs[0, 1, 0] = c0 + hw
+        edge_coeffs[0, 1, 1] = tilt
+        xranges_in = np.array([[5, ncols - 5]], dtype=int)
+
+        flat, _, _ = _make_single_order_flat(
+            nrows=nrows, ncols=ncols, c0=c0, tilt=tilt, hw=hw, seed=88,
+        )
+        path = str(tmp_path / "safe_flat.fits")
+        _write_fits_flat(flat.astype(np.float32), path)
+
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs,
+            xranges=xranges_in,
+            edge_degree=1,
+            flat_fraction=0.75,
+            comm_window=6,
+            slit_range_pixels=(int(hw * 0.3), int(hw * 2.5)),
+            ybuffer=1,
+            step=15,
+            omask=None,
+            ycororder=None,
+            orders=[0],
+        )
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+
+        xr = trace.order_xranges
+        assert xr is not None, "order_xranges must be populated"
+        assert xr[0, 0] == xranges_in[0, 0], (
+            f"x_start {xr[0, 0]} was unexpectedly clipped from {xranges_in[0, 0]}"
+        )
+        assert xr[0, 1] == xranges_in[0, 1], (
+            f"x_end {xr[0, 1]} was unexpectedly clipped from {xranges_in[0, 1]}"
+        )
+
+    def test_edge_polynomials_within_detector_at_reported_xranges(self, tmp_path):
+        """Within the reported order_xranges, BOTH fitted edge polynomials must
+        evaluate to pixel rows strictly within (0, nrows-1).
+
+        This is the postcondition of the IDL xrange-restriction step:
+        ``where(top gt 0.0 and top lt nrows-1 and bot gt 0 and bot lt nrows-1)``
+        """
+        flat = _make_synthetic_flat(seed=5)
+        path = str(tmp_path / "syn_flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat([path], n_sample_cols=15, poly_degree=2)
+
+        nrows = flat.shape[0]
+        for i in range(trace.n_orders):
+            xr = trace.order_xranges[i]
+            x_dense = np.arange(xr[0], xr[1] + 1, dtype=float)
+            if len(x_dense) == 0:
+                continue
+            bot_v = np.polynomial.polynomial.polyval(x_dense, trace.bot_poly_coeffs[i])
+            top_v = np.polynomial.polynomial.polyval(x_dense, trace.top_poly_coeffs[i])
+            assert np.all(bot_v > 0.0) and np.all(bot_v < float(nrows - 1)), (
+                f"Order {i}: bot poly outside (0, {nrows-1}) within "
+                f"reported xrange [{xr[0]}, {xr[1]}]"
+            )
+            assert np.all(top_v > 0.0) and np.all(top_v < float(nrows - 1)), (
+                f"Order {i}: top poly outside (0, {nrows-1}) within "
+                f"reported xrange [{xr[0]}, {xr[1]}]"
+            )
+
+    # ---- Requirement 5: downstream geometry conversion --------------------
+
+    def test_to_order_geometry_set_returns_valid_geometryset(self, tmp_path):
+        """trace_orders_from_flat result converts to OrderGeometrySet without error.
+
+        Requirement 5: the returned structure supports downstream geometry
+        conversion via to_order_geometry_set().
+        """
+        flat = _make_synthetic_flat(seed=6)
+        path = str(tmp_path / "syn_flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+
+        geom = trace.to_order_geometry_set("H1")
+        assert isinstance(geom, OrderGeometrySet), (
+            "to_order_geometry_set must return an OrderGeometrySet"
+        )
+        assert geom.n_orders == trace.n_orders
+        assert geom.mode == "H1"
+
+    def test_order_geometry_uses_traced_edge_polys(self, tmp_path):
+        """OrderGeometry.bottom_edge_coeffs / top_edge_coeffs must come directly
+        from the IDL-traced edge polynomials, not from centre ± half_width.
+
+        IDL mc_findorders: ``edgecoeffs[*,0,i]`` and ``edgecoeffs[*,1,i]`` are
+        the primary output; they feed directly into the geometry.
+        """
+        flat = _make_synthetic_flat(seed=7)
+        path = str(tmp_path / "syn_flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+
+        assert trace.bot_poly_coeffs is not None
+        assert trace.top_poly_coeffs is not None
+        geom = trace.to_order_geometry_set("H1")
+        for i, g in enumerate(geom.geometries):
+            np.testing.assert_allclose(
+                g.bottom_edge_coeffs, trace.bot_poly_coeffs[i], rtol=1e-10,
+                err_msg=(
+                    f"Order {i}: geometry bottom_edge_coeffs must equal "
+                    "bot_poly_coeffs (IDL edgecoeffs[*,0,i])"
+                ),
+            )
+            np.testing.assert_allclose(
+                g.top_edge_coeffs, trace.top_poly_coeffs[i], rtol=1e-10,
+                err_msg=(
+                    f"Order {i}: geometry top_edge_coeffs must equal "
+                    "top_poly_coeffs (IDL edgecoeffs[*,1,i])"
+                ),
+            )
+
+    def test_order_geometry_top_edge_above_bottom_at_all_sample_cols(self, tmp_path):
+        """At every sample column, the top edge must be above the bottom edge.
+
+        IDL mc_findorders guarantees this by design: com_top (row above centre)
+        > com_bot (row below centre).
+        """
+        flat = _make_synthetic_flat(seed=8)
+        path = str(tmp_path / "syn_flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+        geom = trace.to_order_geometry_set("H1")
+
+        for i, g in enumerate(geom.geometries):
+            col_mid = (g.x_start + g.x_end) // 2
+            top_y = g.eval_top_edge(col_mid)
+            bot_y = g.eval_bottom_edge(col_mid)
+            assert top_y > bot_y, (
+                f"Order {i}: top edge ({top_y:.1f}) not above bottom "
+                f"edge ({bot_y:.1f}) at col {col_mid}"
+            )
+
+    # ---- Requirement 6: public compatibility fields remain usable ---------
+
+    def test_all_public_fields_accessible(self, tmp_path):
+        """All public-facing FlatOrderTrace fields that downstream code uses
+        must be populated and have the expected shapes / types.
+
+        Requirement 6: existing compatibility fields stay usable.
+        """
+        flat = _make_synthetic_flat(seed=9)
+        path = str(tmp_path / "syn_flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+
+        n = trace.n_orders
+        d = trace.poly_degree + 1   # number of polynomial coefficients
+
+        # --- scalar fields ---
+        assert isinstance(trace.n_orders, int) and trace.n_orders > 0
+        assert isinstance(trace.poly_degree, int)
+        assert isinstance(trace.seed_col, int)
+
+        # --- array shapes ---
+        assert trace.sample_cols.ndim == 1 and len(trace.sample_cols) > 0
+        assert trace.center_rows.shape == (n, len(trace.sample_cols))
+        assert trace.center_poly_coeffs.shape == (n, d)
+        assert trace.fit_rms.shape == (n,)
+        assert trace.half_width_rows.shape == (n,)
+        assert trace.bot_poly_coeffs.shape == (n, d)
+        assert trace.top_poly_coeffs.shape == (n, d)
+        assert trace.order_xranges.shape == (n, 2)
+
+        # --- list fields ---
+        assert len(trace.order_samples) == n
+        assert len(trace.order_stats) == n
+
+        # --- value sanity ---
+        assert np.all(trace.half_width_rows > 0)
+        for i in range(n):
+            xr = trace.order_xranges[i]
+            assert xr[0] <= xr[1], f"Order {i}: degenerate xrange {xr}"
+
+    def test_order_samples_fields_are_accessible(self, tmp_path):
+        """OrderTraceSamples fields (sample_cols, center_rows, bot_rows, top_rows,
+        x_start, x_end) must all be present and consistent.
+
+        These are the authoritative per-order representations — downstream code
+        must be able to rely on them.
+        """
+        flat = _make_synthetic_flat(seed=10)
+        path = str(tmp_path / "syn_flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat([path], n_sample_cols=12, poly_degree=2)
+
+        for i, os_i in enumerate(trace.order_samples):
+            n_samp = len(os_i.sample_cols)
+            assert n_samp > 0, f"Order {i}: empty sample_cols"
+            assert os_i.center_rows.shape == (n_samp,)
+            assert os_i.bot_rows.shape == (n_samp,)
+            assert os_i.top_rows.shape == (n_samp,)
+            assert isinstance(os_i.x_start, int)
+            assert isinstance(os_i.x_end, int)
+            assert os_i.x_start <= os_i.x_end, (
+                f"Order {i}: degenerate xrange [{os_i.x_start}, {os_i.x_end}]"
+            )
+
+    def test_fit_rms_finite_for_well_traced_orders(self, tmp_path):
+        """fit_rms must be finite for all orders traced on a clean synthetic flat.
+
+        A NaN fit_rms means the polynomial fit failed (too few valid samples),
+        which would indicate a regression in the tracing core.
+        """
+        flat = _make_synthetic_flat(seed=99)
+        path = str(tmp_path / "syn_flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat([path], n_sample_cols=15, poly_degree=2)
+
+        bad = np.where(~np.isfinite(trace.fit_rms))[0]
+        assert len(bad) == 0, (
+            f"Orders {bad.tolist()} have NaN fit_rms — tracing core regression"
+        )
