@@ -28,6 +28,7 @@ from astropy.io import fits
 
 from pyspextool.instruments.ishell.tracing import (
     FlatOrderTrace,
+    OrderTraceSamples,
     OrderTraceStats,
     load_and_combine_flats,
     trace_orders_from_flat,
@@ -1160,9 +1161,16 @@ class TestPerOrderXranges:
         )
         return trace_orders_from_flat([path], flatinfo=fi)
 
-    def test_auto_detect_order_xranges_is_none(self, trace_auto):
-        """In auto-detect mode, order_xranges is None (no per-order ranges)."""
-        assert trace_auto.order_xranges is None
+    def test_auto_detect_order_xranges_shape(self, trace_auto):
+        """In auto-detect mode, order_xranges is still populated (from order_samples)."""
+        assert trace_auto.order_xranges is not None
+        assert trace_auto.order_xranges.shape == (trace_auto.n_orders, 2)
+
+    def test_auto_detect_order_xranges_valid(self, trace_auto):
+        """Each auto-detect order_xrange is a valid [start, end]."""
+        for i in range(trace_auto.n_orders):
+            xr = trace_auto.order_xranges[i]
+            assert xr[0] <= xr[1], f"Order {i}: xrange invalid {xr}"
 
     def test_flatinfo_order_xranges_shape(self, trace_flatinfo):
         """In flatinfo mode, order_xranges has shape (n_orders, 2)."""
@@ -1182,12 +1190,12 @@ class TestPerOrderXranges:
             assert g.x_start == int(trace_flatinfo.order_xranges[i, 0])
             assert g.x_end == int(trace_flatinfo.order_xranges[i, 1])
 
-    def test_to_order_geometry_auto_uses_col_range(self, trace_auto):
-        """In auto-detect mode, all orders share the same col_range."""
-        geom = trace_auto.to_order_geometry_set("K3", col_range=(50, 400))
-        for g in geom.geometries:
-            assert g.x_start == 50
-            assert g.x_end == 400
+    def test_to_order_geometry_auto_col_range_from_samples(self, trace_auto):
+        """In auto-detect mode, geometry x_start/x_end comes from order_xranges."""
+        geom = trace_auto.to_order_geometry_set("K3")
+        for i, g in enumerate(geom.geometries):
+            assert g.x_start == int(trace_auto.order_xranges[i, 0])
+            assert g.x_end == int(trace_auto.order_xranges[i, 1])
 
     def test_filter_edge_orders_preserves_xranges(self, trace_flatinfo):
         """_filter_edge_orders carries over order_xranges into the filtered trace."""
@@ -1388,6 +1396,129 @@ class TestPerOrderSampleColumns:
         # Each order's xrange is preserved
         assert xr[0, 0] == 0
         assert xr[1, 1] == 500
+
+
+# ---------------------------------------------------------------------------
+# 15. OrderTraceSamples authoritative per-order structure
+# ---------------------------------------------------------------------------
+
+
+class TestOrderTraceSamples:
+    """FlatOrderTrace.order_samples is the authoritative per-order representation."""
+
+    @pytest.fixture()
+    def trace_auto(self, tmp_path):
+        flat = _make_synthetic_flat(seed=0)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        return trace_orders_from_flat([path])
+
+    @pytest.fixture()
+    def trace_flatinfo(self, tmp_path):
+        from types import SimpleNamespace
+        flat = _make_synthetic_flat(seed=0)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        n_orders = _SYN_N_ORDERS
+        poly_degree = 3
+        hw = float(_SYN_HALF_WIDTH)
+        edge_coeffs = np.zeros((n_orders, 2, poly_degree + 1))
+        xranges = np.zeros((n_orders, 2), dtype=int)
+        for k in range(n_orders):
+            c0 = float(_SYN_FIRST_CENTER + k * _SYN_SPACING)
+            edge_coeffs[k, 0, 0] = c0 - hw / 2.0
+            edge_coeffs[k, 1, 0] = c0 + hw / 2.0
+            xranges[k] = [10, _NCOLS - 10]
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs, xranges=xranges,
+            edge_degree=poly_degree, flat_fraction=0.85, comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.0)),
+            ybuffer=1, step=20,
+            omask=None, ycororder=None, orders=list(range(n_orders)),
+        )
+        return trace_orders_from_flat([path], flatinfo=fi)
+
+    def test_order_samples_exists(self, trace_auto):
+        assert hasattr(trace_auto, "order_samples")
+
+    def test_order_samples_length_equals_n_orders(self, trace_auto):
+        assert len(trace_auto.order_samples) == trace_auto.n_orders
+
+    def test_order_samples_1d_arrays(self, trace_auto):
+        for os_i in trace_auto.order_samples:
+            assert os_i.sample_cols.ndim == 1
+            assert os_i.center_rows.shape == os_i.sample_cols.shape
+            assert os_i.bot_rows.shape == os_i.sample_cols.shape
+            assert os_i.top_rows.shape == os_i.sample_cols.shape
+
+    def test_order_samples_xrange_fields(self, trace_auto):
+        for os_i in trace_auto.order_samples:
+            assert isinstance(os_i.x_start, int)
+            assert isinstance(os_i.x_end, int)
+            assert os_i.x_start <= os_i.x_end
+
+    def test_flatinfo_order_samples_cols_within_xrange(self, trace_flatinfo):
+        """In flatinfo mode, each order's sample_cols lie within its own xrange."""
+        for os_i in trace_flatinfo.order_samples:
+            assert os_i.sample_cols[0] >= os_i.x_start, (
+                f"Order {os_i.order_index}: sample_cols starts before x_start"
+            )
+            assert os_i.sample_cols[-1] <= os_i.x_end, (
+                f"Order {os_i.order_index}: sample_cols ends after x_end"
+            )
+
+    def test_flatinfo_orders_may_have_different_sample_counts(self, tmp_path):
+        """Orders with different xranges have different sample_cols lengths."""
+        from types import SimpleNamespace
+        flat = _make_synthetic_flat(seed=0)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        n_orders = _SYN_N_ORDERS
+        poly_degree = 3
+        hw = float(_SYN_HALF_WIDTH)
+        edge_coeffs = np.zeros((n_orders, 2, poly_degree + 1))
+        # Give orders different column widths (step=20 → different counts)
+        xranges = np.array([
+            [10, 100], [10, 200], [10, 300], [10, 400], [10, 500]
+        ], dtype=int)[:n_orders]
+        for k in range(n_orders):
+            c0 = float(_SYN_FIRST_CENTER + k * _SYN_SPACING)
+            edge_coeffs[k, 0, 0] = c0 - hw / 2.0
+            edge_coeffs[k, 1, 0] = c0 + hw / 2.0
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs, xranges=xranges,
+            edge_degree=poly_degree, flat_fraction=0.85, comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.0)),
+            ybuffer=1, step=20,
+            omask=None, ycororder=None, orders=list(range(n_orders)),
+        )
+        trace = trace_orders_from_flat([path], flatinfo=fi)
+        col_counts = [len(os_i.sample_cols) for os_i in trace.order_samples]
+        # With different xranges and step=20, orders should have different counts
+        assert len(set(col_counts)) > 1, (
+            "Expected orders with different xranges to have different sample column counts"
+        )
+
+    def test_legacy_sample_cols_populated(self, trace_auto):
+        """Legacy sample_cols field is still populated (backward compat)."""
+        assert trace_auto.sample_cols is not None
+        assert len(trace_auto.sample_cols) > 0
+
+    def test_legacy_center_rows_populated(self, trace_auto):
+        """Legacy center_rows field is still populated (backward compat)."""
+        assert trace_auto.center_rows is not None
+        assert trace_auto.center_rows.shape[0] == trace_auto.n_orders
+
+    def test_order_xranges_always_populated(self, trace_auto):
+        """order_xranges is always populated (from order_samples), even in auto-detect."""
+        assert trace_auto.order_xranges is not None
+        assert trace_auto.order_xranges.shape == (trace_auto.n_orders, 2)
+
+    def test_order_xranges_matches_order_samples(self, trace_auto):
+        """order_xranges[i] matches order_samples[i].x_start / x_end."""
+        for i, os_i in enumerate(trace_auto.order_samples):
+            assert trace_auto.order_xranges[i, 0] == os_i.x_start
+            assert trace_auto.order_xranges[i, 1] == os_i.x_end
 
 
 # ---------------------------------------------------------------------------

@@ -102,10 +102,6 @@ IDL-to-Python fidelity status
 
 **Does NOT fully match IDL:**
 
-- IDL ``mc_findorders`` uses per-order column ranges (``sranges``) as its
-  inner sweep range; this Python version uses a common column index space
-  (the union of all per-order column arrays) and gates per-order validity
-  with boolean masks, which is functionally equivalent but not identical.
 - Step-based column sampling is used when ``flatinfo.step > 0``; otherwise
   ``n_sample_cols`` evenly-spaced columns are used (no IDL equivalent for
   that fallback).
@@ -129,6 +125,7 @@ from .geometry import OrderGeometry, OrderGeometrySet
 
 __all__ = [
     "FlatOrderTrace",
+    "OrderTraceSamples",
     "OrderTraceStats",
     "trace_orders_from_flat",
     "load_and_combine_flats",
@@ -223,6 +220,44 @@ class OrderTraceStats:
 
 
 @dataclass
+class OrderTraceSamples:
+    """Per-order traced sample data — the authoritative internal representation.
+
+    This is the primary output of the per-order tracing loop in
+    :func:`trace_orders_from_flat`.  Each order has its own 1-D arrays of
+    column indices and the corresponding traced edge/centre rows, which
+    may span a different column range from other orders (matching the IDL
+    ``sranges[*,i]`` design).
+
+    Attributes
+    ----------
+    order_index : int
+        Zero-based index of this order within the :class:`FlatOrderTrace`.
+    sample_cols : ndarray, shape (n_samp,)
+        Column indices at which this order was traced.
+    center_rows : ndarray, shape (n_samp,)
+        Derived centre-row at each sampled column (mean of bot/top edges).
+        NaN where edges were not reliably detected.
+    bot_rows : ndarray, shape (n_samp,)
+        Bottom-edge row at each sampled column.  NaN where not detected.
+    top_rows : ndarray, shape (n_samp,)
+        Top-edge row at each sampled column.  NaN where not detected.
+    x_start : int
+        First column of the order's valid range (IDL ``xranges[0, i]``).
+    x_end : int
+        Last column of the order's valid range (IDL ``xranges[1, i]``).
+    """
+
+    order_index: int
+    sample_cols: np.ndarray
+    center_rows: np.ndarray
+    bot_rows: np.ndarray
+    top_rows: np.ndarray
+    x_start: int
+    x_end: int
+
+
+@dataclass
 class FlatOrderTrace:
     """Result of order-centre tracing from one or more flat-field frames.
 
@@ -230,19 +265,26 @@ class FlatOrderTrace:
     ----------
     n_orders : int
         Number of orders successfully traced.
+    order_samples : list of OrderTraceSamples
+        **Authoritative per-order traced samples.**  Each element holds the
+        traced bottom-edge, top-edge, and centre arrays for one order, on
+        that order's own column grid (IDL ``sranges[*,i]`` domain).  This
+        is the native internal representation produced by the tracing loop.
+        Length equals ``n_orders`` when populated by :func:`trace_orders_from_flat`;
+        empty list when the object is constructed directly (backward-compatibility).
     sample_cols : ndarray, shape (n_sample,)
-        Detector column indices at which cross-dispersion profiles were
-        evaluated.
+        **Legacy compatibility field.**  Union of all per-order sample column
+        sets.  Populated from ``order_samples`` after tracing for callers
+        that expect a shared column grid.  Authoritative representation is
+        ``order_samples``; do not use this for per-order geometry.
     center_rows : ndarray, shape (n_orders, n_sample)
-        Traced centre-row position at each sample column, derived from the
-        mean of bottom and top edge positions.  ``NaN`` marks columns where
-        edges were not reliably detected.
+        **Legacy compatibility field.**  Centre-row positions on the shared
+        ``sample_cols`` grid.  NaN for columns outside each order's own range.
+        Derived from ``order_samples`` after tracing.
     center_poly_coeffs : ndarray, shape (n_orders, poly_degree + 1)
         Per-order polynomial coefficients for the centre-row trajectory,
         derived as the arithmetic mean of ``bot_poly_coeffs`` and
-        ``top_poly_coeffs``.  When ``bot_poly_coeffs`` is ``None`` (object
-        constructed without edge tracking), this is fitted directly to
-        ``center_rows``.  Follows the ``numpy.polynomial.polynomial``
+        ``top_poly_coeffs``.  Follows the ``numpy.polynomial.polynomial``
         convention: ``coeffs[k]`` is the coefficient of ``col**k``.
     fit_rms : ndarray, shape (n_orders,)
         RMS of the centre polynomial residuals for each order, in pixels.
@@ -264,10 +306,8 @@ class FlatOrderTrace:
         order (IDL ``edgecoeffs[*,1,i]``).  ``None`` as above.
     order_xranges : ndarray, shape (n_orders, 2) or None
         Per-order valid column ranges ``[x_start, x_end]``, matching the
-        IDL ``xranges[*,i]`` output of ``mc_adjustguesspos``.  When
-        flatinfo mode is used this is derived from the adjusted xranges.
-        In auto-detect mode it is ``None`` (all orders share the common
-        column range).
+        IDL ``xranges[*,i]`` output of ``mc_adjustguesspos``.  Derived from
+        ``order_samples`` when populated.
     order_stats : list of OrderTraceStats
         Per-order QA metrics.  Empty if constructed directly.
     """
@@ -283,6 +323,7 @@ class FlatOrderTrace:
     bot_poly_coeffs: Optional[np.ndarray] = None
     top_poly_coeffs: Optional[np.ndarray] = None
     order_xranges: Optional[np.ndarray] = None
+    order_samples: list[OrderTraceSamples] = field(default_factory=list)
     order_stats: list[OrderTraceStats] = field(default_factory=list)
 
     def to_order_geometry_set(
@@ -521,7 +562,7 @@ def trace_orders_from_flat(
         col_lo, col_hi = int(col_range[0]), int(col_range[1])
 
     # ------------------------------------------------------------------
-    # 4. Compute guess positions and build sample columns
+    # 4. Compute guess positions and build per-order sample column arrays
     # ------------------------------------------------------------------
     if flatinfo is not None and flatinfo.edge_coeffs is not None and flatinfo.xranges is not None:
         # IDL path: adjust guess positions via cross-correlation (mc_adjustguesspos),
@@ -565,10 +606,10 @@ def trace_orders_from_flat(
         seed_profile = _extract_cross_section(flat, seed_col, col_half_width)
         seed_peaks = np.array([gp[1] for gp in guess_positions])
 
-        # Build per-order sample column arrays.
-        # IDL mc_findorders: for each order, scols = start+step-1 : stop-step+1 by step.
+        # Build per-order sample column arrays (IDL sranges[*,i]).
         step = int(getattr(flatinfo, "step", 0))
         order_sample_cols_list: list[npt.NDArray] = []
+        order_seed_indices: list[int] = []
         for i in range(n_orders):
             x0_i = max(col_lo, int(guess_xranges[i, 0]))
             x1_i = min(col_hi, int(guess_xranges[i, 1]))
@@ -580,17 +621,8 @@ def trace_orders_from_flat(
                 s_cols_i = np.round(np.linspace(x0_i, x1_i, n_sample_cols)).astype(int)
             s_cols_i = np.unique(np.clip(s_cols_i, x0_i, x1_i))
             order_sample_cols_list.append(s_cols_i)
-
-        # Shared output column array = union of all per-order sample columns.
-        # Each order is traced on its own s_cols_i array (IDL sranges approach);
-        # results are mapped back to this shared index space for the public API.
-        sample_cols = np.unique(np.concatenate(order_sample_cols_list))
-
-        # Per-order seed indices into sample_cols (used only for seed_col reporting)
-        order_seed_indices = [
-            int(np.argmin(np.abs(sample_cols - gp[0])))
-            for gp in guess_positions
-        ]
+            seed_idx_i = int(np.argmin(np.abs(s_cols_i - guess_positions[i][0])))
+            order_seed_indices.append(seed_idx_i)
 
         # Store the adjusted per-order xranges for downstream output
         traced_xranges = guess_xranges.copy()
@@ -614,13 +646,14 @@ def trace_orders_from_flat(
 
         n_orders = len(seed_peaks)
         guess_positions = None
-        order_sample_cols_list = None  # all orders use sample_cols directly
-
-        sample_cols = np.round(np.linspace(col_lo, col_hi, n_sample_cols)).astype(int)
-        sample_cols = np.unique(sample_cols)
-        seed_idx = int(np.argmin(np.abs(sample_cols - seed_col)))
-        order_seed_indices = [seed_idx] * n_orders
         traced_xranges = None
+
+        # All orders share the same column grid in fallback mode.
+        shared_cols = np.round(np.linspace(col_lo, col_hi, n_sample_cols)).astype(int)
+        shared_cols = np.unique(shared_cols)
+        seed_idx = int(np.argmin(np.abs(shared_cols - seed_col)))
+        order_sample_cols_list = [shared_cols.copy() for _ in range(n_orders)]
+        order_seed_indices = [seed_idx] * n_orders
 
         logger.info(
             "Auto-detect mode: %d order seeds at column %d: rows %s",
@@ -628,27 +661,46 @@ def trace_orders_from_flat(
         )
 
     # ------------------------------------------------------------------
-    # 5. Trace each order independently (IDL mc_findorders algorithm)
-    #    Primary tracked quantities: bottom edge and top edge at each column.
-    #    In flatinfo mode: each order uses its own per-order sample columns
-    #    (IDL sranges); results are mapped back to the shared column space.
+    # 5. Trace each order on its own per-order sample column array.
+    #    Build OrderTraceSamples — the authoritative per-order representation.
+    #    (IDL mc_findorders inner loop with per-order sranges[*,i].)
     # ------------------------------------------------------------------
-    center_rows = np.full((n_orders, len(sample_cols)), np.nan)
-    bot_rows = np.full((n_orders, len(sample_cols)), np.nan)
-    top_rows = np.full((n_orders, len(sample_cols)), np.nan)
+    sflat = _compute_sobel_magnitude(flat)
 
-    _trace_all_orders(
-        flat, sample_cols, order_seed_indices, seed_peaks,
-        center_rows, bot_rows, top_rows, poly_degree,
-        ybuffer=ybuffer,
-        intensity_fraction=intensity_fraction,
-        com_half_width=com_half_width,
-        slit_height_range=slit_height_range,
-        order_sample_cols_list=order_sample_cols_list,
-    )
+    order_samples: list[OrderTraceSamples] = []
+    for i in range(n_orders):
+        s_cols_i = order_sample_cols_list[i]
+        seed_idx_i = order_seed_indices[i]
+        y_seed_i = float(seed_peaks[i])
+
+        cen_i, bot_i, top_i = _trace_single_order(
+            flat, sflat, s_cols_i, seed_idx_i, y_seed_i, poly_degree,
+            ybuffer=ybuffer,
+            intensity_fraction=intensity_fraction,
+            com_half_width=com_half_width,
+            slit_height_range=slit_height_range,
+        )
+
+        if traced_xranges is not None:
+            x_start_i = int(traced_xranges[i, 0])
+            x_end_i = int(traced_xranges[i, 1])
+        else:
+            x_start_i = int(s_cols_i[0])
+            x_end_i = int(s_cols_i[-1])
+
+        order_samples.append(OrderTraceSamples(
+            order_index=i,
+            sample_cols=s_cols_i,
+            center_rows=cen_i,
+            bot_rows=bot_i,
+            top_rows=top_i,
+            x_start=x_start_i,
+            x_end=x_end_i,
+        ))
 
     # ------------------------------------------------------------------
-    # 6. Fit robust polynomials to bottom and top edges separately
+    # 6. Fit robust polynomials to bottom and top edges per order,
+    #    using each order's own sample column array.
     #    (IDL: mc_robustpoly1d on edges[*,0] and edges[*,1])
     # ------------------------------------------------------------------
     bot_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
@@ -656,20 +708,16 @@ def trace_orders_from_flat(
     center_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
     fit_rms = np.full(n_orders, np.nan)
 
-    for i in range(n_orders):
-        # Use only columns that were actually traced for this order (non-NaN).
-        # Since per-order tracing now operates on true per-order column arrays,
-        # columns outside the order's range are NaN in the output arrays.
-        good_bot = np.isfinite(bot_rows[i])
-        good_top = np.isfinite(top_rows[i])
-        good_cen = np.isfinite(center_rows[i])
-
+    for i, os_i in enumerate(order_samples):
+        good_bot = np.isfinite(os_i.bot_rows)
+        good_top = np.isfinite(os_i.top_rows)
+        good_cen = np.isfinite(os_i.center_rows)
         n_min = poly_degree + 1
 
         if good_bot.sum() >= n_min:
             b_coeffs, _ = _fit_poly_robust(
-                sample_cols[good_bot].astype(float),
-                bot_rows[i][good_bot],
+                os_i.sample_cols[good_bot].astype(float),
+                os_i.bot_rows[good_bot],
                 poly_degree, sigma_clip,
             )
             bot_poly_coeffs[i] = b_coeffs
@@ -682,8 +730,8 @@ def trace_orders_from_flat(
 
         if good_top.sum() >= n_min:
             t_coeffs, _ = _fit_poly_robust(
-                sample_cols[good_top].astype(float),
-                top_rows[i][good_top],
+                os_i.sample_cols[good_top].astype(float),
+                os_i.top_rows[good_top],
                 poly_degree, sigma_clip,
             )
             top_poly_coeffs[i] = t_coeffs
@@ -694,33 +742,51 @@ def trace_orders_from_flat(
             )
             top_poly_coeffs[i][:] = np.nan
 
-        # Centre polynomial = arithmetic mean of bot and top polynomials.
         center_poly_coeffs[i] = (bot_poly_coeffs[i] + top_poly_coeffs[i]) / 2.0
 
-        # RMS of centre residuals against sampled centre positions.
         if good_cen.sum() >= n_min:
             pred = np.polynomial.polynomial.polyval(
-                sample_cols[good_cen].astype(float), center_poly_coeffs[i]
+                os_i.sample_cols[good_cen].astype(float), center_poly_coeffs[i]
             )
-            fit_rms[i] = float(np.std(center_rows[i][good_cen] - pred))
+            fit_rms[i] = float(np.std(os_i.center_rows[good_cen] - pred))
 
     # ------------------------------------------------------------------
-    # 7. Estimate order half-widths
-    #    - Flatinfo mode: use edge separation (IDL slith_pix equivalent)
-    #    - Auto-detect mode: use profile-based FWHM/2 estimator
+    # 7. Estimate order half-widths from per-order edge samples
     # ------------------------------------------------------------------
     if flatinfo is not None:
+        # Use edge separation at the seed column of the first order as representative.
+        # Build temporary 2D arrays from per-order samples for the helper.
+        max_samp = max(len(os_i.sample_cols) for os_i in order_samples)
+        bot_rows_2d = np.full((n_orders, max_samp), np.nan)
+        top_rows_2d = np.full((n_orders, max_samp), np.nan)
+        for i, os_i in enumerate(order_samples):
+            n = len(os_i.sample_cols)
+            bot_rows_2d[i, :n] = os_i.bot_rows
+            top_rows_2d[i, :n] = os_i.top_rows
         half_width_rows = _estimate_half_widths_from_edges(
-            bot_rows, top_rows, order_seed_indices[0],
+            bot_rows_2d, top_rows_2d, order_seed_indices[0],
         )
     else:
         half_width_rows = _estimate_half_widths(seed_profile, seed_peaks)
 
     # ------------------------------------------------------------------
-    # 8. Compute per-order QA metrics
+    # 8. Build legacy compatibility arrays: union sample_cols + 2D center_rows
+    #    These are derived from order_samples for callers that still use the
+    #    shared-grid API.  They are NOT used internally for geometry.
+    # ------------------------------------------------------------------
+    union_cols = np.unique(np.concatenate([os_i.sample_cols for os_i in order_samples]))
+    compat_center_rows = np.full((n_orders, len(union_cols)), np.nan)
+    for i, os_i in enumerate(order_samples):
+        for j, col in enumerate(os_i.sample_cols):
+            k = int(np.searchsorted(union_cols, col))
+            if k < len(union_cols) and union_cols[k] == col:
+                compat_center_rows[i, k] = os_i.center_rows[j]
+
+    # ------------------------------------------------------------------
+    # 9. Compute per-order QA metrics
     # ------------------------------------------------------------------
     order_stats = _compute_order_trace_stats(
-        center_poly_coeffs, fit_rms, sample_cols,
+        center_poly_coeffs, fit_rms, union_cols,
     )
     _log_trace_qa_summary(order_stats)
 
@@ -730,10 +796,16 @@ def trace_orders_from_flat(
         float(np.nanmedian(fit_rms)),
     )
 
+    # Build order_xranges from order_samples (authoritative x_start/x_end)
+    traced_xranges_out = np.array(
+        [[os_i.x_start, os_i.x_end] for os_i in order_samples], dtype=int
+    )
+
     return FlatOrderTrace(
         n_orders=n_orders,
-        sample_cols=sample_cols,
-        center_rows=center_rows,
+        order_samples=order_samples,
+        sample_cols=union_cols,
+        center_rows=compat_center_rows,
         center_poly_coeffs=center_poly_coeffs,
         fit_rms=fit_rms,
         half_width_rows=half_width_rows,
@@ -741,7 +813,7 @@ def trace_orders_from_flat(
         seed_col=seed_col,
         bot_poly_coeffs=bot_poly_coeffs,
         top_poly_coeffs=top_poly_coeffs,
-        order_xranges=traced_xranges,
+        order_xranges=traced_xranges_out,
         order_stats=order_stats,
     )
 
