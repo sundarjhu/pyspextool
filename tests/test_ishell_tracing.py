@@ -1917,6 +1917,305 @@ class TestPostFitXrangeRestriction:
             )
 
 
+# ---------------------------------------------------------------------------
+# 17. _polyval_with_xrange unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestPolyvalWithXrange:
+    """Tests for the _polyval_with_xrange domain-of-validity helper.
+
+    The helper must:
+    - return finite values within [x_start, x_end]
+    - return NaN outside that interval
+    - accept the boundary points as valid
+    - fall back gracefully when there are no valid columns
+    """
+
+    def _pv(self, coeffs, x, x_start, x_end):
+        from pyspextool.instruments.ishell.tracing import _polyval_with_xrange
+        return _polyval_with_xrange(np.array(coeffs), np.array(x, dtype=float),
+                                    x_start, x_end)
+
+    def test_inside_range_is_finite(self):
+        """Columns strictly inside xrange return finite values."""
+        vals = self._pv([100.0, 0.1], [50, 100, 150], 10, 200)
+        assert np.all(np.isfinite(vals))
+
+    def test_outside_left_is_nan(self):
+        """Columns to the left of x_start return NaN."""
+        vals = self._pv([100.0, 0.1], [5, 9], 10, 200)
+        assert np.all(np.isnan(vals))
+
+    def test_outside_right_is_nan(self):
+        """Columns to the right of x_end return NaN."""
+        vals = self._pv([100.0, 0.1], [201, 300], 10, 200)
+        assert np.all(np.isnan(vals))
+
+    def test_boundary_left_is_finite(self):
+        """The x_start boundary column returns a finite value (inclusive)."""
+        vals = self._pv([100.0, 0.1], [10], 10, 200)
+        assert np.isfinite(vals[0])
+
+    def test_boundary_right_is_finite(self):
+        """The x_end boundary column returns a finite value (inclusive)."""
+        vals = self._pv([100.0, 0.1], [200], 10, 200)
+        assert np.isfinite(vals[0])
+
+    def test_mixed_in_and_out(self):
+        """Array spanning inside and outside the range: correct split."""
+        x = np.array([0.0, 10.0, 50.0, 100.0, 101.0])
+        vals = self._pv([5.0, 1.0], x, 10, 100)
+        assert np.isnan(vals[0])        # col 0, outside
+        assert np.isfinite(vals[1])     # col 10, boundary (valid)
+        assert np.isfinite(vals[2])     # col 50, inside
+        assert np.isfinite(vals[3])     # col 100, boundary (valid)
+        assert np.isnan(vals[4])        # col 101, outside
+
+    def test_correct_polynomial_value_inside(self):
+        """Values inside xrange match a direct polyval call."""
+        coeffs = np.array([3.0, 2.0, 1.0])  # 3 + 2x + x²
+        x_in = np.array([5.0, 10.0, 20.0])
+        expected = np.polynomial.polynomial.polyval(x_in, coeffs)
+        vals = self._pv(coeffs.tolist(), x_in, 0, 50)
+        np.testing.assert_array_almost_equal(vals, expected)
+
+    def test_no_valid_columns_all_nan(self):
+        """When no columns fall within [x_start, x_end], result is all NaN."""
+        vals = self._pv([100.0], [300, 400, 500], 10, 200)
+        assert np.all(np.isnan(vals))
+
+    def test_coefficients_not_modified(self):
+        """_polyval_with_xrange must not modify the input coefficients array."""
+        from pyspextool.instruments.ishell.tracing import _polyval_with_xrange
+        coeffs = np.array([1.0, 2.0, 3.0])
+        coeffs_orig = coeffs.copy()
+        _polyval_with_xrange(coeffs, np.array([0.0, 5.0, 20.0]), 5, 15)
+        np.testing.assert_array_equal(coeffs, coeffs_orig)
+
+
+# ---------------------------------------------------------------------------
+# 18. _compute_order_trace_stats xrange masking tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeOrderTraceStatsXrangeMasking:
+    """_compute_order_trace_stats must ignore extrapolated polynomial tails.
+
+    When order_xranges is supplied, stats (curvature, oscillation, inter-order
+    separation) must be based only on the valid column range.  A polynomial that
+    diverges outside its xrange must not inflate those metrics.
+
+    When order_xranges is None (backward compatibility), the full column grid
+    is used as before.
+    """
+
+    def _make_stats(self, coeffs_list, rms_list, cols, order_xranges=None):
+        from pyspextool.instruments.ishell.tracing import _compute_order_trace_stats
+        center_poly_coeffs = np.array(coeffs_list)
+        fit_rms = np.array(rms_list, dtype=float)
+        return _compute_order_trace_stats(
+            center_poly_coeffs, fit_rms, np.array(cols, dtype=float),
+            order_xranges=(np.array(order_xranges, dtype=int)
+                           if order_xranges is not None else None),
+        )
+
+    def test_diverging_tail_does_not_inflate_oscillation_when_xrange_set(self):
+        """Polynomial slope diverges outside [x_start, x_end].
+
+        With the xrange enforced, oscillation_metric must reflect only the
+        well-behaved portion; without it, the large slope variation outside
+        would inflate the metric.
+        """
+        # Cubic with a large cubic term that is almost flat in [0, 50]
+        # but explodes beyond that.
+        #  p(x) = 100 + 0.0 * x + 0.0 * x² + 0.05 * x³
+        # In [0, 50]: p'(x) = 0.15 * x²  → max at x=50, value 375.  That's
+        # large, so let's use a milder case: p'(x) = 3 * 0.001 * x²
+        # Coefficients: [100.0, 0.0, 0.0, 0.001]
+        # In [0, 50]: p'(50) = 3 * 0.001 * 2500 = 7.5
+        # In [0, 500]: p'(500) = 3 * 0.001 * 250000 = 750  ← huge
+        coeffs = [100.0, 0.0, 0.0, 0.001]
+        cols = list(range(0, 501, 10))  # 0 to 500
+
+        # Without xrange restriction: cols includes 0..500 → osc ≈ 750
+        stats_no_xr = self._make_stats([coeffs], [1.0], cols)
+        # With xrange [0, 50]: only uses cols 0..50 → osc ≈ 7.5
+        stats_xr = self._make_stats([coeffs], [1.0], cols, [[0, 50]])
+
+        assert stats_no_xr[0].oscillation_metric > stats_xr[0].oscillation_metric, (
+            "Oscillation metric with no xrange must be larger than with xrange "
+            "for a polynomial that diverges outside [0, 50]."
+        )
+
+    def test_diverging_tail_does_not_inflate_curvature_when_xrange_set(self):
+        """Curvature outside the xrange must not contaminate the metric."""
+        # p(x) = 100 + 0.002 * x²  → p''(x) = 0.004, constant.
+        # At x=200: p''(200) = 0.004 (constant for quadratic).
+        # Actually curvature is constant for a quadratic.  Use a cubic.
+        # p(x) = 100 + 0.0 * x + 0.0 * x² + 0.01 * x³
+        # p''(x) = 6 * 0.01 * x = 0.06 * x
+        # At x=10: |p''| = 0.6
+        # At x=100: |p''| = 6.0   ← curvature inflated outside [0, 10]
+        coeffs = [100.0, 0.0, 0.0, 0.01]
+        cols = list(range(0, 101, 5))
+
+        stats_no_xr = self._make_stats([coeffs], [1.0], cols)
+        stats_xr = self._make_stats([coeffs], [1.0], cols, [[0, 10]])
+
+        assert stats_no_xr[0].curvature_metric > stats_xr[0].curvature_metric, (
+            "Curvature metric with no xrange must be larger than with xrange "
+            "for a polynomial whose second derivative grows outside [0, 10]."
+        )
+
+    def test_inter_order_separation_uses_valid_range_only(self):
+        """Inter-order separation must only be measured where both orders are
+        valid.  If one order has a restricted xrange and diverges outside it,
+        the separation calculation must not use those extrapolated values."""
+        # Order 0: flat at row 100, valid over [0, 500]
+        # Order 1: flat at row 200, valid only over [0, 50]
+        #   At col 100, order 1's polynomial extrapolates to 200 (flat),
+        #   but the stats should only measure separation within [0, 50].
+        cols = list(range(0, 501, 10))
+        coeffs_0 = [100.0]  # constant at 100
+        coeffs_1 = [200.0]  # constant at 200
+        center_poly_coeffs = np.zeros((2, 4))
+        center_poly_coeffs[0, 0] = 100.0
+        center_poly_coeffs[1, 0] = 200.0
+        fit_rms = np.array([1.0, 1.0])
+
+        # With xrange restriction for order 1: [0, 50]
+        # center_vals[1] has NaN beyond col 50 → separation still 100 at valid cols
+        from pyspextool.instruments.ishell.tracing import _compute_order_trace_stats
+        stats_xr = _compute_order_trace_stats(
+            center_poly_coeffs, fit_rms, np.array(cols, dtype=float),
+            order_xranges=np.array([[0, 500], [0, 50]], dtype=int),
+        )
+        # Separation for order 1 (upper) vs order 0 (lower) should still be ~100
+        # (gap is evaluated only at cols 0..50 where both are valid).
+        assert np.isfinite(stats_xr[0].min_sep_upper), (
+            "min_sep_upper should be finite: order 0 can see order 1 at cols 0..50"
+        )
+        assert abs(stats_xr[0].min_sep_upper - 100.0) < 5.0, (
+            f"Expected ~100 px separation, got {stats_xr[0].min_sep_upper}"
+        )
+
+    def test_backward_compat_no_xrange_uses_full_grid(self):
+        """When order_xranges=None, the full column grid is used (backward compat)."""
+        coeffs = [[100.0, 0.1], [200.0, 0.1]]
+        cols = list(range(0, 201, 10))
+        stats = self._make_stats(coeffs, [1.0, 1.0], cols, order_xranges=None)
+        # Both orders' center_vals must be finite everywhere (no NaN masking).
+        from pyspextool.instruments.ishell.tracing import _compute_order_trace_stats
+        import numpy as np
+        center_poly_coeffs = np.zeros((2, 2))
+        center_poly_coeffs[0] = [100.0, 0.1]
+        center_poly_coeffs[1] = [200.0, 0.1]
+        fit_rms = np.array([1.0, 1.0])
+        cols_arr = np.arange(0, 201, 10, dtype=float)
+        stats2 = _compute_order_trace_stats(center_poly_coeffs, fit_rms, cols_arr)
+        # All metrics must be finite (no accidental NaN from xrange masking).
+        for s in stats2:
+            assert np.isfinite(s.curvature_metric), (
+                f"Order {s.order_index}: curvature_metric is NaN without xrange"
+            )
+            assert np.isfinite(s.oscillation_metric), (
+                f"Order {s.order_index}: oscillation_metric is NaN without xrange"
+            )
+
+    def test_failed_fit_rms_still_gives_nan_metrics(self):
+        """Orders with NaN fit_rms still produce NaN metrics (unchanged behavior)."""
+        coeffs = [[100.0, 0.1]]
+        stats = self._make_stats(coeffs, [np.nan], [0, 100, 200],
+                                 order_xranges=[[0, 200]])
+        assert np.isnan(stats[0].curvature_metric)
+        assert np.isnan(stats[0].oscillation_metric)
+        assert not stats[0].trace_valid
+
+
+# ---------------------------------------------------------------------------
+# 19. Compatibility arrays: no finite values outside valid xrange
+# ---------------------------------------------------------------------------
+
+
+class TestCompatArraysNoExtrapolation:
+    """compat_center_rows must never contain finite values outside an order's
+    valid xrange.
+
+    The compat arrays are built from raw traced samples (not polynomial
+    evaluation), so they should only contain finite values at columns that
+    were actually traced — which lie within the order's xrange by construction.
+    This class verifies that invariant explicitly.
+    """
+
+    @pytest.fixture()
+    def trace_flatinfo(self, tmp_path):
+        """Trace with flatinfo so orders have explicit xranges."""
+        from types import SimpleNamespace
+        flat = _make_synthetic_flat(seed=42)
+        path = str(tmp_path / "flat.fits")
+        _write_fits_flat(flat, path)
+        n_orders = _SYN_N_ORDERS
+        poly_degree = 3
+        hw = float(_SYN_HALF_WIDTH)
+        edge_coeffs = np.zeros((n_orders, 2, poly_degree + 1))
+        xranges = np.zeros((n_orders, 2), dtype=int)
+        for k in range(n_orders):
+            c0 = float(_SYN_FIRST_CENTER + k * _SYN_SPACING)
+            edge_coeffs[k, 0, 0] = c0 - hw / 2.0
+            edge_coeffs[k, 1, 0] = c0 + hw / 2.0
+            xranges[k] = [10 + k * 2, _NCOLS - 10 - k * 2]
+        fi = SimpleNamespace(
+            edge_coeffs=edge_coeffs, xranges=xranges,
+            edge_degree=poly_degree, flat_fraction=0.85, comm_window=4,
+            slit_range_pixels=(int(hw * 0.4), int(hw * 2.0)),
+            ybuffer=1, step=20,
+            omask=None, ycororder=None, orders=list(range(n_orders)),
+        )
+        return trace_orders_from_flat([path], flatinfo=fi)
+
+    def test_compat_center_rows_no_finite_outside_xrange(self, trace_flatinfo):
+        """Every finite entry in center_rows must correspond to a column within
+        the order's valid [x_start, x_end] range."""
+        trace = trace_flatinfo
+        for i in range(trace.n_orders):
+            x_start = int(trace.order_xranges[i, 0])
+            x_end = int(trace.order_xranges[i, 1])
+            for k, col in enumerate(trace.sample_cols):
+                val = trace.center_rows[i, k]
+                if np.isfinite(val):
+                    assert x_start <= col <= x_end, (
+                        f"Order {i}: center_rows[{i}, {k}] = {val:.2f} is finite "
+                        f"at col {col}, but order xrange is [{x_start}, {x_end}]"
+                    )
+
+    def test_compat_center_rows_outside_xrange_are_nan(self, trace_flatinfo):
+        """Columns outside the order's xrange must have NaN in center_rows."""
+        trace = trace_flatinfo
+        for i in range(trace.n_orders):
+            x_start = int(trace.order_xranges[i, 0])
+            x_end = int(trace.order_xranges[i, 1])
+            for k, col in enumerate(trace.sample_cols):
+                if col < x_start or col > x_end:
+                    val = trace.center_rows[i, k]
+                    assert np.isnan(val), (
+                        f"Order {i}: center_rows[{i}, {k}] = {val:.2f} is finite "
+                        f"at col {col} outside xrange [{x_start}, {x_end}] — "
+                        "extrapolated value must not appear in compat arrays"
+                    )
+
+    def test_compat_center_rows_shape_preserved(self, trace_flatinfo):
+        """center_rows shape must be (n_orders, n_sample_cols) after masking."""
+        trace = trace_flatinfo
+        assert trace.center_rows.shape == (trace.n_orders, len(trace.sample_cols))
+
+    def test_sample_cols_unchanged(self, trace_flatinfo):
+        """sample_cols (union of all per-order columns) must remain present."""
+        trace = trace_flatinfo
+        assert trace.sample_cols is not None
+        assert len(trace.sample_cols) > 0
+
+
 
 def rng_offset(k: int) -> float:
     """Small constant offset to make three flats slightly different."""

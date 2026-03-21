@@ -103,6 +103,10 @@ IDL-to-Python fidelity status
   is narrowed to only those columns where BOTH fitted edges evaluate to valid
   pixel positions (``0 < edge < nrows-1``), matching IDL's end-of-loop
   ``where(top gt 0 and top lt nrows-1 and bot gt 0 and bot lt nrows-1)`` block
+- Per-order polynomial domain enforcement: QA statistics (curvature,
+  oscillation, inter-order separation) are computed only within each order's
+  valid ``[x_start, x_end]`` range; extrapolated tails return ``NaN`` via
+  :func:`_polyval_with_xrange`
 
 **Does NOT fully match IDL:**
 
@@ -913,12 +917,16 @@ def trace_orders_from_flat(
 
     # ------------------------------------------------------------------
     # 9. Compute per-order QA metrics
-    #    _compute_order_trace_stats evaluates the fitted polynomials at the
-    #    supplied column array.  Passing union_cols is safe: it is used for
-    #    polynomial evaluation only, not for indexing raw traced arrays.
+    #    Build traced_xranges_out first so we can pass it to
+    #    _compute_order_trace_stats, which will restrict polynomial
+    #    evaluation to each order's valid column range.
     # ------------------------------------------------------------------
+    traced_xranges_out = np.array(
+        [[os_i.x_start, os_i.x_end] for os_i in order_samples], dtype=int
+    )
     order_stats = _compute_order_trace_stats(
         center_poly_coeffs, fit_rms, union_cols,
+        order_xranges=traced_xranges_out,
     )
     _log_trace_qa_summary(order_stats)
 
@@ -926,11 +934,6 @@ def trace_orders_from_flat(
         "Order tracing complete: %d orders, median RMS = %.2f px",
         n_orders,
         float(np.nanmedian(fit_rms)),
-    )
-
-    # Build order_xranges from order_samples (authoritative x_start/x_end)
-    traced_xranges_out = np.array(
-        [[os_i.x_start, os_i.x_end] for os_i in order_samples], dtype=int
     )
 
     return FlatOrderTrace(
@@ -1782,11 +1785,48 @@ def _estimate_half_widths(
     return half_widths
 
 
+def _polyval_with_xrange(
+    coeffs: npt.NDArray,
+    x: npt.NDArray,
+    x_start: int,
+    x_end: int,
+) -> npt.NDArray:
+    """Evaluate a polynomial, returning NaN outside ``[x_start, x_end]``.
+
+    Polynomials are only physically meaningful within the detector region
+    where edge samples were actually collected.  This helper enforces that
+    constraint so that extrapolated tails never contaminate QA stats or
+    compatibility arrays.
+
+    Parameters
+    ----------
+    coeffs : ndarray, shape (degree + 1,)
+        Polynomial coefficients in ``numpy.polynomial.polynomial`` convention.
+    x : ndarray, shape (n,)
+        Column values at which to evaluate.
+    x_start : int
+        First valid column (inclusive).
+    x_end : int
+        Last valid column (inclusive).
+
+    Returns
+    -------
+    ndarray, shape (n,)
+        Polynomial values where ``x_start <= x <= x_end``; ``NaN`` elsewhere.
+    """
+    result = np.full(len(x), np.nan)
+    valid = (x >= x_start) & (x <= x_end)
+    if np.any(valid):
+        result[valid] = np.polynomial.polynomial.polyval(x[valid], coeffs)
+    return result
+
+
 def _compute_order_trace_stats(
     center_poly_coeffs: npt.NDArray,
     fit_rms: npt.NDArray,
     sample_cols: npt.NDArray,
     *,
+    order_xranges: npt.NDArray | None = None,
     rms_threshold: float = _RMS_THRESHOLD,
     curvature_threshold: float = _CURVATURE_THRESHOLD,
     separation_threshold: float = _SEPARATION_THRESHOLD,
@@ -1803,6 +1843,13 @@ def _compute_order_trace_stats(
         RMS of polynomial residuals per order.  ``NaN`` marks failed fits.
     sample_cols : ndarray, shape (n_sample,)
         Detector column indices at which the polynomial is evaluated.
+    order_xranges : ndarray, shape (n_orders, 2), optional
+        Per-order valid column ranges ``[x_start, x_end]``.  When supplied,
+        polynomial evaluation is restricted to columns inside each order's
+        valid range via :func:`_polyval_with_xrange` — extrapolated tails
+        outside that range contribute ``NaN`` and do not corrupt metrics.
+        When ``None``, the full ``sample_cols`` grid is used for every order
+        (backward-compatible behaviour).
     rms_threshold : float, default ``_RMS_THRESHOLD``
         Maximum acceptable RMS residual in pixels.
     curvature_threshold : float, default ``_CURVATURE_THRESHOLD``
@@ -1830,16 +1877,24 @@ def _compute_order_trace_stats(
     )
 
     # Pre-compute centre-row positions at all sample columns.
-    # Use NaN rows where the polynomial fit failed so they do not
-    # corrupt inter-order separation calculations.
+    # When order_xranges is supplied, evaluate only within [x_start, x_end]
+    # for each order — extrapolated tails return NaN and do not corrupt
+    # inter-order separation calculations.
+    # When order_xranges is None (backward compat), use the full column grid.
     # NOTE: the only operation on `cols` throughout this function is
     # ``polyval(cols, coeffs)`` — no indexing into raw traced arrays occurs.
     center_vals = np.full((n_orders, len(cols)), np.nan)
     for i in range(n_orders):
         if np.isfinite(fit_rms[i]):
-            center_vals[i] = np.polynomial.polynomial.polyval(
-                cols, center_poly_coeffs[i]
-            )
+            if order_xranges is not None:
+                center_vals[i] = _polyval_with_xrange(
+                    center_poly_coeffs[i], cols,
+                    int(order_xranges[i, 0]), int(order_xranges[i, 1]),
+                )
+            else:
+                center_vals[i] = np.polynomial.polynomial.polyval(
+                    cols, center_poly_coeffs[i]
+                )
 
     stats_list: list[OrderTraceStats] = []
 
@@ -1848,37 +1903,46 @@ def _compute_order_trace_stats(
         rms = float(fit_rms[i])
         fit_ok = np.isfinite(rms)
 
+        # Per-order valid column sub-array: restrict metrics to the valid range.
+        if order_xranges is not None:
+            x_start_i = int(order_xranges[i, 0])
+            x_end_i = int(order_xranges[i, 1])
+            valid_col_mask = (cols >= x_start_i) & (cols <= x_end_i)
+            cols_i = cols[valid_col_mask]
+        else:
+            cols_i = cols
+
         # ------------------------------------------------------------------
-        # 1. Curvature metric: max |d²y/dx²| evaluated at sample columns.
+        # 1. Curvature metric: max |d²y/dx²| evaluated at valid sample columns.
         #    Uses numpy.polynomial.polynomial.polyder to differentiate.
         # ------------------------------------------------------------------
         if not fit_ok:
             curvature_metric = np.nan
         else:
             d2_coeffs = np.polynomial.polynomial.polyder(coeffs, 2)
-            if d2_coeffs.size == 0:
+            if d2_coeffs.size == 0 or len(cols_i) == 0:
                 curvature_metric = 0.0
             else:
                 d2_vals = np.abs(
-                    np.polynomial.polynomial.polyval(cols, d2_coeffs)
+                    np.polynomial.polynomial.polyval(cols_i, d2_coeffs)
                 )
                 curvature_metric = float(np.max(d2_vals))
 
         # ------------------------------------------------------------------
         # 2. Oscillation metric: peak-to-peak variation in the first
-        #    derivative (slope) across the sample columns.  A straight trace
-        #    gives 0; oscillatory or pathologically curved polynomials give
-        #    large values.  This replaces the previous boolean monotonicity
+        #    derivative (slope) across the valid sample columns.  A straight
+        #    trace gives 0; oscillatory or pathologically curved polynomials
+        #    give large values.  This replaces the previous boolean monotonicity
         #    test, which incorrectly flagged even gently curved traces.
         # ------------------------------------------------------------------
         if not fit_ok:
             oscillation_metric = np.nan
         else:
             d1_coeffs = np.polynomial.polynomial.polyder(coeffs, 1)
-            if d1_coeffs.size == 0:
+            if d1_coeffs.size == 0 or len(cols_i) == 0:
                 oscillation_metric = 0.0
             else:
-                d1_vals = np.polynomial.polynomial.polyval(cols, d1_coeffs)
+                d1_vals = np.polynomial.polynomial.polyval(cols_i, d1_coeffs)
                 oscillation_metric = float(np.max(d1_vals) - np.min(d1_vals))
 
         # ------------------------------------------------------------------
