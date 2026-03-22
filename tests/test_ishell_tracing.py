@@ -5539,93 +5539,100 @@ class TestMCFindordersDriftAudit:
             "(not _fit_poly_robust directly) so the alias is used"
         )
 
-    # ── IDL NaN invariant enforcement ─────────────────────────────────────────
+    # ── IDL branch semantics: goto cont1/cont2 vs fallback else-branch ───────
 
-    def test_defensive_nan_mask_overwrites_invalid_centers(self, tmp_path):
-        """The defensive NaN mask in trace_orders_from_flat must overwrite any
-        finite center value at columns where either edge is NaN.
+    def test_goto_cont1_right_sweep_cen_stays_nan(self):
+        """Right sweep: goto cont2 path leaves center NaN (not assigned).
 
-        This verifies that the invariant is enforced defensively and not just
-        trusted to the internal tracing logic.  The mock deliberately injects
-        NaN into one edge sample AND sets center to a finite (wrong) value at
-        the same column; the defensive mask must overwrite it with NaN.
-
-        This test fails if center is ever filled independently of the edges.
+        When both flags are active, both COMs are finite, but slit-height
+        check fails, the right-sweep takes the goto cont2 path and must NOT
+        assign center.  Outside the seed window, center was NaN before the
+        sweep; it must remain NaN after.
         """
-        from pyspextool.instruments.ishell import tracing as _m
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_order_right,
+            _compute_sobel_image,
+        )
 
-        original_fn = _m._trace_single_order_idlstyle
-        injection_log = []  # record (order_call, col_idx) for each injection
-
-        def patched_fn(*args, **kwargs):
-            result = original_fn(*args, **kwargs)
-            # Inject NaN into bottom_edge_samples at the first finite column
-            # in [n//4, n//2), and simultaneously set center to 999.0 (finite,
-            # incorrect) so the defensive mask MUST overwrite it with NaN.
-            n = len(result.bottom_edge_samples)
-            if n > 4:
-                for idx in range(n // 4, n // 2):
-                    if np.isfinite(result.bottom_edge_samples[idx]):
-                        result.bottom_edge_samples[idx] = np.nan
-                        result.center_samples[idx] = 999.0
-                        injection_log.append(idx)
-                        break
-            return result
-
-        flat = _make_synthetic_flat(seed=201)
+        flat, _, _ = _make_single_order_flat(c0=128.0, hw=14.0, tilt=0.0, noise=0.0, seed=108)
         nrows, ncols = flat.shape
-        path = str(tmp_path / "nan_test_flat.fits")
-        _write_fits_flat(flat.astype(np.float32), path)
+        sobel = _compute_sobel_image(flat)
+        sample_cols = np.unique(np.round(np.linspace(20, ncols - 20, 14)).astype(int))
+        n_samp = len(sample_cols)
+        gidx = n_samp // 2
 
-        import unittest.mock as mock
+        cen = np.full(n_samp, np.nan)
+        seed_lo = max(0, gidx - 2)
+        seed_hi = min(n_samp - 1, gidx + 2)
+        cen[seed_lo: seed_hi + 1] = 128.0
+        bot = np.full(n_samp, np.nan)
+        top_arr = np.full(n_samp, np.nan)
 
-        with mock.patch.object(_m, "_trace_single_order_idlstyle", patched_fn):
-            trace = _m.trace_orders_from_flat(
-                [path],
-                guess_rows=_SYN_GUESS_ROWS,
-                n_sample_cols=15,
-                poly_degree=2,
-            )
-
-        # Confirm the mock actually fired — if it didn't, the test proves nothing.
-        assert len(injection_log) > 0, (
-            "Mock did not inject any NaN edges — test setup error: "
-            "no finite bottom edge was found in the expected index range"
+        # slit_height_max=5 << actual slit ~28px → goto cont2 for finite-edge cols
+        _trace_order_right(
+            flat, sobel, sample_cols, cen, bot, top_arr,
+            gidx, nrows, bufpix=2, poly_degree=2, frac=0.7,
+            com_half_width=4, slit_height_min=0.0, slit_height_max=5.0,
         )
 
-        # For each order, verify the IDL invariant:
-        # center_rows NaN ↔ (bot_rows NaN OR top_rows NaN)
-        for os_i in trace.order_samples:
-            invalid = ~np.isfinite(os_i.bot_rows) | ~np.isfinite(os_i.top_rows)
-            cen_nan = ~np.isfinite(os_i.center_rows)
-            assert np.all(invalid == cen_nan), (
-                "IDL NaN invariant violated: center_rows must be NaN wherever "
-                "either edge is invalid.  Found mismatch at columns: "
-                f"{os_i.sample_cols[invalid != cen_nan].tolist()}"
+        # Columns to the RIGHT of the seed window were NaN before the sweep.
+        # Under goto-cont2 they must stay NaN (center not assigned).
+        for k in range(seed_hi + 1, n_samp):
+            assert np.isnan(cen[k]), (
+                f"goto cont2: col index {k} (col {sample_cols[k]}) right of seed "
+                f"window [{seed_lo},{seed_hi}]; cen was NaN before sweep, must "
+                f"remain NaN on goto-cont2, got {cen[k]:.3f}"
             )
 
-    def test_center_nan_invariant_without_mock(self, tmp_path):
-        """On a real synthetic flat, the IDL NaN invariant must hold without
-        any mocking — the defensive mask in trace_orders_from_flat must be
-        sufficient even if internal tracing produces a center at a column
-        where an edge is missing.
+    def test_else_branch_sets_center_to_y_guess_when_edge_fails(self):
+        """Fallback else-branch: when threshold edge detection fails (COMs are
+        NaN), center is set to y_guess_f (the polynomial-predicted centre).
 
-        This is a self-consistency check: centre is valid IFF both edges are valid.
+        Edges remain NaN but center is finite — proving the else-branch does
+        NOT enforce center=NaN and no global post-hoc mask touches it.
+
+        This test uses a uniform flat so _find_threshold_edge_guesses always
+        returns None (no below-threshold pixels), making both COMs NaN and
+        triggering the else-branch for every column outside the seed window.
         """
-        flat = _make_synthetic_flat(seed=202)
-        path = str(tmp_path / "inv_flat.fits")
-        _write_fits_flat(flat, path)
-        trace = trace_orders_from_flat(
-            [path], n_sample_cols=15, poly_degree=2, guess_rows=_SYN_GUESS_ROWS
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_order_left,
+            _compute_sobel_image,
         )
 
-        for i, os_i in enumerate(trace.order_samples):
-            invalid = ~np.isfinite(os_i.bot_rows) | ~np.isfinite(os_i.top_rows)
-            cen_nan = ~np.isfinite(os_i.center_rows)
-            assert np.all(invalid == cen_nan), (
-                f"Order {i}: IDL NaN invariant violated — center_rows is finite "
-                "at a column where one or both edges are NaN.  "
-                f"Mismatch at columns: {os_i.sample_cols[invalid != cen_nan].tolist()}"
+        # Uniform flat: every column profile is constant → threshold detection
+        # always fails → COM = NaN → else-branch fires → center = y_guess_f.
+        nrows, ncols = 256, 256
+        flat = np.ones((nrows, ncols), dtype=float) * 1000.0
+        sobel = _compute_sobel_image(flat)
+        sample_cols = np.unique(np.round(np.linspace(20, ncols - 20, 14)).astype(int))
+        n_samp = len(sample_cols)
+        gidx = n_samp // 2
+
+        cen = np.full(n_samp, np.nan)
+        seed_lo = max(0, gidx - 2)
+        seed_hi = min(n_samp - 1, gidx + 2)
+        cen[seed_lo: seed_hi + 1] = 128.0
+        bot = np.full(n_samp, np.nan)
+        top_arr = np.full(n_samp, np.nan)
+
+        _trace_order_left(
+            flat, sobel, sample_cols, cen, bot, top_arr,
+            gidx, nrows, bufpix=2, poly_degree=2, frac=0.7,
+            com_half_width=4, slit_height_min=0.0, slit_height_max=500.0,
+        )
+
+        # Outside seed window AND to the left of gidx, edges must be NaN
+        # but center must be finite (the y_guess_f fallback was assigned).
+        for k in range(0, seed_lo):
+            assert np.isnan(bot[k]) and np.isnan(top_arr[k]), (
+                f"else-branch: edges at col index {k} should be NaN (detection "
+                f"failed), got bot={bot[k]}, top={top_arr[k]}"
+            )
+            assert np.isfinite(cen[k]), (
+                f"else-branch: center at col index {k} should be finite "
+                f"(y_guess_f fallback), got cen={cen[k]}.  "
+                "A global NaN mask would incorrectly erase this."
             )
 
     # ── tabinv vs interp: verified equivalent ─────────────────────────────────

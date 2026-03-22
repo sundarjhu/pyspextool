@@ -109,10 +109,16 @@ IDL-to-Python fidelity status
   oscillation, inter-order separation) are computed only within each order's
   valid ``[x_start, x_end]`` range; extrapolated tails return ``NaN`` via
   :func:`_polyval_with_xrange`
-- Center samples are enforced to be NaN wherever either edge is invalid,
-  matching IDL ``goto cont1``/``goto cont2`` semantics exactly.  This
-  invariant is applied defensively in :func:`trace_orders_from_flat` after
-  per-order tracing completes.
+- Three-branch per-column centre semantics matching IDL:
+
+  1. *Accepted edge pair* — both flags active, both COMs finite, slit-height
+     passes: ``center = (com_bot + com_top) / 2``.
+  2. *goto cont1/cont2* — both flags active, both COMs finite, but
+     slit-height check fails: edges set to NaN; centre is **not assigned**
+     (stays at its initialised value, typically NaN outside the seed window).
+  3. *Fallback else-branch* — not both flags active, or at least one COM is
+     NaN: edges set to NaN; ``center = y_guess_f`` (the polynomial-predicted
+     centre at that column).
 
 **Does NOT fully match IDL (known approximation):**
 
@@ -760,27 +766,6 @@ def trace_orders_from_flat(
             poly_degree, nrows, ybuffer,
             intensity_fraction, com_half_width,
             slith_min, slith_max,
-        )
-
-        # IDL NaN-semantics enforcement: center must be NaN wherever either
-        # edge is invalid.  This mirrors IDL goto cont1/cont2 which skips
-        # the cen[k] assignment entirely on any non-accept path.
-        # This defensive mask is applied unconditionally — it ensures the
-        # invariant holds even if internal tracing logic produces a finite
-        # center at a column where one edge is missing (e.g. due to the
-        # else-branch fallback writing y_guess_f after a single-side failure).
-        invalid_mask = (
-            ~np.isfinite(result_i.bottom_edge_samples)
-            | ~np.isfinite(result_i.top_edge_samples)
-        )
-        result_i.center_samples[invalid_mask] = np.nan
-        assert np.all(
-            ~np.isfinite(result_i.center_samples)
-            == (~np.isfinite(result_i.bottom_edge_samples)
-                | ~np.isfinite(result_i.top_edge_samples))
-        ), (
-            "Center samples must be NaN wherever either edge is invalid "
-            "(IDL goto cont1/cont2 invariant)"
         )
 
         order_samples.append(OrderTraceSamples(
