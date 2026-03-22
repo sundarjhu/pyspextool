@@ -3781,6 +3781,25 @@ class TestIDLHelperFunctions:
         r2 = _compute_sobel_image(img * 2.0)
         np.testing.assert_allclose(r1, r2, rtol=1e-5)
 
+    def test_sobel_normalisation_matches_idl_formula(self):
+        """_compute_sobel_image applies IDL's rimage = sobel(image*1000./max(image)).
+
+        Directly verify that the function is equivalent to explicitly computing
+        ``scipy.ndimage.sobel`` on ``image * 1000.0 / max(image)``, matching
+        ``mc_findorders.pro`` line: ``rimage = sobel(image*1000./max(image))``.
+        """
+        from scipy.ndimage import sobel as _scipy_sobel
+        from pyspextool.instruments.ishell.tracing import _compute_sobel_image
+
+        rng = np.random.default_rng(99)
+        img = rng.uniform(50, 500, size=(32, 32)).astype(np.float64)
+        scaled = img * (1000.0 / img.max())
+        s0 = _scipy_sobel(scaled, axis=0)
+        s1 = _scipy_sobel(scaled, axis=1)
+        expected = np.sqrt(s0 ** 2 + s1 ** 2)
+
+        result = _compute_sobel_image(img)
+        np.testing.assert_allclose(result, expected, rtol=1e-12)
     # ── Block B: _build_sample_cols ─────────────────────────────────────────
 
     def test_build_sample_cols_basic(self):

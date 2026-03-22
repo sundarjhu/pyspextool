@@ -1310,7 +1310,7 @@ def _mc_robustpoly1d(
     yy = y[good]
 
     def _solve(xg: npt.NDArray, yg: npt.NDArray) -> npt.NDArray:
-        """Unweighted normal equations via np.linalg.solve (equivalent to GAUSSJ)."""
+        """Solve unweighted normal equations for polynomial coefficients."""
         A = np.vander(xg, N=degree + 1, increasing=True)
         return np.linalg.solve(A.T @ A, A.T @ yg)
 
@@ -1716,9 +1716,11 @@ def _compute_sobel_image(image: npt.NDArray) -> npt.NDArray:
     IDL block (mc_findorders.pro, line 158):
         rimage = sobel(image*1000./max(image))
 
-    The factor of 1000 and the division by max(image) are kept explicit to
-    match the IDL semantics.  The actual COM step uses relative weights so the
-    absolute scale is cosmetic, but correctness requires the normalisation.
+    The factor of 1000 and the division by ``max(image)`` are kept explicit to
+    match the IDL semantics exactly.  Normalising by the image maximum makes
+    the Sobel response scale-invariant across flats with different exposure
+    levels; the COM step is unaffected by the absolute scale factor (1000) but
+    including it preserves full numerical fidelity with the IDL call site.
 
     Parameters
     ----------
