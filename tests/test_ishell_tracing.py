@@ -6,7 +6,7 @@ These tests verify:
   - load_and_combine_flats() raises on empty input and returns the
     correct shape for one or multiple synthetic FITS files,
   - trace_orders_from_flat() raises on empty file list and on profiles
-    with no detectable peaks,
+    with insufficient signal for edge detection,
   - trace_orders_from_flat() works end-to-end on a synthetic flat image
     with known order structure,
   - the polynomial fit residuals are within expected bounds on synthetic data,
@@ -88,7 +88,6 @@ _SYN_HALF_WIDTH = 10      # half-width in rows
 _SYN_TILT = 0.01          # pixels per column
 
 # Known centre-row guess positions for the synthetic flat (at col 0 / seed column).
-# These replace the old auto-detect (find_peaks) initialisation.
 # IDL mc_findorders always receives guesspos from mc_adjustguesspos; here we
 # hard-code the known positions for the synthetic test data.
 _SYN_GUESS_ROWS: list[float] = [
@@ -3040,8 +3039,8 @@ class TestIDLPortFidelity:
     """Verify the six IDL mc_findorders.pro fidelity requirements.
 
     Problem-statement requirement 1:
-        The tracing core no longer depends on peak-finding / peak-matching
-        helpers (IDL mc_findorders does not use find_peaks anywhere).
+        The tracing core uses edge detection (flux-threshold + Sobel COM) as
+        in IDL mc_findorders; no peak-finding helpers are present or needed.
 
     Problem-statement requirement 2:
         Edge tracing is primary; centre values are derived from traced edges

@@ -1412,7 +1412,7 @@ def _compute_order_trace_stats(
         # 3. Inter-order separation: absolute gap to each adjacent neighbour.
         #    Reports lower and upper neighbours separately, and flags any
         #    crossing explicitly.  Uses nanmin so that isolated NaN columns
-        #    (missed peaks in center_vals) do not discard an entire neighbour.
+        #    (missing centre values in center_vals) do not discard an entire neighbour.
         # ------------------------------------------------------------------
         if n_orders <= 1 or not fit_ok:
             min_sep_lower = np.nan
