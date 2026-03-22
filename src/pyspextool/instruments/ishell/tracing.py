@@ -125,7 +125,8 @@ IDL-to-Python fidelity status
   equations solved by ``numpy.linalg.solve`` (numerically equivalent to
   Gauss-Jordan for well-conditioned systems), up to 9 repeat-loop iterations
   matching IDL's ``endrep until ittr eq 10``, and identical sigma-clipping
-  logic (population std, mean-centred residuals).
+  logic (sample std ddof=1 via IDL ``MOMENT()`` in IDL 8.1+, mean-centred
+  residuals).
 
 **Does NOT fully match IDL:**
 
@@ -185,6 +186,11 @@ class OrderTraceStats:
     order-centre polynomial **before** any orders are rejected.  They are
     stored in :attr:`FlatOrderTrace.order_stats` and printed as a concise
     summary log after tracing completes.
+
+    **Python-only QA diagnostic**: none of these metrics have a direct IDL
+    equivalent in ``mc_findorders.pro`` or its callers.  They exist solely to
+    support Python-side quality checks and are not used for any IDL-equivalent
+    computation.
 
     Attributes
     ----------
@@ -333,6 +339,9 @@ class FlatOrderTrace:
         convention: ``coeffs[k]`` is the coefficient of ``col**k``.
     fit_rms : ndarray, shape (n_orders,)
         RMS of the centre polynomial residuals for each order, in pixels.
+        **Python-only QA diagnostic** — no direct IDL equivalent.  Computed
+        as ``np.std(centre_samples - polyval(cols, centre_coeffs), ddof=1)``
+        on valid (finite) centre samples after tracing.
     half_width_rows : ndarray, shape (n_orders,)
         Estimated half-width of each order in pixels, derived from the mean
         bottom-to-top edge separation at the guess/seed column.
@@ -789,7 +798,7 @@ def trace_orders_from_flat(
             pred = np.polynomial.polynomial.polyval(
                 s_cols_i[cen_valid].astype(float), result_i.center_coeffs,
             )
-            fit_rms[i] = float(np.std(result_i.center_samples[cen_valid] - pred))
+            fit_rms[i] = float(np.std(result_i.center_samples[cen_valid] - pred, ddof=1))
 
     # ------------------------------------------------------------------
     # 5a. Validate order_samples — internal consistency invariants.
@@ -1234,7 +1243,7 @@ def _fit_poly_robust(
     good = r["goodbad"] == 1
     if good.sum() > 0:
         predicted = np.polynomial.polynomial.polyval(cols[good], coeffs)
-        rms = float(np.std(rows[good] - predicted))
+        rms = float(np.std(rows[good] - predicted, ddof=1))
     else:
         rms = np.nan
     return coeffs, rms
@@ -1264,7 +1273,9 @@ def _mc_robustpoly1d(
 
     1. Build unweighted normal equations via the Vandermonde design matrix.
     2. Solve with ``numpy.linalg.solve``.
-    3. Compute residuals on initial-good points; get mean and population std (ddof=0).
+    3. Compute residuals on initial-good points; get mean and sample std (ddof=1,
+       matching IDL ``mc_moments`` which calls ``MOMENT()`` — in IDL 8.1+ ``MOMENT``
+       uses the N-1 denominator).
     4. If no outliers found on the first pass, return immediately (IDL
        ``goto cont1``).
     5. Iterate (IDL ``endrep until ittr eq 10`` starting from ``ittr=1`` and
@@ -1295,7 +1306,7 @@ def _mc_robustpoly1d(
         Polynomial coefficients in ``numpy.polynomial.polynomial``
         (increasing-power) convention.
     rms : float
-        Population-std RMS (ddof=0, matching IDL ``mc_robustpoly1d``) of
+        Sample-std RMS (ddof=1, matching IDL ``mc_robustpoly1d`` / ``mc_polyfit1d``) of
         fit residuals on the accepted (good) points.
     """
     x = np.asarray(cols, dtype=float)
@@ -1319,10 +1330,10 @@ def _mc_robustpoly1d(
     coeffs = _solve(xx, yy)
     residual = yy - np.polynomial.polynomial.polyval(xx, coeffs)
     mean = float(np.mean(residual))
-    # NOTE: Use ddof=0 (population standard deviation) to match IDL mc_robustpoly1d.
-    # Although this is a biased estimator, IDL uses population std in its MOMENT-based
-    # sigma calculation, and we must reproduce that behavior exactly for fidelity.
-    stddev = float(np.std(residual, ddof=0))
+    # NOTE: Use ddof=1 (sample standard deviation) to match IDL mc_robustpoly1d.
+    # IDL mc_moments calls MOMENT() which in IDL 8.1+ computes variance with the
+    # N-1 denominator (Bessel's correction), making stddev the sample std (ddof=1).
+    stddev = float(np.std(residual, ddof=1))
 
     if stddev == 0.0:
         return coeffs, 0.0
@@ -1344,10 +1355,10 @@ def _mc_robustpoly1d(
 
         residual_cur = yy[z_good] - np.polynomial.polynomial.polyval(xx[z_good], coeffs)
         mean = float(np.mean(residual_cur))
-        # NOTE: Use ddof=0 (population standard deviation) to match IDL mc_robustpoly1d.
-        # Although this is a biased estimator, IDL uses population std in its MOMENT-based
-        # sigma calculation, and we must reproduce that behavior exactly for fidelity.
-        stddev = float(np.std(residual_cur, ddof=0))
+        # NOTE: Use ddof=1 (sample standard deviation) to match IDL mc_robustpoly1d.
+        # IDL mc_moments calls MOMENT() which in IDL 8.1+ computes variance with the
+        # N-1 denominator (Bessel's correction), making stddev the sample std (ddof=1).
+        stddev = float(np.std(residual_cur, ddof=1))
 
         if stddev == 0.0:
             break
@@ -1363,10 +1374,10 @@ def _mc_robustpoly1d(
             break
 
     # Final RMS on accepted subset.
-    # NOTE: Use ddof=0 (population standard deviation) to match IDL mc_robustpoly1d.
-    # Although this is a biased estimator, IDL uses population std in its MOMENT-based
-    # sigma calculation, and we must reproduce that behavior exactly for fidelity.
-    rms = float(np.std(yy[z_good] - np.polynomial.polynomial.polyval(xx[z_good], coeffs), ddof=0))
+    # NOTE: Use ddof=1 (sample standard deviation) to match IDL mc_robustpoly1d.
+    # IDL mc_polyfit1d uses stddev() (N-1 denominator) for its RMS keyword output,
+    # and mc_moments uses MOMENT() (N-1 in IDL 8.1+) for sigma during rejection.
+    rms = float(np.std(yy[z_good] - np.polynomial.polynomial.polyval(xx[z_good], coeffs), ddof=1))
     return coeffs, rms
 
 
