@@ -120,19 +120,20 @@ IDL-to-Python fidelity status
      NaN: edges set to NaN; ``center = y_guess_f`` (the polynomial-predicted
      centre at that column).
 
-**Does NOT fully match IDL (known approximation):**
+- Final edge polynomial fitting via :func:`_mc_robustpoly1d`, a direct Python
+  port of IDL ``mc_robustpoly1d(..., 3, 0.01, /GAUSSJ)``: unweighted normal
+  equations solved by ``numpy.linalg.solve`` (numerically equivalent to
+  Gauss-Jordan for well-conditioned systems), up to 9 repeat-loop iterations
+  matching IDL's ``endrep until ittr eq 10``, and identical sigma-clipping
+  logic (population std, mean-centred residuals).
+
+**Does NOT fully match IDL:**
 
 - Step-based column sampling is used when ``flatinfo.step > 0``; otherwise
   ``n_sample_cols`` evenly-spaced columns are used (no IDL equivalent for
   that fallback).
 - When neither ``flatinfo`` nor explicit ``guess_rows`` are provided, a
   ``ValueError`` is raised; IDL always requires external ``guesspos``.
-- The robust polynomial fitter (see :data:`_ROBUST_FIT_FUNCTION`) uses
-  iterative sigma-clipping rather than IDL's Gauss-Jordan solver
-  (``mc_robustpoly1d /GAUSSJ``).  Parameters are aligned (thresh=3,
-  eps=0.01); the difference affects outlier-rejection trajectory, not the
-  final polynomial form.  **This is the only remaining algorithmic
-  approximation.**
 """
 
 from __future__ import annotations
@@ -1239,13 +1240,140 @@ def _fit_poly_robust(
     return coeffs, rms
 
 
-# NOTE: This is the only remaining approximation relative to IDL
-# (mc_robustpoly1d /GAUSSJ): the solver method uses iterative sigma-clipping
-# rather than Gauss-Jordan elimination.  The robust rejection parameters are
-# aligned (thresh=3, eps=0.01) so the difference is in solver trajectory only,
-# not the final polynomial form for well-behaved data.  This alias allows
-# swapping in a more faithful implementation later without touching tracing logic.
-_ROBUST_FIT_FUNCTION = _fit_poly_robust
+def _mc_robustpoly1d(
+    cols: npt.NDArray,
+    rows: npt.NDArray,
+    degree: int,
+    thresh: float = 3.0,
+    eps: float = 0.01,
+) -> tuple[npt.NDArray, float]:
+    """IDL-equivalent robust polynomial fit (``mc_robustpoly1d /GAUSSJ`` port).
+
+    Directly mirrors ``mc_robustpoly1d`` called with ``/GAUSSJ`` in
+    ``mc_findorders.pro``::
+
+        coeff = mc_robustpoly1d(scols, edges[*,j], degree, 3, 0.01,
+                                OGOODBAD=goodbad, /SILENT, /GAUSSJ,
+                                CANCEL=cancel)
+
+    ``/GAUSSJ`` selects Gauss-Jordan elimination to solve the normal
+    equations.  ``numpy.linalg.solve`` (LU with partial pivoting) is
+    numerically equivalent for these well-conditioned polynomial systems.
+
+    Algorithm (matching IDL ``mc_robustpoly1d``):
+
+    1. Build unweighted normal equations via the Vandermonde design matrix.
+    2. Solve with ``numpy.linalg.solve``.
+    3. Compute residuals on initial-good points; get mean and population std (ddof=0).
+    4. If no outliers found on the first pass, return immediately (IDL
+       ``goto cont1``).
+    5. Iterate (IDL ``endrep until ittr eq 10`` starting from ``ittr=1`` and
+       incrementing at the top of the loop → up to 9 repeat iterations):
+
+       - Re-fit on the current accepted subset.
+       - Check convergence: ``(sig_old - sig) / sig_old < eps``.
+       - Reject new outliers from the full initial-good set.
+
+    6. Return ``(coeffs, rms)``.
+
+    Parameters
+    ----------
+    cols : ndarray
+        Column coordinates (x values).
+    rows : ndarray
+        Edge row positions (y values); non-finite values are treated as bad.
+    degree : int
+        Polynomial degree (IDL ``order``).
+    thresh : float, default 3.0
+        Sigma rejection threshold (IDL ``thresh=3``).
+    eps : float, default 0.01
+        Fractional-sigma convergence limit (IDL ``eps=0.01``).
+
+    Returns
+    -------
+    coeffs : ndarray, shape (degree + 1,)
+        Polynomial coefficients in ``numpy.polynomial.polynomial``
+        (increasing-power) convention.
+    rms : float
+        Population-std RMS (ddof=0, matching IDL ``mc_robustpoly1d``) of
+        fit residuals on the accepted (good) points.
+    """
+    x = np.asarray(cols, dtype=float)
+    y = np.asarray(rows, dtype=float)
+
+    # Mask non-finite inputs (IDL: ogoodbad[nan] = 2).
+    good = np.isfinite(x) & np.isfinite(y)
+    count_initgood = int(good.sum())
+    if count_initgood < degree + 1:
+        return np.zeros(degree + 1), np.nan
+
+    xx = x[good]
+    yy = y[good]
+
+    def _solve(xg: npt.NDArray, yg: npt.NDArray) -> npt.NDArray:
+        """Solve unweighted normal equations for polynomial coefficients."""
+        A = np.vander(xg, N=degree + 1, increasing=True)
+        return np.linalg.solve(A.T @ A, A.T @ yg)
+
+    # Initial fit on all initial-good points.
+    coeffs = _solve(xx, yy)
+    residual = yy - np.polynomial.polynomial.polyval(xx, coeffs)
+    mean = float(np.mean(residual))
+    # NOTE: Use ddof=0 (population standard deviation) to match IDL mc_robustpoly1d.
+    # Although this is a biased estimator, IDL uses population std in its MOMENT-based
+    # sigma calculation, and we must reproduce that behavior exactly for fidelity.
+    stddev = float(np.std(residual, ddof=0))
+
+    if stddev == 0.0:
+        return coeffs, 0.0
+
+    z_good = np.abs((residual - mean) / stddev) <= thresh
+    count_good = int(z_good.sum())
+    if count_good == 0:
+        return np.zeros(degree + 1), np.nan
+
+    # No outliers on first pass → skip loop (IDL: goto cont1).
+    if count_good == count_initgood:
+        return coeffs, float(stddev)
+
+    # Iterative loop: IDL ``endrep until ittr eq 10`` with ``ittr`` starting
+    # at 1 and incremented at the top of each iteration → 9 repeat iterations.
+    for _ in range(9):
+        sig_old = stddev
+        coeffs = _solve(xx[z_good], yy[z_good])
+
+        residual_cur = yy[z_good] - np.polynomial.polynomial.polyval(xx[z_good], coeffs)
+        mean = float(np.mean(residual_cur))
+        # NOTE: Use ddof=0 (population standard deviation) to match IDL mc_robustpoly1d.
+        # Although this is a biased estimator, IDL uses population std in its MOMENT-based
+        # sigma calculation, and we must reproduce that behavior exactly for fidelity.
+        stddev = float(np.std(residual_cur, ddof=0))
+
+        if stddev == 0.0:
+            break
+
+        # Convergence (IDL: if ((sig_old-sig)/sig_old) lt eps then goto cont1).
+        if (sig_old - stddev) / sig_old < eps:
+            break
+
+        # Reject from full initial-good set (IDL: test = yy - poly(xx, coeff)).
+        residual_all = yy - np.polynomial.polynomial.polyval(xx, coeffs)
+        z_good = np.abs((residual_all - mean) / stddev) <= thresh
+        if z_good.sum() == 0:
+            break
+
+    # Final RMS on accepted subset.
+    # NOTE: Use ddof=0 (population standard deviation) to match IDL mc_robustpoly1d.
+    # Although this is a biased estimator, IDL uses population std in its MOMENT-based
+    # sigma calculation, and we must reproduce that behavior exactly for fidelity.
+    rms = float(np.std(yy[z_good] - np.polynomial.polynomial.polyval(xx[z_good], coeffs), ddof=0))
+    return coeffs, rms
+
+
+# _ROBUST_FIT_FUNCTION is the single point of indirection for the robust edge
+# polynomial fitter.  It points to _mc_robustpoly1d, a direct Python port of
+# IDL mc_robustpoly1d(..., 3, 0.01, /GAUSSJ) as called in mc_findorders.pro.
+_ROBUST_FIT_FUNCTION = _mc_robustpoly1d
 
 
 def _polyval_with_xrange(
@@ -1598,9 +1726,11 @@ def _compute_sobel_image(image: npt.NDArray) -> npt.NDArray:
     IDL block (mc_findorders.pro, line 158):
         rimage = sobel(image*1000./max(image))
 
-    The factor of 1000 and the division by max(image) are kept explicit to
-    match the IDL semantics.  The actual COM step uses relative weights so the
-    absolute scale is cosmetic, but correctness requires the normalisation.
+    The factor of 1000 and the division by ``max(image)`` are kept explicit to
+    match the IDL semantics exactly.  Normalising by the image maximum makes
+    the Sobel response scale-invariant across flats with different exposure
+    levels; the COM step is unaffected by the absolute scale factor (1000) but
+    including it preserves full numerical fidelity with the IDL call site.
 
     Parameters
     ----------
@@ -2363,16 +2493,10 @@ def _fit_order_edge_polynomials(
 
     IDL's ``mc_robustpoly1d`` automatically skips NaN samples via its
     internal goodbad mask.  Here we filter finite samples explicitly before
-    passing to :func:`_fit_poly_robust`, which wraps ``_polyfit_1d`` with
-    equivalent robust-rejection settings (threshold=3, eps=0.01).
-
-    .. note::
-        Known approximation (the only algorithmic difference vs IDL):
-        :func:`_fit_poly_robust` uses iterative sigma-clipping via
-        ``_polyfit_1d`` rather than IDL's Gauss-Jordan implementation
-        (``/GAUSSJ``).  The robust interface is otherwise parameter-compatible
-        (thresh=3, eps=0.01).  The difference affects the outlier-rejection
-        trajectory but not the final polynomial form for well-behaved data.
+    passing to :func:`_ROBUST_FIT_FUNCTION`, which is :func:`_mc_robustpoly1d`
+    — a direct Python port of IDL ``mc_robustpoly1d /GAUSSJ`` with the same
+    unweighted normal-equation solver, sigma-clipping parameters (thresh=3,
+    eps=0.01), and iteration count (up to 9 repeat iterations).
 
     Parameters
     ----------
