@@ -5503,6 +5503,131 @@ class TestMCFindordersDriftAudit:
             "substitution — it is the only remaining algorithmic approximation"
         )
 
+    def test_ROBUST_FIT_FUNCTION_alias_exists_and_callable(self):
+        """_ROBUST_FIT_FUNCTION module alias must exist and point to a callable
+        that accepts (cols, rows, degree) and returns (coeffs, rms).
+
+        This alias is the single point of indirection for the robust fitter so
+        that a more IDL-faithful implementation (Gauss-Jordan) can be swapped
+        in later without touching any tracing logic.
+        """
+        import pyspextool.instruments.ishell.tracing as _m
+
+        assert hasattr(_m, "_ROBUST_FIT_FUNCTION"), (
+            "_ROBUST_FIT_FUNCTION alias must be defined at module level"
+        )
+        assert callable(_m._ROBUST_FIT_FUNCTION), (
+            "_ROBUST_FIT_FUNCTION must be callable"
+        )
+        # Smoke-test: basic call succeeds.
+        cols = np.arange(10, dtype=float)
+        rows = 2.0 * cols + 1.0
+        coeffs, rms = _m._ROBUST_FIT_FUNCTION(cols, rows, 1)
+        assert coeffs.shape == (2,), f"Expected 2 coefficients, got {coeffs.shape}"
+        assert np.isfinite(rms), "RMS should be finite for noise-free data"
+
+    def test_fit_order_edge_polynomials_uses_ROBUST_FIT_FUNCTION(self):
+        """_fit_order_edge_polynomials source must call _ROBUST_FIT_FUNCTION,
+        not _fit_poly_robust directly, so the alias indirection is in effect.
+        """
+        import inspect
+        from pyspextool.instruments.ishell.tracing import _fit_order_edge_polynomials
+
+        src = inspect.getsource(_fit_order_edge_polynomials)
+        assert "_ROBUST_FIT_FUNCTION" in src, (
+            "_fit_order_edge_polynomials must call _ROBUST_FIT_FUNCTION "
+            "(not _fit_poly_robust directly) so the alias is used"
+        )
+
+    # ── IDL NaN invariant enforcement ─────────────────────────────────────────
+
+    def test_defensive_nan_mask_overwrites_invalid_centers(self, tmp_path):
+        """The defensive NaN mask in trace_orders_from_flat must overwrite any
+        finite center value at columns where either edge is NaN.
+
+        This verifies that the invariant is enforced defensively and not just
+        trusted to the internal tracing logic.  The mock deliberately injects
+        NaN into one edge sample AND sets center to a finite (wrong) value at
+        the same column; the defensive mask must overwrite it with NaN.
+
+        This test fails if center is ever filled independently of the edges.
+        """
+        from pyspextool.instruments.ishell import tracing as _m
+
+        original_fn = _m._trace_single_order_idlstyle
+        injection_log = []  # record (order_call, col_idx) for each injection
+
+        def patched_fn(*args, **kwargs):
+            result = original_fn(*args, **kwargs)
+            # Inject NaN into bottom_edge_samples at the first finite column
+            # in [n//4, n//2), and simultaneously set center to 999.0 (finite,
+            # incorrect) so the defensive mask MUST overwrite it with NaN.
+            n = len(result.bottom_edge_samples)
+            if n > 4:
+                for idx in range(n // 4, n // 2):
+                    if np.isfinite(result.bottom_edge_samples[idx]):
+                        result.bottom_edge_samples[idx] = np.nan
+                        result.center_samples[idx] = 999.0
+                        injection_log.append(idx)
+                        break
+            return result
+
+        flat = _make_synthetic_flat(seed=201)
+        nrows, ncols = flat.shape
+        path = str(tmp_path / "nan_test_flat.fits")
+        _write_fits_flat(flat.astype(np.float32), path)
+
+        import unittest.mock as mock
+
+        with mock.patch.object(_m, "_trace_single_order_idlstyle", patched_fn):
+            trace = _m.trace_orders_from_flat(
+                [path],
+                guess_rows=_SYN_GUESS_ROWS,
+                n_sample_cols=15,
+                poly_degree=2,
+            )
+
+        # Confirm the mock actually fired — if it didn't, the test proves nothing.
+        assert len(injection_log) > 0, (
+            "Mock did not inject any NaN edges — test setup error: "
+            "no finite bottom edge was found in the expected index range"
+        )
+
+        # For each order, verify the IDL invariant:
+        # center_rows NaN ↔ (bot_rows NaN OR top_rows NaN)
+        for os_i in trace.order_samples:
+            invalid = ~np.isfinite(os_i.bot_rows) | ~np.isfinite(os_i.top_rows)
+            cen_nan = ~np.isfinite(os_i.center_rows)
+            assert np.all(invalid == cen_nan), (
+                "IDL NaN invariant violated: center_rows must be NaN wherever "
+                "either edge is invalid.  Found mismatch at columns: "
+                f"{os_i.sample_cols[invalid != cen_nan].tolist()}"
+            )
+
+    def test_center_nan_invariant_without_mock(self, tmp_path):
+        """On a real synthetic flat, the IDL NaN invariant must hold without
+        any mocking — the defensive mask in trace_orders_from_flat must be
+        sufficient even if internal tracing produces a center at a column
+        where an edge is missing.
+
+        This is a self-consistency check: centre is valid IFF both edges are valid.
+        """
+        flat = _make_synthetic_flat(seed=202)
+        path = str(tmp_path / "inv_flat.fits")
+        _write_fits_flat(flat, path)
+        trace = trace_orders_from_flat(
+            [path], n_sample_cols=15, poly_degree=2, guess_rows=_SYN_GUESS_ROWS
+        )
+
+        for i, os_i in enumerate(trace.order_samples):
+            invalid = ~np.isfinite(os_i.bot_rows) | ~np.isfinite(os_i.top_rows)
+            cen_nan = ~np.isfinite(os_i.center_rows)
+            assert np.all(invalid == cen_nan), (
+                f"Order {i}: IDL NaN invariant violated — center_rows is finite "
+                "at a column where one or both edges are NaN.  "
+                f"Mismatch at columns: {os_i.sample_cols[invalid != cen_nan].tolist()}"
+            )
+
     # ── tabinv vs interp: verified equivalent ─────────────────────────────────
 
     def test_tabinv_equivalent_to_interp(self):

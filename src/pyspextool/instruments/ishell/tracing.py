@@ -109,19 +109,24 @@ IDL-to-Python fidelity status
   oscillation, inter-order separation) are computed only within each order's
   valid ``[x_start, x_end]`` range; extrapolated tails return ``NaN`` via
   :func:`_polyval_with_xrange`
+- Center samples are enforced to be NaN wherever either edge is invalid,
+  matching IDL ``goto cont1``/``goto cont2`` semantics exactly.  This
+  invariant is applied defensively in :func:`trace_orders_from_flat` after
+  per-order tracing completes.
 
-**Does NOT fully match IDL:**
+**Does NOT fully match IDL (known approximation):**
 
 - Step-based column sampling is used when ``flatinfo.step > 0``; otherwise
   ``n_sample_cols`` evenly-spaced columns are used (no IDL equivalent for
   that fallback).
 - When neither ``flatinfo`` nor explicit ``guess_rows`` are provided, a
   ``ValueError`` is raised; IDL always requires external ``guesspos``.
-- The robust polynomial fitter (:func:`_fit_poly_robust`) uses iterative
-  sigma-clipping rather than IDL's Gauss-Jordan solver (``mc_robustpoly1d
-  /GAUSSJ``).  Parameters are aligned (thresh=3, eps=0.01); the difference
-  affects outlier-rejection trajectory, not the final polynomial form.
-  This is the only remaining algorithmic approximation.
+- The robust polynomial fitter (see :data:`_ROBUST_FIT_FUNCTION`) uses
+  iterative sigma-clipping rather than IDL's Gauss-Jordan solver
+  (``mc_robustpoly1d /GAUSSJ``).  Parameters are aligned (thresh=3,
+  eps=0.01); the difference affects outlier-rejection trajectory, not the
+  final polynomial form.  **This is the only remaining algorithmic
+  approximation.**
 """
 
 from __future__ import annotations
@@ -757,6 +762,27 @@ def trace_orders_from_flat(
             slith_min, slith_max,
         )
 
+        # IDL NaN-semantics enforcement: center must be NaN wherever either
+        # edge is invalid.  This mirrors IDL goto cont1/cont2 which skips
+        # the cen[k] assignment entirely on any non-accept path.
+        # This defensive mask is applied unconditionally — it ensures the
+        # invariant holds even if internal tracing logic produces a finite
+        # center at a column where one edge is missing (e.g. due to the
+        # else-branch fallback writing y_guess_f after a single-side failure).
+        invalid_mask = (
+            ~np.isfinite(result_i.bottom_edge_samples)
+            | ~np.isfinite(result_i.top_edge_samples)
+        )
+        result_i.center_samples[invalid_mask] = np.nan
+        assert np.all(
+            ~np.isfinite(result_i.center_samples)
+            == (~np.isfinite(result_i.bottom_edge_samples)
+                | ~np.isfinite(result_i.top_edge_samples))
+        ), (
+            "Center samples must be NaN wherever either edge is invalid "
+            "(IDL goto cont1/cont2 invariant)"
+        )
+
         order_samples.append(OrderTraceSamples(
             order_index=i,
             sample_cols=result_i.sample_cols,
@@ -1226,6 +1252,15 @@ def _fit_poly_robust(
     else:
         rms = np.nan
     return coeffs, rms
+
+
+# NOTE: This is the only remaining approximation relative to IDL
+# (mc_robustpoly1d /GAUSSJ): the solver method uses iterative sigma-clipping
+# rather than Gauss-Jordan elimination.  The robust rejection parameters are
+# aligned (thresh=3, eps=0.01) so the difference is in solver trajectory only,
+# not the final polynomial form for well-behaved data.  This alias allows
+# swapping in a more faithful implementation later without touching tracing logic.
+_ROBUST_FIT_FUNCTION = _fit_poly_robust
 
 
 def _polyval_with_xrange(
@@ -2378,12 +2413,12 @@ def _fit_order_edge_polynomials(
     # IDL j=0: bottom edge
     bot = np.asarray(bottom_edge_samples, dtype=float)
     bot_ok = np.isfinite(bot)
-    bottom_coeffs, _ = _fit_poly_robust(cols[bot_ok], bot[bot_ok], poly_degree)
+    bottom_coeffs, _ = _ROBUST_FIT_FUNCTION(cols[bot_ok], bot[bot_ok], poly_degree)
 
     # IDL j=1: top edge
     top = np.asarray(top_edge_samples, dtype=float)
     top_ok = np.isfinite(top)
-    top_coeffs, _ = _fit_poly_robust(cols[top_ok], top[top_ok], poly_degree)
+    top_coeffs, _ = _ROBUST_FIT_FUNCTION(cols[top_ok], top[top_ok], poly_degree)
 
     return bottom_coeffs, top_coeffs
 
