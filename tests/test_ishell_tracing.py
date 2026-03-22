@@ -87,9 +87,7 @@ _SYN_FIRST_CENTER = 60   # centre of order 0 at col 0
 _SYN_HALF_WIDTH = 10      # half-width in rows
 _SYN_TILT = 0.01          # pixels per column
 
-# Known centre-row guess positions for the synthetic flat (at col 0 / seed column).
-# IDL mc_findorders always receives guesspos from mc_adjustguesspos; here we
-# hard-code the known positions for the synthetic test data.
+# Synthetic tests provide explicit initial guess positions, analogous to mc_adjustguesspos in IDL.
 _SYN_GUESS_ROWS: list[float] = [
     float(_SYN_FIRST_CENTER + k * _SYN_SPACING) for k in range(_SYN_N_ORDERS)
 ]   # = [60.0, 100.0, 140.0, 180.0, 220.0]
@@ -5479,36 +5477,29 @@ class TestMCFindordersDriftAudit:
                 f"(edges: bot={bot[k]}, top={top_arr[k]})"
             )
 
-    # ── Known approximation: robust-fit solver ────────────────────────────────
+    # ── Robust-fit solver: IDL-equivalent _mc_robustpoly1d ───────────────────
 
-    def test_robust_fit_approximation_documented(self):
-        """The only remaining algorithmic approximation vs IDL: _fit_order_edge_polynomials
-        uses _fit_poly_robust (iterative sigma-clipping) instead of IDL mc_robustpoly1d
-        with /GAUSSJ.
+    def test_robust_fit_idl_equivalent_documented(self):
+        """_fit_order_edge_polynomials now uses _mc_robustpoly1d, a direct port
+        of IDL mc_robustpoly1d /GAUSSJ, so the prior approximation is resolved.
 
-        This test verifies that the substitution is documented in the function's
-        source, and that the function is callable with aligned parameters
-        (thresh=3, eps=0.01).  For well-behaved data the two solvers produce
-        equivalent results; the difference only appears in outlier-rejection
-        trajectory.
+        The docstring must reference the IDL /GAUSSJ equivalence.
         """
         import inspect
         from pyspextool.instruments.ishell.tracing import _fit_order_edge_polynomials
 
         src = inspect.getsource(_fit_order_edge_polynomials)
-        # The docstring must record the known approximation.
-        assert "Gauss-Jordan" in src or "GAUSSJ" in src, (
-            "_fit_order_edge_polynomials docstring must acknowledge the IDL /GAUSSJ "
-            "substitution — it is the only remaining algorithmic approximation"
+        assert "GAUSSJ" in src, (
+            "_fit_order_edge_polynomials docstring must reference the IDL /GAUSSJ "
+            "equivalence of _mc_robustpoly1d"
         )
 
     def test_ROBUST_FIT_FUNCTION_alias_exists_and_callable(self):
-        """_ROBUST_FIT_FUNCTION module alias must exist and point to a callable
-        that accepts (cols, rows, degree) and returns (coeffs, rms).
+        """_ROBUST_FIT_FUNCTION module alias must exist and point to _mc_robustpoly1d.
 
         This alias is the single point of indirection for the robust fitter so
-        that a more IDL-faithful implementation (Gauss-Jordan) can be swapped
-        in later without touching any tracing logic.
+        that the implementation can be swapped without touching any tracing logic.
+        _ROBUST_FIT_FUNCTION now points to _mc_robustpoly1d (IDL-equivalent).
         """
         import pyspextool.instruments.ishell.tracing as _m
 
@@ -5537,6 +5528,87 @@ class TestMCFindordersDriftAudit:
             "_fit_order_edge_polynomials must call _ROBUST_FIT_FUNCTION "
             "(not _fit_poly_robust directly) so the alias is used"
         )
+
+    def test_ROBUST_FIT_FUNCTION_points_to_mc_robustpoly1d(self):
+        """_ROBUST_FIT_FUNCTION must be the IDL-equivalent _mc_robustpoly1d."""
+        import pyspextool.instruments.ishell.tracing as _m
+
+        assert _m._ROBUST_FIT_FUNCTION is _m._mc_robustpoly1d, (
+            "_ROBUST_FIT_FUNCTION must point to _mc_robustpoly1d "
+            "(the IDL mc_robustpoly1d /GAUSSJ port)"
+        )
+
+    # ── _mc_robustpoly1d: regression tests for the IDL-equivalent fitter ─────
+
+    def test_mc_robustpoly1d_linear_no_outliers(self):
+        """_mc_robustpoly1d recovers exact linear coefficients on clean data."""
+        from pyspextool.instruments.ishell.tracing import _mc_robustpoly1d
+
+        cols = np.arange(0, 100, dtype=float)
+        rows = 3.5 * cols + 12.0
+        coeffs, rms = _mc_robustpoly1d(cols, rows, degree=1)
+        assert np.isclose(coeffs[0], 12.0, atol=1e-6), f"intercept={coeffs[0]}"
+        assert np.isclose(coeffs[1], 3.5, atol=1e-6), f"slope={coeffs[1]}"
+        assert rms == 0.0 or np.isclose(rms, 0.0, atol=1e-10), f"rms={rms}"
+
+    def test_mc_robustpoly1d_rejects_outliers(self):
+        """_mc_robustpoly1d rejects large outliers and recovers the true polynomial."""
+        from pyspextool.instruments.ishell.tracing import _mc_robustpoly1d
+
+        rng = np.random.default_rng(7)
+        cols = np.arange(50, dtype=float)
+        rows = 2.0 * cols + 5.0 + rng.normal(0.0, 0.1, size=50)
+        # Inject 5 large outliers.
+        outlier_idx = [5, 15, 25, 35, 45]
+        rows[outlier_idx] += 50.0
+
+        coeffs, rms = _mc_robustpoly1d(cols, rows, degree=1, thresh=3.0)
+        # After rejecting outliers the fit should be very close to the truth.
+        assert np.isclose(coeffs[0], 5.0, atol=0.5), f"intercept={coeffs[0]:.3f}"
+        assert np.isclose(coeffs[1], 2.0, atol=0.05), f"slope={coeffs[1]:.4f}"
+        assert np.isfinite(rms) and rms < 1.0, f"rms={rms:.3f} should be small"
+
+    def test_mc_robustpoly1d_handles_nan_inputs(self):
+        """_mc_robustpoly1d treats NaN values as bad and skips them."""
+        from pyspextool.instruments.ishell.tracing import _mc_robustpoly1d
+
+        cols = np.arange(30, dtype=float)
+        rows = 1.5 * cols + 3.0
+        # Inject NaNs at 5 positions.
+        nan_idx = [2, 8, 14, 20, 26]
+        rows[nan_idx] = np.nan
+
+        coeffs, rms = _mc_robustpoly1d(cols, rows, degree=1)
+        assert np.isclose(coeffs[0], 3.0, atol=1e-6), f"intercept={coeffs[0]}"
+        assert np.isclose(coeffs[1], 1.5, atol=1e-6), f"slope={coeffs[1]}"
+        assert np.isfinite(rms), "rms should be finite even with NaN inputs"
+
+    def test_mc_robustpoly1d_too_few_points_returns_nan_rms(self):
+        """_mc_robustpoly1d returns (zeros, nan) when fewer than degree+1 points."""
+        from pyspextool.instruments.ishell.tracing import _mc_robustpoly1d
+
+        # degree=3 requires 4 good points; only 2 provided.
+        cols = np.array([1.0, 2.0])
+        rows = np.array([1.0, 2.0])
+        coeffs, rms = _mc_robustpoly1d(cols, rows, degree=3)
+        assert np.isnan(rms), f"Expected nan rms, got {rms}"
+
+    def test_mc_robustpoly1d_quadratic_with_outliers(self):
+        """_mc_robustpoly1d fits a quadratic and rejects injected outliers."""
+        from pyspextool.instruments.ishell.tracing import _mc_robustpoly1d
+
+        rng = np.random.default_rng(42)
+        cols = np.linspace(0, 100, 80)
+        # True: y = 0.001*x^2 + 0.5*x + 10
+        rows = 0.001 * cols**2 + 0.5 * cols + 10.0 + rng.normal(0.0, 0.2, 80)
+        # Inject outliers.
+        rows[[10, 30, 50, 70]] += 30.0
+
+        coeffs, rms = _mc_robustpoly1d(cols, rows, degree=2, thresh=3.0)
+        assert np.isclose(coeffs[0], 10.0, atol=0.5), f"c0={coeffs[0]:.3f}"
+        assert np.isclose(coeffs[1], 0.5, atol=0.05), f"c1={coeffs[1]:.4f}"
+        assert np.isclose(coeffs[2], 0.001, atol=0.001), f"c2={coeffs[2]:.6f}"
+        assert np.isfinite(rms) and rms < 1.0, f"rms={rms:.3f}"
 
     # ── IDL branch semantics: goto cont1/cont2 vs fallback else-branch ───────
 
