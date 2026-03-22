@@ -2506,3 +2506,282 @@ def _update_edge_activity_flags(
         trace_bottom_active = False
 
     return trace_top_active, trace_bottom_active
+
+
+# ---------------------------------------------------------------------------
+# IDL mc_findorders building-block helpers (blocks J–K)
+# ---------------------------------------------------------------------------
+
+
+def _trace_order_left(
+    image: npt.NDArray,
+    sobel_image: npt.NDArray,
+    sample_cols: npt.NDArray,
+    center_samples: npt.NDArray,
+    bottom_edge_samples: npt.NDArray,
+    top_edge_samples: npt.NDArray,
+    gidx: int,
+    nrows: int,
+    bufpix: int,
+    poly_degree: int,
+    frac: float,
+    com_half_width: int,
+    slit_height_min: float,
+    slit_height_max: float,
+) -> None:
+    """Trace left from the seeded column index, updating edge and centre arrays.
+
+    IDL left-sweep (mc_findorders.pro, lines 197–309):
+        dotop = 1 & dobot = 1
+        for j = 0, gidx do begin
+            k = gidx - j
+            fcol = reform(image[scols[k], *])
+            rcol = reform(rimage[scols[k], *])
+            coeff   = mc_polyfit1d(scols, cen, 1>(degree-2), /SILENT, /JUSTFIT)
+            y_guess = bufpix > poly(scols[k], coeff) < (nrows-bufpix-1)
+            ...COM for top / bottom...
+            ...slit-height check...
+            ...boundary flags...
+            if not dotop and not dobot then goto, moveon1
+        endfor
+        moveon1:
+
+    Arrays *center_samples*, *bottom_edge_samples*, and *top_edge_samples* are
+    mutated in-place, exactly as in IDL's shared ``cen`` / ``edges`` arrays.
+
+    Parameters
+    ----------
+    image : ndarray, shape (nrows, ncols)
+    sobel_image : ndarray, shape (nrows, ncols)
+    sample_cols : ndarray of int, shape (n_samp,)
+    center_samples : ndarray of float, shape (n_samp,)
+        Pre-seeded at the seed window; updated in-place.
+    bottom_edge_samples : ndarray of float, shape (n_samp,)
+        Updated in-place.
+    top_edge_samples : ndarray of float, shape (n_samp,)
+        Updated in-place.
+    gidx : int
+        Index of the seed column in *sample_cols* (IDL ``gidx``).
+    nrows : int
+    bufpix : int
+    poly_degree : int
+        Full polynomial degree (IDL ``degree``).
+    frac : float
+        Intensity threshold fraction (IDL ``frac``).
+    com_half_width : int
+        Half-width of the Sobel COM window (IDL ``halfwin``).
+    slit_height_min : float
+        IDL ``slith_pix[0]``.
+    slit_height_max : float
+        IDL ``slith_pix[1]``.
+    """
+    # IDL: dotop = 1 & dobot = 1
+    do_top = True
+    do_bot = True
+
+    # IDL: for j = 0, gidx do begin  …  k = gidx-j  …  endfor
+    for j in range(gidx + 1):
+        k = gidx - j
+
+        # IDL: fcol = reform(image[scols[k],*]) ; rcol = reform(rimage[scols[k],*])
+        fcol, rcol = _extract_column_profiles(image, sobel_image, int(sample_cols[k]))
+
+        # IDL: coeff = mc_polyfit1d(scols,cen,1>(degree-2),/SILENT,/JUSTFIT)
+        #      y_guess = bufpix > poly(scols[k],coeff) < (nrows-bufpix-1)
+        y_guess_f = _predict_center_from_known_samples(
+            sample_cols, center_samples, float(sample_cols[k]),
+            poly_degree, nrows, bufpix,
+        )
+        # Clamp to valid row indices before indexing fcol.
+        y_guess = int(np.clip(round(y_guess_f), 0, nrows - 1))
+
+        # IDL: z_guess = fcol[y_guess]
+        z_guess = float(fcol[y_guess])
+        threshold = frac * z_guess
+
+        # IDL: if dotop then begin
+        #        ztop = where(fcol lt frac*z_guess and row gt y_guess, cnt)
+        #        if cnt ne 0 then … COM_top … else COM_top = !values.f_nan
+        #      endif else COM_top = !values.f_nan
+        if do_top:
+            guessyt, _ = _find_threshold_edge_guesses(fcol, y_guess_f, frac)
+            if guessyt is not None:
+                com_top = _sobel_centroid(rcol, guessyt, com_half_width, nrows)
+            else:
+                com_top = np.nan
+        else:
+            com_top = np.nan
+
+        # IDL: if dobot then begin
+        #        zbot = where(fcol lt frac*z_guess and row lt y_guess, cnt)
+        #        if cnt ne 0 then … COM_bot … else COM_bot = !values.f_nan
+        #      endif else COM_bot = !values.f_nan
+        if do_bot:
+            _, guessyb = _find_threshold_edge_guesses(fcol, y_guess_f, frac)
+            if guessyb is not None:
+                com_bot = _sobel_centroid(rcol, guessyb, com_half_width, nrows)
+            else:
+                com_bot = np.nan
+        else:
+            com_bot = np.nan
+
+        # IDL: if dotop and dobot and finite(COM_bot) and finite(COM_top) then begin
+        #        if abs(com_bot-com_top) gt slith_pix[0] and … lt slith_pix[1] then begin
+        #          edges[k,*] = [com_bot,com_top]; cen[k] = (com_bot+com_top)/2.
+        #        endif else goto, cont1
+        #      endif else begin
+        #        com_bot = !values.f_nan; com_top = !values.f_nan
+        #        edges[k,*] = [com_bot,com_top]; cen[k] = y_guess
+        #      endelse
+        if do_top and do_bot and _accept_edge_pair(com_bot, com_top, slit_height_min, slit_height_max):
+            bottom_edge_samples[k] = com_bot
+            top_edge_samples[k]    = com_top
+            center_samples[k]      = (com_bot + com_top) / 2.0
+        else:
+            if do_top and do_bot:
+                # Both active but edge pair rejected (IDL: goto cont1 path)
+                # Edges stay NaN; center falls back to y_guess.
+                pass
+            # NaN case (IDL: else-branch after the outer if)
+            bottom_edge_samples[k] = np.nan
+            top_edge_samples[k]    = np.nan
+            center_samples[k]      = y_guess_f
+            # IDL: goto cont1 — activity flags still checked via fall-through
+            # IDL lines 302-303 run for the NaN branch as well; use NaN values
+            # so the float comparisons in _update_edge_activity_flags are safe.
+            do_top, do_bot = _update_edge_activity_flags(
+                com_top, com_bot, nrows, bufpix, do_top, do_bot,
+            )
+            if not do_top and not do_bot:
+                break
+            continue
+
+        # IDL: if com_top le bufpix or com_top ge (nrows-1-bufpix) then dotop=0
+        # IDL: if com_bot le bufpix or com_bot gt  (nrows-1-bufpix) then dobot=0
+        do_top, do_bot = _update_edge_activity_flags(
+            com_top, com_bot, nrows, bufpix, do_top, do_bot,
+        )
+
+        # IDL: if not dotop and not dobot then goto, moveon1
+        if not do_top and not do_bot:
+            break
+
+
+def _trace_order_right(
+    image: npt.NDArray,
+    sobel_image: npt.NDArray,
+    sample_cols: npt.NDArray,
+    center_samples: npt.NDArray,
+    bottom_edge_samples: npt.NDArray,
+    top_edge_samples: npt.NDArray,
+    gidx: int,
+    nrows: int,
+    bufpix: int,
+    poly_degree: int,
+    frac: float,
+    com_half_width: int,
+    slit_height_min: float,
+    slit_height_max: float,
+) -> None:
+    """Trace right from the seeded column index, updating edge and centre arrays.
+
+    IDL right-sweep (mc_findorders.pro, lines 312–401):
+        dotop = 1 & dobot = 1
+        for j = gidx+1, nscols-1 do begin
+            k = j
+            fcol = reform(image[scols[k],*])
+            rcol = reform(rimage[scols[k],*])
+            coeff   = mc_polyfit1d(scols,cen,1>(degree-2),/SILENT,/JUSTFIT)
+            y_guess = bufpix > poly(scols[k],coeff) < (nrows-bufpix-1)
+            ...COM for top / bottom...
+            ...slit-height check...
+            ...boundary flags...
+            if not dotop and not dobot then goto, moveon2
+        endfor
+        moveon2:
+
+    Parameters are identical to :func:`_trace_order_left` (arrays mutated
+    in-place for the right half of *sample_cols*).
+    """
+    # IDL: dotop = 1 & dobot = 1
+    do_top = True
+    do_bot = True
+
+    # IDL: for j = gidx+1, nscols-1 do begin  …  k = j  …  endfor
+    for k in range(gidx + 1, len(sample_cols)):
+
+        # IDL: fcol = reform(image[scols[k],*]) ; rcol = reform(rimage[scols[k],*])
+        fcol, rcol = _extract_column_profiles(image, sobel_image, int(sample_cols[k]))
+
+        # IDL: coeff = mc_polyfit1d(scols,cen,1>(degree-2),/SILENT,/JUSTFIT)
+        #      y_guess = bufpix > poly(scols[k],coeff) < (nrows-bufpix-1)
+        y_guess_f = _predict_center_from_known_samples(
+            sample_cols, center_samples, float(sample_cols[k]),
+            poly_degree, nrows, bufpix,
+        )
+        # Clamp to valid row indices before indexing fcol.
+        y_guess = int(np.clip(round(y_guess_f), 0, nrows - 1))
+
+        # IDL: z_guess = fcol[y_guess]
+        z_guess = float(fcol[y_guess])
+        threshold = frac * z_guess
+
+        # IDL: if dotop then begin
+        #        z = where(fcol lt frac*z_guess and row gt y_guess, cnt)
+        #        if cnt ne 0 then … COM_top … else com_top = !values.f_nan
+        #      endif else com_top = !values.f_nan
+        if do_top:
+            guessyt, _ = _find_threshold_edge_guesses(fcol, y_guess_f, frac)
+            if guessyt is not None:
+                com_top = _sobel_centroid(rcol, guessyt, com_half_width, nrows)
+            else:
+                com_top = np.nan
+        else:
+            com_top = np.nan
+
+        # IDL: if dobot then begin
+        #        z = where(fcol lt frac*z_guess and row lt y_guess, cnt)
+        #        if cnt ne 0 then … COM_bot … else com_bot = !values.f_nan
+        #      endif else com_bot = !values.f_nan
+        if do_bot:
+            _, guessyb = _find_threshold_edge_guesses(fcol, y_guess_f, frac)
+            if guessyb is not None:
+                com_bot = _sobel_centroid(rcol, guessyb, com_half_width, nrows)
+            else:
+                com_bot = np.nan
+        else:
+            com_bot = np.nan
+
+        # IDL: if dotop and dobot and finite(com_top) and finite(com_bot) then begin
+        #        if abs(com_bot-com_top) gt slith_pix[0] and … lt slith_pix[1] then begin
+        #          edges[k,*] = [com_bot,com_top]; cen[k] = (com_bot+com_top)/2.
+        #        endif else goto, cont2
+        #      endif else begin
+        #        com_bot = !values.f_nan; com_top = !values.f_nan
+        #        edges[k,*] = [com_bot,com_top]; cen[k] = y_guess
+        #      endelse
+        if do_top and do_bot and _accept_edge_pair(com_bot, com_top, slit_height_min, slit_height_max):
+            bottom_edge_samples[k] = com_bot
+            top_edge_samples[k]    = com_top
+            center_samples[k]      = (com_bot + com_top) / 2.0
+        else:
+            # NaN case or rejected pair (IDL else-branch / cont2 path)
+            bottom_edge_samples[k] = np.nan
+            top_edge_samples[k]    = np.nan
+            center_samples[k]      = y_guess_f
+            do_top, do_bot = _update_edge_activity_flags(
+                com_top, com_bot, nrows, bufpix, do_top, do_bot,
+            )
+            if not do_top and not do_bot:
+                break
+            continue
+
+        # IDL: if com_top le bufpix or com_top ge (nrows-1-bufpix) then dotop=0
+        # IDL: if com_bot le bufpix or com_bot gt  (nrows-1-bufpix) then dobot=0
+        do_top, do_bot = _update_edge_activity_flags(
+            com_top, com_bot, nrows, bufpix, do_top, do_bot,
+        )
+
+        # IDL: if not dotop and not dobot then goto, moveon2
+        if not do_top and not do_bot:
+            break

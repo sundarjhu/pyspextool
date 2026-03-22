@@ -4386,3 +4386,256 @@ class TestIDLHelperFunctionsGHI:
         )
         assert top_act is False
         assert bot_act is False
+
+
+# ---------------------------------------------------------------------------
+# TestIDLHelperFunctionsJK  (mc_findorders blocks J–K: left/right sweeps)
+# ---------------------------------------------------------------------------
+
+
+def _make_banded_order_fixture(
+    nrows=200, ncols=100, order_center=100,
+    half_slit=10, band_flux=1000.0, bg_flux=50.0,
+):
+    """
+    Synthetic flat with a single order band centred at *order_center*.
+
+    The order occupies rows [order_center - half_slit, order_center + half_slit]
+    with constant flux *band_flux*; all other rows have *bg_flux*.
+
+    Returns
+    -------
+    image, sobel_image, sample_cols, center_samples, bottom_edge_samples, top_edge_samples
+        Arrays sized for a simple horizontal sweep with step=5.
+    """
+    from pyspextool.instruments.ishell.tracing import _compute_sobel_image, _build_sample_cols
+
+    image = np.full((nrows, ncols), bg_flux, dtype=float)
+    bot_row = order_center - half_slit
+    top_row = order_center + half_slit
+    image[bot_row: top_row + 1, :] = band_flux
+
+    sobel_image = _compute_sobel_image(image)
+
+    # Sample every 5 columns across the full detector.
+    sample_cols = _build_sample_cols(x_lo=0, x_hi=ncols - 1, step=5)
+    n_samp = len(sample_cols)
+
+    center_samples      = np.full(n_samp, np.nan)
+    bottom_edge_samples = np.full(n_samp, np.nan)
+    top_edge_samples    = np.full(n_samp, np.nan)
+
+    return (
+        image, sobel_image, sample_cols,
+        center_samples, bottom_edge_samples, top_edge_samples,
+        order_center, bot_row, top_row,
+    )
+
+
+def _seed_arrays(center_samples, sample_cols, gidx, order_center, poly_degree=3):
+    """Fill the seed window around gidx (IDL: cen[(gidx-degree):(gidx+degree)])."""
+    n_samp = len(sample_cols)
+    lo = max(0, gidx - poly_degree)
+    hi = min(n_samp - 1, gidx + poly_degree)
+    center_samples[lo: hi + 1] = float(order_center)
+
+
+class TestIDLHelperFunctionsJK:
+    """Unit tests for IDL mc_findorders building-block helpers J and K."""
+
+    # ── Shared fixture parameters ────────────────────────────────────────────
+
+    NROWS    = 200
+    NCOLS    = 100
+    CEN      = 100     # order center row
+    HALF     = 10      # half slit height in rows
+    BUFPIX   = 3
+    POLY_DEG = 3
+    FRAC     = 0.5
+    HALFWIN  = 3
+    SLITH_MIN = 8.0    # < 2*HALF
+    SLITH_MAX = 30.0   # > 2*HALF
+
+    def _setup(self):
+        (
+            image, sobel_image, sample_cols,
+            center_samples, bottom_edge_samples, top_edge_samples,
+            order_center, bot_row, top_row,
+        ) = _make_banded_order_fixture(
+            nrows=self.NROWS, ncols=self.NCOLS,
+            order_center=self.CEN, half_slit=self.HALF,
+        )
+        n_samp = len(sample_cols)
+        # Seed at the middle column.
+        gidx = n_samp // 2
+        _seed_arrays(center_samples, sample_cols, gidx, order_center, self.POLY_DEG)
+        return (
+            image, sobel_image, sample_cols,
+            center_samples, bottom_edge_samples, top_edge_samples,
+            gidx,
+        )
+
+    def _call_left(self, image, sobel_image, sample_cols,
+                   center_samples, bot, top, gidx):
+        from pyspextool.instruments.ishell.tracing import _trace_order_left
+        _trace_order_left(
+            image, sobel_image, sample_cols,
+            center_samples, bot, top, gidx,
+            nrows=self.NROWS, bufpix=self.BUFPIX,
+            poly_degree=self.POLY_DEG, frac=self.FRAC,
+            com_half_width=self.HALFWIN,
+            slit_height_min=self.SLITH_MIN, slit_height_max=self.SLITH_MAX,
+        )
+
+    def _call_right(self, image, sobel_image, sample_cols,
+                    center_samples, bot, top, gidx):
+        from pyspextool.instruments.ishell.tracing import _trace_order_right
+        _trace_order_right(
+            image, sobel_image, sample_cols,
+            center_samples, bot, top, gidx,
+            nrows=self.NROWS, bufpix=self.BUFPIX,
+            poly_degree=self.POLY_DEG, frac=self.FRAC,
+            com_half_width=self.HALFWIN,
+            slit_height_min=self.SLITH_MIN, slit_height_max=self.SLITH_MAX,
+        )
+
+    # ── J: _trace_order_left ────────────────────────────────────────────────
+
+    def test_left_sweep_populates_edge_samples(self):
+        """Left sweep writes finite bottom/top edges for the banded order."""
+        image, sobel, scols, cen, bot, top, gidx = self._setup()
+        self._call_left(image, sobel, scols, cen, bot, top, gidx)
+        # At least some columns to the left of gidx should have finite edges.
+        n_finite_bot = int(np.sum(np.isfinite(bot[:gidx])))
+        n_finite_top = int(np.sum(np.isfinite(top[:gidx])))
+        assert n_finite_bot > 0, "left sweep should find at least one finite bottom edge"
+        assert n_finite_top > 0, "left sweep should find at least one finite top edge"
+
+    def test_left_sweep_populates_center_samples(self):
+        """Left sweep writes finite center values derived from traced edges."""
+        image, sobel, scols, cen, bot, top, gidx = self._setup()
+        self._call_left(image, sobel, scols, cen, bot, top, gidx)
+        n_finite_cen = int(np.sum(np.isfinite(cen[:gidx])))
+        assert n_finite_cen > 0, "left sweep should produce at least one finite center"
+
+    def test_left_sweep_centers_derived_from_edges(self):
+        """Centers written during left sweep equal (bot + top) / 2 where both finite."""
+        image, sobel, scols, cen, bot, top, gidx = self._setup()
+        self._call_left(image, sobel, scols, cen, bot, top, gidx)
+        for k in range(gidx):
+            if np.isfinite(bot[k]) and np.isfinite(top[k]):
+                expected = (bot[k] + top[k]) / 2.0
+                assert cen[k] == pytest.approx(expected, abs=1e-9), (
+                    f"center[{k}] should be (bot+top)/2 but got {cen[k]} vs {expected}"
+                )
+
+    def test_left_sweep_rejected_pair_sets_center_to_y_guess(self):
+        """Rejected edge pair in left sweep stores NaN edges and center=y_guess.
+
+        We force rejection by using an impossible slit-height window so no column
+        can be accepted.
+        """
+        from pyspextool.instruments.ishell.tracing import _trace_order_left
+
+        image, sobel, scols, cen, bot, top, gidx = self._setup()
+        # Slit-height window that excludes the actual slit (HALF*2=20):
+        # require height > 50, which is impossible for our band.
+        _trace_order_left(
+            image, sobel, scols, cen, bot, top, gidx,
+            nrows=self.NROWS, bufpix=self.BUFPIX,
+            poly_degree=self.POLY_DEG, frac=self.FRAC,
+            com_half_width=self.HALFWIN,
+            slit_height_min=50.0, slit_height_max=200.0,
+        )
+        # All left columns must have NaN edges.
+        assert not np.any(np.isfinite(bot[:gidx])), "edges should be NaN after rejection"
+        assert not np.any(np.isfinite(top[:gidx])), "edges should be NaN after rejection"
+        # Center must be finite (fallback to y_guess).
+        assert np.any(np.isfinite(cen[:gidx])), "center should fall back to y_guess"
+
+    # ── K: _trace_order_right ───────────────────────────────────────────────
+
+    def test_right_sweep_populates_edge_samples(self):
+        """Right sweep writes finite bottom/top edges for the banded order."""
+        image, sobel, scols, cen, bot, top, gidx = self._setup()
+        self._call_right(image, sobel, scols, cen, bot, top, gidx)
+        n_finite_bot = int(np.sum(np.isfinite(bot[gidx + 1:])))
+        n_finite_top = int(np.sum(np.isfinite(top[gidx + 1:])))
+        assert n_finite_bot > 0, "right sweep should find at least one finite bottom edge"
+        assert n_finite_top > 0, "right sweep should find at least one finite top edge"
+
+    def test_right_sweep_populates_center_samples(self):
+        """Right sweep writes finite center values derived from traced edges."""
+        image, sobel, scols, cen, bot, top, gidx = self._setup()
+        self._call_right(image, sobel, scols, cen, bot, top, gidx)
+        n_finite_cen = int(np.sum(np.isfinite(cen[gidx + 1:])))
+        assert n_finite_cen > 0, "right sweep should produce at least one finite center"
+
+    def test_right_sweep_centers_derived_from_edges(self):
+        """Centers written during right sweep equal (bot + top) / 2 where both finite."""
+        image, sobel, scols, cen, bot, top, gidx = self._setup()
+        self._call_right(image, sobel, scols, cen, bot, top, gidx)
+        for k in range(gidx + 1, len(scols)):
+            if np.isfinite(bot[k]) and np.isfinite(top[k]):
+                expected = (bot[k] + top[k]) / 2.0
+                assert cen[k] == pytest.approx(expected, abs=1e-9), (
+                    f"center[{k}] should be (bot+top)/2 but got {cen[k]} vs {expected}"
+                )
+
+    def test_right_sweep_rejected_pair_stores_nan_edges_and_y_guess_center(self):
+        """Rejected edge pair in right sweep stores NaN edges and center=y_guess."""
+        from pyspextool.instruments.ishell.tracing import _trace_order_right
+
+        image, sobel, scols, cen, bot, top, gidx = self._setup()
+        _trace_order_right(
+            image, sobel, scols, cen, bot, top, gidx,
+            nrows=self.NROWS, bufpix=self.BUFPIX,
+            poly_degree=self.POLY_DEG, frac=self.FRAC,
+            com_half_width=self.HALFWIN,
+            slit_height_min=50.0, slit_height_max=200.0,
+        )
+        assert not np.any(np.isfinite(bot[gidx + 1:])), "edges should be NaN after rejection"
+        assert not np.any(np.isfinite(top[gidx + 1:])), "edges should be NaN after rejection"
+        assert np.any(np.isfinite(cen[gidx + 1:])), "center should fall back to y_guess"
+
+    def test_both_sweeps_terminate_when_flags_inactive(self):
+        """Both sweeps stop when activity flags go inactive (no infinite loop)."""
+        from pyspextool.instruments.ishell.tracing import _trace_order_left, _trace_order_right
+
+        # Place order center very close to the bottom guard band so
+        # the bottom flag fires immediately.
+        bufpix = 5
+        order_center = bufpix + 1   # 1 row inside the guard band
+        (
+            image, sobel, scols, cen, bot, top,
+            _, _, _,
+        ) = _make_banded_order_fixture(
+            nrows=self.NROWS, ncols=self.NCOLS,
+            order_center=order_center, half_slit=self.HALF,
+        )
+        n_samp = len(scols)
+        gidx = n_samp // 2
+        _seed_arrays(cen, scols, gidx, order_center, self.POLY_DEG)
+
+        bot_l = np.full(n_samp, np.nan)
+        top_l = np.full(n_samp, np.nan)
+        cen_l = cen.copy()
+        _trace_order_left(
+            image, sobel, scols, cen_l, bot_l, top_l, gidx,
+            nrows=self.NROWS, bufpix=bufpix,
+            poly_degree=self.POLY_DEG, frac=self.FRAC,
+            com_half_width=self.HALFWIN,
+            slit_height_min=self.SLITH_MIN, slit_height_max=self.SLITH_MAX,
+        )
+
+        bot_r = np.full(n_samp, np.nan)
+        top_r = np.full(n_samp, np.nan)
+        cen_r = cen.copy()
+        _trace_order_right(
+            image, sobel, scols, cen_r, bot_r, top_r, gidx,
+            nrows=self.NROWS, bufpix=bufpix,
+            poly_degree=self.POLY_DEG, frac=self.FRAC,
+            com_half_width=self.HALFWIN,
+            slit_height_min=self.SLITH_MIN, slit_height_max=self.SLITH_MAX,
+        )
+        # The test succeeds simply by completing (no hang / exception).
