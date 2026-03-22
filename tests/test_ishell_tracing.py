@@ -4115,3 +4115,274 @@ class TestIDLHelperFunctions:
         flux_col = np.full(nrows, 5000.0)
         guessyt, guessyb = _find_threshold_edge_guesses(flux_col, 50.0, frac=0.8)
         assert guessyb is None
+
+
+# ---------------------------------------------------------------------------
+# TestIDLHelperFunctionsGHI  (mc_findorders blocks G–I)
+# ---------------------------------------------------------------------------
+
+
+class TestIDLHelperFunctionsGHI:
+    """Unit tests for IDL mc_findorders building-block helpers G, H, and I."""
+
+    # ── Block G: _sobel_centroid ────────────────────────────────────────────
+
+    def test_sobel_centroid_finite_for_nonzero_sobel(self):
+        """Returns a finite value when the Sobel window has nonzero weight."""
+        from pyspextool.instruments.ishell.tracing import _sobel_centroid
+
+        nrows = 100
+        # Sharp Sobel spike at row 40.
+        sobel_col = np.zeros(nrows)
+        sobel_col[40] = 10.0
+        com = _sobel_centroid(sobel_col, guess_row=40, halfwin=3, nrows=nrows)
+        assert np.isfinite(com)
+        assert abs(com - 40.0) < 0.1  # spike is exactly at row 40
+
+    def test_sobel_centroid_zero_denominator_returns_nan(self):
+        """Returns NaN when all Sobel weights inside the window are zero."""
+        from pyspextool.instruments.ishell.tracing import _sobel_centroid
+
+        nrows = 100
+        sobel_col = np.zeros(nrows)  # all zero → total(z) == 0
+        com = _sobel_centroid(sobel_col, guess_row=50, halfwin=3, nrows=nrows)
+        assert np.isnan(com)
+
+    def test_sobel_centroid_window_clips_at_bottom(self):
+        """Window is clamped to row 0 when guess_row - halfwin < 0."""
+        from pyspextool.instruments.ishell.tracing import _sobel_centroid
+
+        nrows = 50
+        sobel_col = np.zeros(nrows)
+        sobel_col[0] = 5.0
+        # guess_row=2, halfwin=5 → bidx=max(0,-3)=0, so row 0 is included.
+        com = _sobel_centroid(sobel_col, guess_row=2, halfwin=5, nrows=nrows)
+        assert np.isfinite(com)
+        # COM should be pulled toward row 0 (the only nonzero weight).
+        assert com == pytest.approx(0.0)
+
+    def test_sobel_centroid_window_clips_at_top(self):
+        """Window is clamped to nrows-1 when guess_row + halfwin >= nrows."""
+        from pyspextool.instruments.ishell.tracing import _sobel_centroid
+
+        nrows = 50
+        sobel_col = np.zeros(nrows)
+        sobel_col[nrows - 1] = 7.0
+        # guess_row=48, halfwin=5 → tidx=min(49,53)=49, so last row is included.
+        com = _sobel_centroid(sobel_col, guess_row=48, halfwin=5, nrows=nrows)
+        assert np.isfinite(com)
+        assert com == pytest.approx(float(nrows - 1))
+
+    def test_sobel_centroid_matches_idl_formula(self):
+        """COM = sum(y*z)/sum(z) matches direct calculation."""
+        from pyspextool.instruments.ishell.tracing import _sobel_centroid
+
+        nrows = 30
+        sobel_col = np.zeros(nrows)
+        sobel_col[10] = 3.0
+        sobel_col[12] = 1.0
+        # guess_row=11, halfwin=4 → bidx=7, tidx=15
+        # rows 7..15 used; only rows 10 and 12 nonzero.
+        # COM = (10*3 + 12*1) / (3+1) = 42/4 = 10.5
+        com = _sobel_centroid(sobel_col, guess_row=11, halfwin=4, nrows=nrows)
+        assert com == pytest.approx(10.5)
+
+    def test_sobel_centroid_inclusive_window_idl_style(self):
+        """IDL bidx:tidx is inclusive: Python slice must be bidx:tidx+1."""
+        from pyspextool.instruments.ishell.tracing import _sobel_centroid
+
+        nrows = 20
+        sobel_col = np.zeros(nrows)
+        sobel_col[5] = 1.0   # exactly at bidx boundary
+        sobel_col[9] = 1.0   # exactly at tidx boundary
+        # guess_row=7, halfwin=2 → bidx=5, tidx=9
+        com = _sobel_centroid(sobel_col, guess_row=7, halfwin=2, nrows=nrows)
+        # Both boundary rows are included → COM = (5*1 + 9*1) / (1+1) = 7.0
+        assert com == pytest.approx(7.0)
+
+    # ── Block H: _accept_edge_pair ──────────────────────────────────────────
+
+    def test_accept_edge_pair_within_limits(self):
+        """Accept when slit_height_min < |bot - top| < slit_height_max."""
+        from pyspextool.instruments.ishell.tracing import _accept_edge_pair
+
+        # |30 - 50| = 20, 10 < 20 < 30 → accept
+        assert _accept_edge_pair(30.0, 50.0, slit_height_min=10.0, slit_height_max=30.0)
+
+    def test_accept_edge_pair_too_small(self):
+        """Reject when slit height < slit_height_min."""
+        from pyspextool.instruments.ishell.tracing import _accept_edge_pair
+
+        # |40 - 45| = 5 < 10 → reject
+        assert not _accept_edge_pair(40.0, 45.0, slit_height_min=10.0, slit_height_max=30.0)
+
+    def test_accept_edge_pair_too_large(self):
+        """Reject when slit height > slit_height_max."""
+        from pyspextool.instruments.ishell.tracing import _accept_edge_pair
+
+        # |10 - 50| = 40 > 30 → reject
+        assert not _accept_edge_pair(10.0, 50.0, slit_height_min=10.0, slit_height_max=30.0)
+
+    def test_accept_edge_pair_equal_to_min_rejected(self):
+        """IDL uses strict 'gt': height exactly equal to min is rejected."""
+        from pyspextool.instruments.ishell.tracing import _accept_edge_pair
+
+        # |30 - 40| = 10 == slit_height_min → 'gt' means strictly greater → reject
+        assert not _accept_edge_pair(30.0, 40.0, slit_height_min=10.0, slit_height_max=30.0)
+
+    def test_accept_edge_pair_equal_to_max_rejected(self):
+        """IDL uses strict 'lt': height exactly equal to max is rejected."""
+        from pyspextool.instruments.ishell.tracing import _accept_edge_pair
+
+        # |10 - 40| = 30 == slit_height_max → 'lt' means strictly less → reject
+        assert not _accept_edge_pair(10.0, 40.0, slit_height_min=10.0, slit_height_max=30.0)
+
+    def test_accept_edge_pair_nan_bottom_rejected(self):
+        """Reject when bottom edge is NaN (IDL: finite() guard)."""
+        from pyspextool.instruments.ishell.tracing import _accept_edge_pair
+
+        assert not _accept_edge_pair(np.nan, 50.0, slit_height_min=10.0, slit_height_max=60.0)
+
+    def test_accept_edge_pair_nan_top_rejected(self):
+        """Reject when top edge is NaN."""
+        from pyspextool.instruments.ishell.tracing import _accept_edge_pair
+
+        assert not _accept_edge_pair(30.0, np.nan, slit_height_min=10.0, slit_height_max=60.0)
+
+    def test_accept_edge_pair_order_independent(self):
+        """Result is symmetric: bot < top produces same answer as bot > top."""
+        from pyspextool.instruments.ishell.tracing import _accept_edge_pair
+
+        assert _accept_edge_pair(50.0, 30.0, slit_height_min=10.0, slit_height_max=30.0)
+
+    # ── Block I: _update_edge_activity_flags ────────────────────────────────
+
+    def test_activity_flags_unchanged_when_edges_interior(self):
+        """Flags remain True when both edges are well inside the detector."""
+        from pyspextool.instruments.ishell.tracing import _update_edge_activity_flags
+
+        nrows, bufpix = 1024, 5
+        top_act, bot_act = _update_edge_activity_flags(
+            top_edge=500.0, bottom_edge=480.0,
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=True, trace_bottom_active=True,
+        )
+        assert top_act is True
+        assert bot_act is True
+
+    def test_activity_flags_top_disabled_at_lower_guard(self):
+        """Top flag is disabled when com_top <= bufpix."""
+        from pyspextool.instruments.ishell.tracing import _update_edge_activity_flags
+
+        nrows, bufpix = 100, 5
+        top_act, bot_act = _update_edge_activity_flags(
+            top_edge=3.0,    # 3 <= 5 → disable top
+            bottom_edge=50.0,
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=True, trace_bottom_active=True,
+        )
+        assert top_act is False
+        assert bot_act is True
+
+    def test_activity_flags_top_disabled_at_upper_guard(self):
+        """Top flag is disabled when com_top >= nrows-1-bufpix (uses >=)."""
+        from pyspextool.instruments.ishell.tracing import _update_edge_activity_flags
+
+        nrows, bufpix = 100, 5
+        upper = nrows - 1 - bufpix  # = 94
+        top_act, bot_act = _update_edge_activity_flags(
+            top_edge=float(upper),   # exactly 94 → >= 94 → disable
+            bottom_edge=50.0,
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=True, trace_bottom_active=True,
+        )
+        assert top_act is False
+        assert bot_act is True
+
+    def test_activity_flags_bottom_disabled_at_lower_guard(self):
+        """Bottom flag is disabled when com_bot <= bufpix."""
+        from pyspextool.instruments.ishell.tracing import _update_edge_activity_flags
+
+        nrows, bufpix = 100, 5
+        top_act, bot_act = _update_edge_activity_flags(
+            top_edge=50.0,
+            bottom_edge=4.0,   # 4 <= 5 → disable bottom
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=True, trace_bottom_active=True,
+        )
+        assert top_act is True
+        assert bot_act is False
+
+    def test_activity_flags_bottom_disabled_strictly_above_upper(self):
+        """Bottom uses 'gt' (>): exactly at upper boundary does NOT disable."""
+        from pyspextool.instruments.ishell.tracing import _update_edge_activity_flags
+
+        nrows, bufpix = 100, 5
+        upper = nrows - 1 - bufpix  # = 94
+        # Exactly at boundary → gt means strictly greater → NOT disabled
+        _, bot_act = _update_edge_activity_flags(
+            top_edge=50.0,
+            bottom_edge=float(upper),   # exactly 94
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=True, trace_bottom_active=True,
+        )
+        assert bot_act is True  # NOT disabled at exact boundary (IDL uses 'gt')
+
+        # One pixel above the boundary → disabled
+        _, bot_act2 = _update_edge_activity_flags(
+            top_edge=50.0,
+            bottom_edge=float(upper) + 0.1,
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=True, trace_bottom_active=True,
+        )
+        assert bot_act2 is False
+
+    def test_activity_flags_top_bottom_asymmetry_at_upper_guard(self):
+        """Verify IDL asymmetry: top uses >= but bottom uses > at upper guard."""
+        from pyspextool.instruments.ishell.tracing import _update_edge_activity_flags
+
+        nrows, bufpix = 100, 5
+        upper = float(nrows - 1 - bufpix)  # 94.0
+
+        # Top at exactly upper boundary: top uses 'ge' → disabled
+        top_act, _ = _update_edge_activity_flags(
+            top_edge=upper, bottom_edge=50.0,
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=True, trace_bottom_active=True,
+        )
+        assert top_act is False, "top 'ge' (>=) should disable at exactly upper"
+
+        # Bottom at exactly upper boundary: bottom uses 'gt' → NOT disabled
+        _, bot_act = _update_edge_activity_flags(
+            top_edge=50.0, bottom_edge=upper,
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=True, trace_bottom_active=True,
+        )
+        assert bot_act is True, "bottom 'gt' (>) should NOT disable at exactly upper"
+
+    def test_activity_flags_nan_edge_leaves_flag_unchanged(self):
+        """NaN edge values must not disable active flags."""
+        from pyspextool.instruments.ishell.tracing import _update_edge_activity_flags
+
+        nrows, bufpix = 100, 5
+        top_act, bot_act = _update_edge_activity_flags(
+            top_edge=np.nan, bottom_edge=np.nan,
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=True, trace_bottom_active=True,
+        )
+        # NaN <= bufpix is False in Python (matches IDL's finite() guard)
+        assert top_act is True
+        assert bot_act is True
+
+    def test_activity_flags_already_inactive_stays_inactive(self):
+        """Already-False flags are not re-enabled regardless of edge value."""
+        from pyspextool.instruments.ishell.tracing import _update_edge_activity_flags
+
+        nrows, bufpix = 100, 5
+        top_act, bot_act = _update_edge_activity_flags(
+            top_edge=50.0, bottom_edge=50.0,
+            nrows=nrows, bufpix=bufpix,
+            trace_top_active=False, trace_bottom_active=False,
+        )
+        assert top_act is False
+        assert bot_act is False

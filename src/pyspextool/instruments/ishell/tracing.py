@@ -2351,3 +2351,158 @@ def _find_threshold_edge_guesses(
     guessyb: int | None = int(zbot_idx[-1]) if len(zbot_idx) > 0 else None
 
     return guessyt, guessyb
+
+
+# ---------------------------------------------------------------------------
+# IDL mc_findorders building-block helpers (blocks G–I)
+# ---------------------------------------------------------------------------
+
+
+def _sobel_centroid(
+    sobel_col: npt.NDArray,
+    guess_row: int,
+    halfwin: int,
+    nrows: int,
+) -> float:
+    """Compute the Sobel-weighted centroid (COM) around a threshold-guess row.
+
+    IDL block (mc_findorders.pro, lines 224–229 for top, 240–246 for bottom):
+        bidx    = 0 > (guessyt - halfwin)
+        tidx    = (guessyt + halfwin) < (nrows-1)
+        y       = row[bidx:tidx]
+        z       = rcol[bidx:tidx]
+        COM_top = total(y*z) / total(z)
+
+    In IDL the subscript ``bidx:tidx`` is *inclusive* on both ends; the
+    Python equivalent is ``bidx : tidx+1``.
+
+    Parameters
+    ----------
+    sobel_col : ndarray of float, shape (nrows,)
+        Sobel column profile (IDL ``rcol``).
+    guess_row : int
+        Threshold-guess row index (IDL ``guessyt`` / ``guessyb``).
+    halfwin : int
+        Half-width of the COM window in rows (IDL ``halfwin``).
+    nrows : int
+        Number of detector rows (used to clip ``tidx``).
+
+    Returns
+    -------
+    float
+        Sobel-weighted centroid row position, or ``NaN`` when the local
+        Sobel sum is zero (undefined COM).
+    """
+    # IDL: bidx = 0 > (guess_row - halfwin)   → max(0, guess_row - halfwin)
+    bidx = max(0, guess_row - halfwin)
+    # IDL: tidx = (guess_row + halfwin) < (nrows-1)  → min(nrows-1, guess_row + halfwin)
+    tidx = min(nrows - 1, guess_row + halfwin)
+
+    row = np.arange(nrows, dtype=float)
+    # IDL subscript bidx:tidx is inclusive; Python slice is bidx:tidx+1.
+    y = row[bidx: tidx + 1]
+    z = sobel_col[bidx: tidx + 1]
+
+    # IDL: COM = total(y*z) / total(z)
+    total_z = float(np.sum(z))
+    if total_z == 0.0:
+        return np.nan
+    return float(np.sum(y * z) / total_z)
+
+
+def _accept_edge_pair(
+    bottom_edge: float,
+    top_edge: float,
+    slit_height_min: float,
+    slit_height_max: float,
+) -> bool:
+    """Return True when the edge pair passes the IDL slit-height sanity check.
+
+    IDL block (mc_findorders.pro, lines 277–285, repeated at lines 367–375):
+        if dotop and dobot and finite(COM_bot) and finite(COM_top) then begin
+            if abs(com_bot-com_top) gt slith_pix[0] and
+               abs(com_bot-com_top) lt slith_pix[1] then begin
+                ; accept
+            endif else goto, cont1   ; reject
+        endif else begin
+            ; NaN case → store NaN, fall back to y_guess
+        endelse
+
+    Parameters
+    ----------
+    bottom_edge : float
+        COM position of the bottom edge (IDL ``com_bot``).
+    top_edge : float
+        COM position of the top edge (IDL ``com_top``).
+    slit_height_min : float
+        Minimum acceptable slit height in pixels (IDL ``slith_pix[0]``).
+    slit_height_max : float
+        Maximum acceptable slit height in pixels (IDL ``slith_pix[1]``).
+
+    Returns
+    -------
+    bool
+        ``True`` when both edges are finite and the slit height satisfies
+        ``slit_height_min < |bottom - top| < slit_height_max``.
+        ``False`` otherwise (IDL ``goto cont1/cont2`` path).
+    """
+    if not (np.isfinite(bottom_edge) and np.isfinite(top_edge)):
+        return False
+    slit_h = abs(bottom_edge - top_edge)
+    # IDL: abs(com_bot-com_top) gt slith_pix[0] and abs(...) lt slith_pix[1]
+    return bool(slit_h > slit_height_min and slit_h < slit_height_max)
+
+
+def _update_edge_activity_flags(
+    top_edge: float,
+    bottom_edge: float,
+    nrows: int,
+    bufpix: int,
+    trace_top_active: bool,
+    trace_bottom_active: bool,
+) -> tuple[bool, bool]:
+    """Disable a tracing side when its edge COM reaches the detector guard band.
+
+    IDL block (mc_findorders.pro, lines 302–303, repeated at lines 393–394):
+        if com_top le bufpix or com_top ge (nrows-1-bufpix) then dotop = 0
+        if com_bot le bufpix or com_bot gt (nrows-1-bufpix) then dobot = 0
+
+    Note the intentional asymmetry between the top and bottom tests:
+    * Top uses ``ge`` (>=) for the upper boundary.
+    * Bottom uses ``gt`` (>)  for the upper boundary.
+
+    NaN edge values leave the flag unchanged (NaN comparisons are always
+    False in Python, matching IDL's ``finite()`` guard).
+
+    Parameters
+    ----------
+    top_edge : float
+        COM position of the top edge (IDL ``com_top``).
+    bottom_edge : float
+        COM position of the bottom edge (IDL ``com_bot``).
+    nrows : int
+        Number of detector rows.
+    bufpix : int
+        Guard-band width in rows (IDL ``bufpix``).
+    trace_top_active : bool
+        Current state of the top-edge tracing flag (IDL ``dotop``).
+    trace_bottom_active : bool
+        Current state of the bottom-edge tracing flag (IDL ``dobot``).
+
+    Returns
+    -------
+    (trace_top_active, trace_bottom_active) : (bool, bool)
+        Updated flags.
+    """
+    upper = nrows - 1 - bufpix
+
+    # IDL: if com_top le bufpix or com_top ge (nrows-1-bufpix) then dotop = 0
+    if trace_top_active and (top_edge <= bufpix or top_edge >= upper):
+        trace_top_active = False
+
+    # IDL: if com_bot le bufpix or com_bot gt (nrows-1-bufpix) then dobot = 0
+    # Note: 'gt' (strictly greater than) for bottom, 'ge' (>=) for top.
+    if trace_bottom_active and (bottom_edge <= bufpix or bottom_edge > upper):
+        trace_bottom_active = False
+
+    return trace_top_active, trace_bottom_active
