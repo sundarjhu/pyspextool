@@ -2050,3 +2050,304 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
         )
     else:
         logger.info("All %d orders passed QA checks.", len(stats))
+
+
+# ---------------------------------------------------------------------------
+# IDL mc_findorders building-block helpers (blocks A–F)
+# ---------------------------------------------------------------------------
+# These functions are named, minimal Python ports of the corresponding IDL
+# code blocks inside mc_findorders.pro.  They are called by _trace_single_order
+# (and may be called directly by tests).
+# ---------------------------------------------------------------------------
+
+
+def _compute_sobel_image(image: npt.NDArray) -> npt.NDArray:
+    """Return the Sobel-filtered image with IDL-matching normalisation.
+
+    IDL block (mc_findorders.pro, line 158):
+        rimage = sobel(image*1000./max(image))
+
+    The factor of 1000 and the division by max(image) are kept explicit to
+    match the IDL semantics.  The actual COM step uses relative weights so the
+    absolute scale is cosmetic, but correctness requires the normalisation.
+
+    Parameters
+    ----------
+    image : ndarray, shape (nrows, ncols)
+        Raw flat-field image in row-major order (Python convention).
+
+    Returns
+    -------
+    ndarray, shape (nrows, ncols), dtype float
+        Sobel gradient magnitude of the normalised image.
+    """
+    max_val = float(np.max(image))
+    if max_val == 0.0:
+        return np.zeros_like(image, dtype=float)
+    # IDL: image*1000./max(image)
+    scaled = image.astype(float) * (1000.0 / max_val)
+    # IDL sobel() = sqrt(Gx^2 + Gy^2) applied along both axes.
+    s0 = _scipy_sobel(scaled, axis=0)
+    s1 = _scipy_sobel(scaled, axis=1)
+    return np.sqrt(s0 ** 2 + s1 ** 2)
+
+
+def _build_sample_cols(x_lo: int, x_hi: int, step: int) -> npt.NDArray:
+    """Construct the sample-column array for one order.
+
+    IDL block (mc_findorders.pro, lines 169–171):
+        starts = start + step - 1
+        stops  = stop  - step + 1
+        scols  = findgen(fix((stops-starts)/step)+1)*step + starts
+
+    Parameters
+    ----------
+    x_lo : int
+        First column of the order range (IDL ``start`` / ``sranges[0,i]``).
+    x_hi : int
+        Last column of the order range (IDL ``stop``  / ``sranges[1,i]``).
+    step : int
+        Step size in columns (IDL ``step``).
+
+    Returns
+    -------
+    ndarray of int
+        Sample column indices.
+    """
+    starts = x_lo + step - 1
+    stops = x_hi - step + 1
+    # IDL: findgen(fix((stops-starts)/step)+1)*step + starts
+    n = int((stops - starts) / step) + 1
+    return (np.arange(n, dtype=float) * step + starts).astype(int)
+
+
+def _initialize_order_trace_arrays(
+    sample_cols: npt.NDArray,
+    guess_col: float,
+    guess_row: float,
+    poly_degree: int,
+) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray, int]:
+    """Create and seed the per-order trace arrays.
+
+    IDL block (mc_findorders.pro, lines 173–195):
+        edges = replicate(!values.f_nan, nscols, 2)
+        cen   = fltarr(nscols) + !values.f_nan
+        tabinv, scols, guesspos[0,i], idx
+        gidx  = round(idx)
+        cen[(gidx-degree):(gidx+degree)] = guesspos[1,i]
+
+    Parameters
+    ----------
+    sample_cols : ndarray of int, shape (n_samp,)
+        Per-order sample column indices (``scols`` in IDL).
+    guess_col : float
+        X-coordinate of the guess position (``guesspos[0,i]``).
+    guess_row : float
+        Y-coordinate of the guess position (``guesspos[1,i]``).
+    poly_degree : int
+        Polynomial degree (IDL ``degree``).  Seeds the range
+        ``[gidx-degree, gidx+degree]`` (inclusive).
+
+    Returns
+    -------
+    edges : ndarray of float, shape (n_samp, 2)
+        NaN-filled array for bottom (col 0) and top (col 1) edge positions.
+    cen : ndarray of float, shape (n_samp,)
+        NaN-filled centre array seeded with *guess_row* near *gidx*.
+    bot : ndarray of float, shape (n_samp,)
+        NaN-filled bottom-edge array (alias for edges[:, 0]).
+    gidx : int
+        Index in *sample_cols* closest to *guess_col* (IDL ``gidx``).
+    """
+    n_samp = len(sample_cols)
+    edges = np.full((n_samp, 2), np.nan)
+    cen = np.full(n_samp, np.nan)
+
+    # IDL: tabinv(scols, guesspos[0,i], idx); gidx = round(idx)
+    # tabinv finds the floating-point index by linear interpolation.
+    # Equivalent: find the position in the sorted array.
+    idx_f = float(np.interp(guess_col, sample_cols.astype(float),
+                             np.arange(n_samp, dtype=float)))
+    gidx = max(0, min(n_samp - 1, int(round(idx_f))))
+
+    # IDL: cen[(gidx-degree):(gidx+degree)] = guesspos[1,i]
+    lo = max(0, gidx - poly_degree)
+    hi = min(n_samp - 1, gidx + poly_degree)
+    cen[lo: hi + 1] = guess_row
+
+    return edges, cen, edges[:, 0], gidx
+
+
+def _predict_center_from_known_samples(
+    sample_cols: npt.NDArray,
+    center_samples: npt.NDArray,
+    predict_col: float,
+    poly_degree: int,
+    nrows: int,
+    bufpix: int,
+) -> float:
+    """Predict the order centre at *predict_col* from previously-traced samples.
+
+    IDL block (mc_findorders.pro, lines 208–210):
+        coeff   = mc_polyfit1d(scols, cen, 1 > (degree-2), /SILENT, /JUSTFIT)
+        y_guess = bufpix > poly(scols[k], coeff) < (nrows-bufpix-1)
+
+    Only finite entries in *center_samples* are used for the fit
+    (IDL's ``mc_polyfit1d`` with ``/JUSTFIT`` ignores NaN points by design).
+
+    Parameters
+    ----------
+    sample_cols : ndarray of float-or-int, shape (n_samp,)
+        All sample column positions for this order.
+    center_samples : ndarray of float, shape (n_samp,)
+        Current centre estimates; NaN where not yet determined.
+    predict_col : float
+        Column at which to predict the centre (``scols[k]`` in IDL).
+    poly_degree : int
+        Full polynomial degree (IDL ``degree``).  The temporary fit degree is
+        ``max(1, poly_degree - 2)`` (IDL: ``1 > (degree-2)``).
+    nrows : int
+        Number of detector rows.
+    bufpix : int
+        Detector-edge buffer in rows (IDL ``bufpix``).
+
+    Returns
+    -------
+    float
+        Predicted centre row, clamped to ``[bufpix, nrows - bufpix - 1]``.
+    """
+    # IDL: 1 > (degree-2)  →  max(1, degree-2)
+    fit_deg = max(1, poly_degree - 2)
+
+    valid_mask = np.isfinite(center_samples)
+    n_valid = int(valid_mask.sum())
+
+    if n_valid >= fit_deg + 1:
+        r = _polyfit_1d(
+            sample_cols[valid_mask].astype(float),
+            center_samples[valid_mask],
+            fit_deg,
+            justfit=True,
+            silent=True,
+        )
+        y_pred = float(np.polynomial.polynomial.polyval(float(predict_col), r["coeffs"]))
+    elif n_valid > 0:
+        # Not enough points for the requested degree; fall back to nearest finite.
+        y_pred = float(center_samples[valid_mask][0])
+    else:
+        y_pred = 0.0
+
+    # IDL: bufpix > y_guess < (nrows-bufpix-1)  →  clamp
+    return float(np.clip(y_pred, bufpix, nrows - bufpix - 1))
+
+
+def _extract_column_profiles(
+    image: npt.NDArray,
+    sobel_image: npt.NDArray,
+    col: int,
+) -> tuple[npt.NDArray, npt.NDArray]:
+    """Extract the flux and Sobel column profiles at *col*.
+
+    IDL block (mc_findorders.pro, lines 205–206):
+        fcol = reform( image[scols[k],*] )
+        rcol = reform( rimage[scols[k],*] )
+
+    In IDL, ``image`` is column-major, so ``image[col, *]`` yields a 1-D
+    array of all rows at that column.  Python uses row-major storage, so the
+    equivalent is ``image[:, col]``.
+
+    Parameters
+    ----------
+    image : ndarray, shape (nrows, ncols)
+        Flat-field image.
+    sobel_image : ndarray, shape (nrows, ncols)
+        Sobel-filtered image (from :func:`_compute_sobel_image`).
+    col : int
+        Column index to extract.
+
+    Returns
+    -------
+    fcol : ndarray of float, shape (nrows,)
+        Flux column profile (IDL ``fcol``).
+    rcol : ndarray of float, shape (nrows,)
+        Sobel column profile (IDL ``rcol``).
+    """
+    return image[:, col].astype(float), sobel_image[:, col].astype(float)
+
+
+def _local_flux_at_guess(flux_col: npt.NDArray, y_guess: float) -> float:
+    """Return the flux at the predicted order-centre row.
+
+    IDL block (mc_findorders.pro, line 210):
+        z_guess = fcol[y_guess]
+
+    In IDL ``y_guess`` is already a rounded integer (from the ``bufpix >
+    poly(...) < (nrows-bufpix-1)`` expression).  This function rounds to the
+    nearest integer explicitly to match that behaviour.
+
+    Parameters
+    ----------
+    flux_col : ndarray of float, shape (nrows,)
+        Flux column profile.
+    y_guess : float
+        Predicted order-centre row (may be fractional).
+
+    Returns
+    -------
+    float
+        Flux value at the integer row nearest to *y_guess*.
+    """
+    return float(flux_col[int(round(y_guess))])
+
+
+def _find_threshold_edge_guesses(
+    flux_col: npt.NDArray,
+    y_guess: float,
+    frac: float,
+) -> tuple[int | None, int | None]:
+    """Find the first-crossing row indices above and below the centre guess.
+
+    IDL block (mc_findorders.pro, lines 220–248):
+        ; Top:
+        ztop = where(fcol lt frac*z_guess and row gt y_guess, cnt)
+        if cnt ne 0 then guessyt = ztop[0]
+        ; Bottom:
+        zbot = where(fcol lt frac*z_guess and row lt y_guess, cnt)
+        if cnt ne 0 then guessyb = zbot[cnt-1]
+
+    These are *threshold guess* rows used to anchor the Sobel COM window —
+    not final edge positions.
+
+    Parameters
+    ----------
+    flux_col : ndarray of float, shape (nrows,)
+        Flux column profile (IDL ``fcol``).
+    y_guess : float
+        Predicted order-centre row (IDL ``y_guess``).
+    frac : float
+        Flux fraction threshold (IDL ``frac``).
+
+    Returns
+    -------
+    guessyt : int or None
+        Row index of the first pixel *above* ``y_guess`` where
+        ``flux < frac * z_guess`` (IDL: ``ztop[0]``).
+        ``None`` if no such row exists (IDL: ``cnt eq 0``).
+    guessyb : int or None
+        Row index of the last pixel *below* ``y_guess`` where
+        ``flux < frac * z_guess`` (IDL: ``zbot[cnt-1]``).
+        ``None`` if no such row exists (IDL: ``cnt eq 0``).
+    """
+    z_guess = _local_flux_at_guess(flux_col, y_guess)
+    threshold = frac * z_guess
+    row = np.arange(len(flux_col), dtype=float)
+
+    # IDL: ztop = where(fcol lt frac*z_guess and row gt y_guess, cnt)
+    ztop_idx = np.where((flux_col < threshold) & (row > y_guess))[0]
+    guessyt: int | None = int(ztop_idx[0]) if len(ztop_idx) > 0 else None
+
+    # IDL: zbot = where(fcol lt frac*z_guess and row lt y_guess, cnt)
+    zbot_idx = np.where((flux_col < threshold) & (row < y_guess))[0]
+    guessyb: int | None = int(zbot_idx[-1]) if len(zbot_idx) > 0 else None
+
+    return guessyt, guessyb

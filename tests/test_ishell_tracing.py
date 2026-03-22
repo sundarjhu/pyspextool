@@ -3728,3 +3728,390 @@ class TestIDLPortFidelity:
         assert len(bad) == 0, (
             f"Orders {bad.tolist()} have NaN fit_rms — tracing core regression"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestIDLHelperFunctions  (mc_findorders blocks A–F)
+# ---------------------------------------------------------------------------
+
+
+class TestIDLHelperFunctions:
+    """Unit tests for the named IDL mc_findorders building-block helpers.
+
+    Each test maps to a specific IDL block (A–F) as described in the
+    problem statement and in the function docstrings.
+    """
+
+    # ── Block A: _compute_sobel_image ───────────────────────────────────────
+
+    def test_sobel_image_shape_preserved(self):
+        """_compute_sobel_image returns an array with the same shape as input."""
+        from pyspextool.instruments.ishell.tracing import _compute_sobel_image
+
+        img = np.ones((32, 64), dtype=np.float32) * 100.0
+        result = _compute_sobel_image(img)
+        assert result.shape == img.shape
+
+    def test_sobel_image_zero_input_returns_zeros(self):
+        """All-zero image → all-zero Sobel image (no division by zero)."""
+        from pyspextool.instruments.ishell.tracing import _compute_sobel_image
+
+        img = np.zeros((16, 16), dtype=np.float32)
+        result = _compute_sobel_image(img)
+        np.testing.assert_array_equal(result, 0.0)
+
+    def test_sobel_image_uniform_field_near_zero(self):
+        """A spatially uniform flat field has near-zero gradient everywhere."""
+        from pyspextool.instruments.ishell.tracing import _compute_sobel_image
+
+        img = np.full((32, 64), 500.0, dtype=np.float32)
+        result = _compute_sobel_image(img)
+        # Uniform → no edges → Sobel ≈ 0 everywhere (float precision)
+        assert float(np.max(np.abs(result))) < 1e-6
+
+    def test_sobel_image_edge_band_has_high_response(self):
+        """A sharp horizontal edge produces large Sobel response at the boundary."""
+        from pyspextool.instruments.ishell.tracing import _compute_sobel_image
+
+        img = np.zeros((64, 64), dtype=np.float32)
+        img[30:, :] = 1000.0  # sharp horizontal step at row 30
+        result = _compute_sobel_image(img)
+        # Maximum response should be near row 30
+        max_row = int(np.unravel_index(np.argmax(result), result.shape)[0])
+        assert abs(max_row - 30) <= 2
+
+    def test_sobel_image_explicit_1000_normalisation(self):
+        """Scaling by 1000 in _compute_sobel_image must equal scaling by k*1000 up to proportionality."""
+        from pyspextool.instruments.ishell.tracing import _compute_sobel_image
+
+        rng = np.random.default_rng(0)
+        img = rng.uniform(100, 200, size=(32, 32)).astype(np.float32)
+        # Doubling all values leaves normalisation unchanged → same Sobel image.
+        r1 = _compute_sobel_image(img)
+        r2 = _compute_sobel_image(img * 2.0)
+        np.testing.assert_allclose(r1, r2, rtol=1e-5)
+
+    # ── Block B: _build_sample_cols ─────────────────────────────────────────
+
+    def test_build_sample_cols_basic(self):
+        """IDL: starts=start+step-1, stops=stop-step+1, n=fix((stops-starts)/step)+1."""
+        from pyspextool.instruments.ishell.tracing import _build_sample_cols
+
+        # x_lo=10, x_hi=50, step=5
+        # starts = 10+5-1 = 14
+        # stops  = 50-5+1 = 46
+        # n = fix((46-14)/5)+1 = fix(6.4)+1 = 6+1 = 7
+        # scols = [0,1,2,3,4,5,6]*5 + 14 = [14,19,24,29,34,39,44]
+        scols = _build_sample_cols(10, 50, 5)
+        expected = np.array([14, 19, 24, 29, 34, 39, 44])
+        np.testing.assert_array_equal(scols, expected)
+
+    def test_build_sample_cols_step_1(self):
+        """Step=1: starts=x_lo, stops=x_hi, dense sampling."""
+        from pyspextool.instruments.ishell.tracing import _build_sample_cols
+
+        # x_lo=0, x_hi=4, step=1
+        # starts=0, stops=4, n=fix(4/1)+1=5
+        # scols=[0,1,2,3,4]
+        scols = _build_sample_cols(0, 4, 1)
+        expected = np.array([0, 1, 2, 3, 4])
+        np.testing.assert_array_equal(scols, expected)
+
+    def test_build_sample_cols_does_not_start_at_x_lo(self):
+        """scols[0] = x_lo + step - 1 (inset by step-1 from the range boundary)."""
+        from pyspextool.instruments.ishell.tracing import _build_sample_cols
+
+        scols = _build_sample_cols(100, 200, 10)
+        # starts = 100 + 10 - 1 = 109
+        assert scols[0] == 109
+
+    def test_build_sample_cols_spacing(self):
+        """All consecutive differences equal the step size."""
+        from pyspextool.instruments.ishell.tracing import _build_sample_cols
+
+        step = 7
+        scols = _build_sample_cols(0, 100, step)
+        diffs = np.diff(scols)
+        assert np.all(diffs == step)
+
+    def test_build_sample_cols_last_le_x_hi_minus_step(self):
+        """The last sample column is ≤ x_hi - step + 1 (stops boundary)."""
+        from pyspextool.instruments.ishell.tracing import _build_sample_cols
+
+        x_lo, x_hi, step = 50, 500, 20
+        scols = _build_sample_cols(x_lo, x_hi, step)
+        stops = x_hi - step + 1
+        assert scols[-1] <= stops
+
+    # ── Block C: _initialize_order_trace_arrays ─────────────────────────────
+
+    def test_initialize_arrays_all_nan_outside_seed_window(self):
+        """All cen entries outside [gidx-degree, gidx+degree] must be NaN."""
+        from pyspextool.instruments.ishell.tracing import (
+            _build_sample_cols,
+            _initialize_order_trace_arrays,
+        )
+
+        scols = _build_sample_cols(0, 100, 5)
+        poly_degree = 3
+        guess_col = float(scols[len(scols) // 2])
+        edges, cen, bot, gidx = _initialize_order_trace_arrays(
+            scols, guess_col, 128.0, poly_degree
+        )
+
+        lo = max(0, gidx - poly_degree)
+        hi = min(len(scols) - 1, gidx + poly_degree)
+
+        # All entries strictly outside the seed window must be NaN.
+        for j in range(len(cen)):
+            if j < lo or j > hi:
+                assert np.isnan(cen[j]), f"cen[{j}] should be NaN, got {cen[j]}"
+
+    def test_initialize_arrays_seed_window_filled(self):
+        """All cen entries inside [gidx-degree, gidx+degree] equal guess_row."""
+        from pyspextool.instruments.ishell.tracing import (
+            _build_sample_cols,
+            _initialize_order_trace_arrays,
+        )
+
+        scols = _build_sample_cols(0, 100, 5)
+        poly_degree = 3
+        guess_col = float(scols[len(scols) // 2])
+        guess_row = 75.5
+        edges, cen, bot, gidx = _initialize_order_trace_arrays(
+            scols, guess_col, guess_row, poly_degree
+        )
+
+        lo = max(0, gidx - poly_degree)
+        hi = min(len(scols) - 1, gidx + poly_degree)
+        for j in range(lo, hi + 1):
+            assert cen[j] == pytest.approx(guess_row), (
+                f"cen[{j}] = {cen[j]}, expected {guess_row}"
+            )
+
+    def test_initialize_arrays_edges_all_nan(self):
+        """edges array must be entirely NaN at initialization."""
+        from pyspextool.instruments.ishell.tracing import (
+            _build_sample_cols,
+            _initialize_order_trace_arrays,
+        )
+
+        scols = _build_sample_cols(0, 60, 5)
+        edges, cen, bot, gidx = _initialize_order_trace_arrays(
+            scols, float(scols[4]), 100.0, 2
+        )
+        assert np.all(np.isnan(edges))
+
+    def test_initialize_arrays_gidx_closest_to_guess_col(self):
+        """gidx must be the index closest to guess_col in sample_cols."""
+        from pyspextool.instruments.ishell.tracing import (
+            _build_sample_cols,
+            _initialize_order_trace_arrays,
+        )
+
+        scols = _build_sample_cols(10, 90, 10)
+        # scols = [19, 29, 39, 49, 59, 69, 79]
+        guess_col = 50.0  # closest to index 3 (value 49)
+        _, _, _, gidx = _initialize_order_trace_arrays(scols, guess_col, 100.0, 2)
+        expected_gidx = int(np.argmin(np.abs(scols - guess_col)))
+        assert gidx == expected_gidx
+
+    def test_initialize_arrays_edges_shape(self):
+        """edges shape must be (n_samp, 2)."""
+        from pyspextool.instruments.ishell.tracing import (
+            _build_sample_cols,
+            _initialize_order_trace_arrays,
+        )
+
+        scols = _build_sample_cols(0, 50, 5)
+        edges, cen, bot, gidx = _initialize_order_trace_arrays(
+            scols, float(scols[3]), 64.0, 2
+        )
+        assert edges.shape == (len(scols), 2)
+        assert cen.shape == (len(scols),)
+
+    # ── Block D: _predict_center_from_known_samples ─────────────────────────
+
+    def test_predict_uses_only_finite_samples(self):
+        """NaN entries in center_samples must be ignored in the polynomial fit."""
+        from pyspextool.instruments.ishell.tracing import _predict_center_from_known_samples
+
+        sample_cols = np.array([0, 10, 20, 30, 40, 50], dtype=float)
+        # Only columns 20, 30, 40 have known (finite) centres; the rest are NaN.
+        center_samples = np.array([np.nan, np.nan, 100.0, 102.0, 104.0, np.nan])
+        # Predict at column 50.
+        y = _predict_center_from_known_samples(
+            sample_cols, center_samples, 50.0, poly_degree=3, nrows=256, bufpix=1
+        )
+        # poly_degree=3 → fit_deg = max(1, 1) = 1 (linear).
+        # Linear fit to (20,100),(30,102),(40,104): slope = 0.2/col.
+        # Extrapolation to col 50: 100 + 0.2*(50-20) = 106.
+        assert np.isfinite(y)
+        assert abs(y - 106.0) < 1.0  # ≈106 from linear extrapolation
+
+    def test_predict_temporary_degree_is_max1_degree_minus_2(self):
+        """The fit degree must be max(1, poly_degree - 2) as in IDL."""
+        from pyspextool.instruments.ishell.tracing import _predict_center_from_known_samples
+
+        # poly_degree=3 → fit_deg = max(1, 1) = 1  (linear)
+        # poly_degree=4 → fit_deg = max(1, 2) = 2  (quadratic)
+        # poly_degree=1 → fit_deg = max(1, -1) = 1 (linear)
+        # We test that with only 2 finite points and poly_degree=3 (fit_deg=1)
+        # the function succeeds (degree 1 requires ≥ 2 points).
+        sample_cols = np.array([0.0, 10.0, 20.0, 30.0])
+        centers = np.array([50.0, 55.0, np.nan, np.nan])
+        y = _predict_center_from_known_samples(
+            sample_cols, centers, 20.0, poly_degree=3, nrows=256, bufpix=1
+        )
+        assert np.isfinite(y)
+
+    def test_predict_clamps_to_detector_bounds(self):
+        """y_guess must be clamped to [bufpix, nrows - bufpix - 1]."""
+        from pyspextool.instruments.ishell.tracing import _predict_center_from_known_samples
+
+        # Force extrapolation far out of bounds.
+        sample_cols = np.array([0.0, 10.0, 20.0, 30.0])
+        centers = np.array([10.0, 8.0, 6.0, 4.0])  # trend heading toward negative rows
+        y = _predict_center_from_known_samples(
+            sample_cols, centers, 1000.0,  # wildly extrapolated column
+            poly_degree=2, nrows=256, bufpix=5
+        )
+        assert y >= 5
+        assert y <= 256 - 5 - 1
+
+    def test_predict_handles_all_nan(self):
+        """All-NaN center_samples must return a clamped fallback value."""
+        from pyspextool.instruments.ishell.tracing import _predict_center_from_known_samples
+
+        sample_cols = np.array([0.0, 10.0, 20.0, 30.0])
+        centers = np.full(4, np.nan)
+        y = _predict_center_from_known_samples(
+            sample_cols, centers, 15.0, poly_degree=2, nrows=128, bufpix=2
+        )
+        # Should return something clamped and finite.
+        assert np.isfinite(y)
+        assert 2 <= y <= 128 - 2 - 1
+
+    # ── Blocks E+F: _extract_column_profiles, _local_flux_at_guess,
+    #               _find_threshold_edge_guesses ────────────────────────────
+
+    def test_extract_column_profiles_shape(self):
+        """_extract_column_profiles returns (nrows,) vectors."""
+        from pyspextool.instruments.ishell.tracing import (
+            _compute_sobel_image,
+            _extract_column_profiles,
+        )
+
+        nrows, ncols = 64, 128
+        img = np.random.default_rng(1).uniform(0, 1000, (nrows, ncols)).astype(np.float32)
+        sobel = _compute_sobel_image(img)
+        fcol, rcol = _extract_column_profiles(img, sobel, col=40)
+        assert fcol.shape == (nrows,)
+        assert rcol.shape == (nrows,)
+
+    def test_extract_column_profiles_values_match_column(self):
+        """fcol must exactly equal image[:, col]."""
+        from pyspextool.instruments.ishell.tracing import (
+            _compute_sobel_image,
+            _extract_column_profiles,
+        )
+
+        img = np.arange(16 * 32, dtype=np.float32).reshape(16, 32)
+        sobel = _compute_sobel_image(img)
+        col = 5
+        fcol, rcol = _extract_column_profiles(img, sobel, col)
+        np.testing.assert_array_equal(fcol, img[:, col].astype(float))
+
+    def test_local_flux_rounds_to_nearest_integer_row(self):
+        """_local_flux_at_guess must index with round(y_guess), not int(y_guess)."""
+        from pyspextool.instruments.ishell.tracing import _local_flux_at_guess
+
+        flux_col = np.arange(100, dtype=float)  # flux[i] = i
+        # y_guess = 10.6 → round = 11, not int(10.6) = 10
+        assert _local_flux_at_guess(flux_col, 10.6) == pytest.approx(11.0)
+        # y_guess = 10.4 → round = 10
+        assert _local_flux_at_guess(flux_col, 10.4) == pytest.approx(10.0)
+
+    def test_find_threshold_edge_guesses_top_is_above_y_guess(self):
+        """guessyt (top guess) must be strictly above y_guess."""
+        from pyspextool.instruments.ishell.tracing import _find_threshold_edge_guesses
+
+        nrows = 100
+        # Background = 200, order peak = 1000 at row 50.
+        flux_col = np.full(nrows, 200.0)
+        flux_col[45:56] = 1000.0  # order spans rows 45–55
+        y_guess = 50.0
+        frac = 0.8
+        guessyt, guessyb = _find_threshold_edge_guesses(flux_col, y_guess, frac)
+        if guessyt is not None:
+            assert guessyt > y_guess, (
+                f"guessyt={guessyt} must be > y_guess={y_guess}"
+            )
+
+    def test_find_threshold_edge_guesses_bottom_is_below_y_guess(self):
+        """guessyb (bottom guess) must be strictly below y_guess."""
+        from pyspextool.instruments.ishell.tracing import _find_threshold_edge_guesses
+
+        nrows = 100
+        flux_col = np.full(nrows, 200.0)
+        flux_col[45:56] = 1000.0
+        y_guess = 50.0
+        frac = 0.8
+        guessyt, guessyb = _find_threshold_edge_guesses(flux_col, y_guess, frac)
+        if guessyb is not None:
+            assert guessyb < y_guess, (
+                f"guessyb={guessyb} must be < y_guess={y_guess}"
+            )
+
+    def test_find_threshold_edge_guesses_top_is_first_crossing(self):
+        """guessyt must be the FIRST (lowest) row above y_guess below threshold.
+
+        IDL: ztop = where(fcol lt frac*z_guess and row gt y_guess, cnt)
+               guessyt = ztop[0]   ; first element
+        """
+        from pyspextool.instruments.ishell.tracing import _find_threshold_edge_guesses
+
+        nrows = 200
+        flux_col = np.full(nrows, 500.0)
+        flux_col[80:120] = 2000.0  # order centre at row 100
+        y_guess = 100.0
+        frac = 0.8
+        guessyt, _ = _find_threshold_edge_guesses(flux_col, y_guess, frac)
+        # First crossing above row 100 where flux drops below frac*2000=1600 is row 120.
+        assert guessyt == 120
+
+    def test_find_threshold_edge_guesses_bottom_is_last_crossing(self):
+        """guessyb must be the LAST (highest) row below y_guess below threshold.
+
+        IDL: zbot = where(fcol lt frac*z_guess and row lt y_guess, cnt)
+               guessyb = zbot[cnt-1]   ; last element
+        """
+        from pyspextool.instruments.ishell.tracing import _find_threshold_edge_guesses
+
+        nrows = 200
+        flux_col = np.full(nrows, 500.0)
+        flux_col[80:120] = 2000.0  # order centre at row 100
+        y_guess = 100.0
+        frac = 0.8
+        _, guessyb = _find_threshold_edge_guesses(flux_col, y_guess, frac)
+        # Last crossing below row 100 where flux drops below frac*2000=1600 is row 79.
+        assert guessyb == 79
+
+    def test_find_threshold_edge_guesses_no_top_returns_none(self):
+        """When no row above y_guess drops below threshold, guessyt must be None."""
+        from pyspextool.instruments.ishell.tracing import _find_threshold_edge_guesses
+
+        nrows = 100
+        # Flux is high everywhere → never drops below threshold above y_guess.
+        flux_col = np.full(nrows, 5000.0)
+        guessyt, guessyb = _find_threshold_edge_guesses(flux_col, 50.0, frac=0.8)
+        assert guessyt is None
+
+    def test_find_threshold_edge_guesses_no_bottom_returns_none(self):
+        """When no row below y_guess drops below threshold, guessyb must be None."""
+        from pyspextool.instruments.ishell.tracing import _find_threshold_edge_guesses
+
+        nrows = 100
+        flux_col = np.full(nrows, 5000.0)
+        guessyt, guessyb = _find_threshold_edge_guesses(flux_col, 50.0, frac=0.8)
+        assert guessyb is None
