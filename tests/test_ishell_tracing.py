@@ -5636,13 +5636,13 @@ class TestMCFindordersDriftAudit:
         assert np.isclose(coeffs[2], 0.001, atol=0.001), f"c2={coeffs[2]:.6f}"
         assert np.isfinite(rms) and rms < 1.0, f"rms={rms:.3f}"
 
-    def test_mc_robustpoly1d_rms_uses_sample_std(self):
-        """Returned RMS uses sample std (ddof=1), matching IDL mc_moments/MOMENT().
+    def test_mc_robustpoly1d_rms_uses_population_std(self):
+        """Returned RMS uses population std (ddof=0), matching IDL mc_robustpoly1d.
 
-        IDL's mc_moments calls MOMENT() whose variance is sum((x-mean)^2)/(N-1).
-        With thresh=100.0 no points are rejected so the early-return path is
-        taken and rms == np.std(residuals, ddof=1), distinguishably different
-        from np.std(residuals, ddof=0) for small n.
+        IDL's mc_robustpoly1d uses population std in its MOMENT-based sigma
+        calculation.  With thresh=100.0 no points are rejected so the
+        early-return path is taken and rms == np.std(residuals, ddof=0),
+        distinguishably different from np.std(residuals, ddof=1) for small n.
         """
         from pyspextool.instruments.ishell.tracing import _mc_robustpoly1d
 
@@ -5653,16 +5653,16 @@ class TestMCFindordersDriftAudit:
 
         coeffs, rms = _mc_robustpoly1d(cols, rows, degree=1, thresh=100.0)
         residuals = rows - np.polynomial.polynomial.polyval(cols, coeffs)
-        expected_sample = float(np.std(residuals, ddof=1))
         expected_pop    = float(np.std(residuals, ddof=0))
+        expected_sample = float(np.std(residuals, ddof=1))
 
-        # For n=10 the two differ by sqrt(10/9) ≈ 1.054; assert sample matches.
-        assert np.isclose(rms, expected_sample, rtol=1e-10), (
-            f"RMS should use sample std (ddof=1) to match IDL mc_moments: "
-            f"got {rms:.8f}, sample={expected_sample:.8f}, pop={expected_pop:.8f}"
+        # For n=10 the two differ by sqrt(10/9) ~ 1.054; assert population matches.
+        assert np.isclose(rms, expected_pop, rtol=1e-10), (
+            f"RMS should use population std (ddof=0) to match IDL mc_robustpoly1d: "
+            f"got {rms:.8f}, pop={expected_pop:.8f}, sample={expected_sample:.8f}"
         )
-        assert not np.isclose(expected_sample, expected_pop, rtol=1e-6), (
-            "sample and population std must differ for this dataset (test sanity check)"
+        assert not np.isclose(expected_pop, expected_sample, rtol=1e-6), (
+            "population and sample std must differ for this dataset (test sanity check)"
         )
 
     # ── IDL branch semantics: goto cont1/cont2 vs fallback else-branch ───────
