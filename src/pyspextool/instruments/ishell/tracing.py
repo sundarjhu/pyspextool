@@ -1264,7 +1264,7 @@ def _mc_robustpoly1d(
 
     1. Build unweighted normal equations via the Vandermonde design matrix.
     2. Solve with ``numpy.linalg.solve``.
-    3. Compute residuals on initial-good points; get mean and population std.
+    3. Compute residuals on initial-good points; get mean and sample std (ddof=1).
     4. If no outliers found on the first pass, return immediately (IDL
        ``goto cont1``).
     5. Iterate (IDL ``endrep until ittr eq 10`` starting from ``ittr=1`` and
@@ -1295,7 +1295,8 @@ def _mc_robustpoly1d(
         Polynomial coefficients in ``numpy.polynomial.polynomial``
         (increasing-power) convention.
     rms : float
-        Population-std RMS of fit residuals on the accepted (good) points.
+        Sample-std RMS (ddof=1, matching IDL ``mc_moments``/``MOMENT()``) of
+        fit residuals on the accepted (good) points.
     """
     x = np.asarray(cols, dtype=float)
     y = np.asarray(rows, dtype=float)
@@ -1318,7 +1319,7 @@ def _mc_robustpoly1d(
     coeffs = _solve(xx, yy)
     residual = yy - np.polynomial.polynomial.polyval(xx, coeffs)
     mean = float(np.mean(residual))
-    stddev = float(np.std(residual))     # population std (ddof=0), matching IDL
+    stddev = float(np.std(residual, ddof=1))  # sample std (ddof=1), matching IDL mc_moments
 
     if stddev == 0.0:
         return coeffs, 0.0
@@ -1340,7 +1341,7 @@ def _mc_robustpoly1d(
 
         residual_cur = yy[z_good] - np.polynomial.polynomial.polyval(xx[z_good], coeffs)
         mean = float(np.mean(residual_cur))
-        stddev = float(np.std(residual_cur))
+        stddev = float(np.std(residual_cur, ddof=1))
 
         if stddev == 0.0:
             break
@@ -1356,7 +1357,7 @@ def _mc_robustpoly1d(
             break
 
     # Final RMS on accepted subset.
-    rms = float(np.std(yy[z_good] - np.polynomial.polynomial.polyval(xx[z_good], coeffs)))
+    rms = float(np.std(yy[z_good] - np.polynomial.polynomial.polyval(xx[z_good], coeffs), ddof=1))
     return coeffs, rms
 
 

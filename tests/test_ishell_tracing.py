@@ -5571,14 +5571,21 @@ class TestMCFindordersDriftAudit:
         assert rms == 0.0 or np.isclose(rms, 0.0, atol=1e-10), f"rms={rms}"
 
     def test_mc_robustpoly1d_rejects_outliers(self):
-        """_mc_robustpoly1d rejects large outliers and recovers the true polynomial."""
+        """_mc_robustpoly1d rejects large outliers and recovers the true polynomial.
+
+        Uses 2 outliers so the initial-fit z-scores are clearly > 3 sigma even
+        with the sample std (ddof=1) used by IDL's mc_moments/MOMENT().  With 5
+        outliers and the previous ddof=0 convention the z-scores were only just
+        above 3 (≈ 2.95–2.99 under ddof=1), making that configuration
+        unsuitable for verifying rejection under the correct IDL convention.
+        """
         from pyspextool.instruments.ishell.tracing import _mc_robustpoly1d
 
         rng = np.random.default_rng(7)
         cols = np.arange(50, dtype=float)
         rows = 2.0 * cols + 5.0 + rng.normal(0.0, 0.1, size=50)
-        # Inject 5 large outliers.
-        outlier_idx = [5, 15, 25, 35, 45]
+        # Inject 2 large outliers (z ≈ 4.7–4.8 under ddof=1, clearly above thresh=3).
+        outlier_idx = [5, 15]
         rows[outlier_idx] += 50.0
 
         coeffs, rms = _mc_robustpoly1d(cols, rows, degree=1, thresh=3.0)
@@ -5628,6 +5635,35 @@ class TestMCFindordersDriftAudit:
         assert np.isclose(coeffs[1], 0.5, atol=0.05), f"c1={coeffs[1]:.4f}"
         assert np.isclose(coeffs[2], 0.001, atol=0.001), f"c2={coeffs[2]:.6f}"
         assert np.isfinite(rms) and rms < 1.0, f"rms={rms:.3f}"
+
+    def test_mc_robustpoly1d_rms_uses_sample_std(self):
+        """Returned RMS uses sample std (ddof=1), matching IDL mc_moments/MOMENT().
+
+        IDL's mc_moments calls MOMENT() whose variance is sum((x-mean)^2)/(N-1).
+        With thresh=100.0 no points are rejected so the early-return path is
+        taken and rms == np.std(residuals, ddof=1), distinguishably different
+        from np.std(residuals, ddof=0) for small n.
+        """
+        from pyspextool.instruments.ishell.tracing import _mc_robustpoly1d
+
+        rng = np.random.default_rng(0)
+        n = 10
+        cols = np.arange(n, dtype=float)
+        rows = 2.0 * cols + 5.0 + rng.normal(0.0, 0.5, n)
+
+        coeffs, rms = _mc_robustpoly1d(cols, rows, degree=1, thresh=100.0)
+        residuals = rows - np.polynomial.polynomial.polyval(cols, coeffs)
+        expected_sample = float(np.std(residuals, ddof=1))
+        expected_pop    = float(np.std(residuals, ddof=0))
+
+        # For n=10 the two differ by sqrt(10/9) ≈ 1.054; assert sample matches.
+        assert np.isclose(rms, expected_sample, rtol=1e-10), (
+            f"RMS should use sample std (ddof=1) to match IDL mc_moments: "
+            f"got {rms:.8f}, sample={expected_sample:.8f}, pop={expected_pop:.8f}"
+        )
+        assert not np.isclose(expected_sample, expected_pop, rtol=1e-6), (
+            "sample and population std must differ for this dataset (test sanity check)"
+        )
 
     # ── IDL branch semantics: goto cont1/cont2 vs fallback else-branch ───────
 
