@@ -340,7 +340,7 @@ class FlatOrderTrace:
     fit_rms : ndarray, shape (n_orders,)
         RMS of the centre polynomial residuals for each order, in pixels.
         **Python-only QA diagnostic** — no direct IDL equivalent.  Computed
-        as ``np.std(centre_samples - polyval(cols, centre_coeffs), ddof=0)``
+        as ``np.std(centre_samples - polyval(cols, centre_coeffs), ddof=1)``
         on valid (finite) centre samples after tracing.
     half_width_rows : ndarray, shape (n_orders,)
         Estimated half-width of each order in pixels, derived from the mean
@@ -798,7 +798,7 @@ def trace_orders_from_flat(
             pred = np.polynomial.polynomial.polyval(
                 s_cols_i[cen_valid].astype(float), result_i.center_coeffs,
             )
-            fit_rms[i] = float(np.std(result_i.center_samples[cen_valid] - pred))
+            fit_rms[i] = float(np.std(result_i.center_samples[cen_valid] - pred, ddof=1))
 
     # ------------------------------------------------------------------
     # 5a. Validate order_samples — internal consistency invariants.
@@ -1243,7 +1243,7 @@ def _fit_poly_robust(
     good = r["goodbad"] == 1
     if good.sum() > 0:
         predicted = np.polynomial.polynomial.polyval(cols[good], coeffs)
-        rms = float(np.std(rows[good] - predicted))
+        rms = float(np.std(rows[good] - predicted, ddof=1))
     else:
         rms = np.nan
     return coeffs, rms
