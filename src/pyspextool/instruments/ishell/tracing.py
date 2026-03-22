@@ -117,6 +117,11 @@ IDL-to-Python fidelity status
   that fallback).
 - When neither ``flatinfo`` nor explicit ``guess_rows`` are provided, a
   ``ValueError`` is raised; IDL always requires external ``guesspos``.
+- The robust polynomial fitter (:func:`_fit_poly_robust`) uses iterative
+  sigma-clipping rather than IDL's Gauss-Jordan solver (``mc_robustpoly1d
+  /GAUSSJ``).  Parameters are aligned (thresh=3, eps=0.01); the difference
+  affects outlier-rejection trajectory, not the final polynomial form.
+  This is the only remaining algorithmic approximation.
 """
 
 from __future__ import annotations
@@ -1178,375 +1183,6 @@ def _compute_guess_positions_from_flatinfo(
     return guess_positions, xranges
 
 
-def _trace_single_order(
-    flat: npt.NDArray,
-    sflat: npt.NDArray,
-    s_cols: npt.NDArray,
-    seed_idx: int,
-    y_seed: float,
-    poly_degree: int,
-    *,
-    ybuffer: int = 1,
-    intensity_fraction: float = 0.85,
-    com_half_width: int = 2,
-    slit_height_range: tuple[float, float] | None = None,
-) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
-    """Trace one order on its own per-order sample column array.
-
-    This is the IDL ``mc_findorders`` inner loop for a single order, operating
-    on the per-order column range (``sranges[*,i]`` in IDL), not a shared
-    union of all-order columns.
-
-    Parameters
-    ----------
-    flat : ndarray, shape (nrows, ncols)
-        Flat-field image.
-    sflat : ndarray, shape (nrows, ncols)
-        Sobel gradient magnitude image (pre-computed).
-    s_cols : ndarray of int, shape (n_samp,)
-        Per-order sample column indices (IDL ``sranges`` for this order).
-    seed_idx : int
-        Index into *s_cols* of the seed/guess column.
-    y_seed : float
-        Seed row (order centre estimate at the seed column).
-    poly_degree : int
-        Polynomial degree for centre-extrapolation fits.
-    ybuffer, intensity_fraction, com_half_width, slit_height_range :
-        Passed through to edge-finding helpers.
-
-    Returns
-    -------
-    cen : ndarray of float, shape (n_samp,)
-    bot : ndarray of float, shape (n_samp,)
-    top : ndarray of float, shape (n_samp,)
-        Traced centre, bottom-edge, and top-edge positions at each column in
-        *s_cols*.  NaN for columns where tracing was not reliable.
-    """
-    n_samp = len(s_cols)
-    nrows = flat.shape[0]
-    row = np.arange(nrows, dtype=float)
-    pred_deg = max(1, poly_degree - 2)
-
-    cen = np.full(n_samp, np.nan)
-    bot = np.full(n_samp, np.nan)
-    top = np.full(n_samp, np.nan)
-
-    # Initialise centre window around the seed index.
-    lo = max(0, seed_idx - poly_degree)
-    hi = min(n_samp - 1, seed_idx + poly_degree)
-    cen[lo: hi + 1] = y_seed
-
-    # Left sweep (seed_idx → 0, inclusive)
-    do_top = True
-    do_bot = True
-    for k in range(seed_idx, -1, -1):
-        fcol = flat[:, s_cols[k]]
-        rcol = sflat[:, s_cols[k]]
-        y_guess_f, com_top, com_bot = _predict_and_find_edges(
-            cen, s_cols, k, pred_deg, fcol, rcol, row,
-            nrows, ybuffer, intensity_fraction, com_half_width,
-            do_top, do_bot,
-        )
-        cont = _update_centre_and_flags(
-            cen, bot, top, k, y_guess_f, com_top, com_bot,
-            nrows, ybuffer, slit_height_range,
-            do_top, do_bot,
-        )
-        if cont == "break":
-            break
-        if cont == "continue":
-            continue
-        do_top, do_bot = cont
-
-    # Right sweep (seed_idx+1 → n_samp-1)
-    do_top = True
-    do_bot = True
-    for k in range(seed_idx + 1, n_samp):
-        fcol = flat[:, s_cols[k]]
-        rcol = sflat[:, s_cols[k]]
-        y_guess_f, com_top, com_bot = _predict_and_find_edges(
-            cen, s_cols, k, pred_deg, fcol, rcol, row,
-            nrows, ybuffer, intensity_fraction, com_half_width,
-            do_top, do_bot,
-        )
-        cont = _update_centre_and_flags(
-            cen, bot, top, k, y_guess_f, com_top, com_bot,
-            nrows, ybuffer, slit_height_range,
-            do_top, do_bot,
-        )
-        if cont == "break":
-            break
-        if cont == "continue":
-            continue
-        do_top, do_bot = cont
-
-    return cen, bot, top
-
-
-def _trace_all_orders(
-    flat: npt.NDArray,
-    sample_cols: npt.NDArray,
-    order_seed_indices: list[int],
-    seed_peaks: npt.NDArray,
-    center_rows: npt.NDArray,
-    bot_rows: npt.NDArray,
-    top_rows: npt.NDArray,
-    poly_degree: int,
-    *,
-    ybuffer: int = 1,
-    intensity_fraction: float = 0.85,
-    com_half_width: int = 2,
-    slit_height_range: tuple[float, float] | None = None,
-    order_sample_cols_list: list[npt.NDArray] | None = None,
-) -> None:
-    """Trace all orders using the IDL ``mc_findorders`` algorithm.
-
-    When *order_sample_cols_list* is provided, each order is traced on its own
-    per-order sample column array (the IDL ``sranges`` approach).  Results are
-    mapped back into the shared *center_rows* / *bot_rows* / *top_rows* output
-    arrays (indexed against *sample_cols*; NaN for columns not in an order's
-    range).
-
-    When *order_sample_cols_list* is ``None``, all orders share *sample_cols*
-    directly (fallback / auto-detect mode).
-
-    Parameters
-    ----------
-    flat : ndarray, shape (nrows, ncols)
-        Flat-field image.
-    sample_cols : ndarray of int
-        Shared column index array for the output arrays.
-    order_seed_indices : list of int
-        Per-order index into *sample_cols* of the seed/guess column.
-    seed_peaks : ndarray of float, shape (n_orders,)
-        Initial order-centre row estimates at the seed column.
-    center_rows : ndarray of float, shape (n_orders, n_sample)
-        Centre array; filled in place.
-    bot_rows : ndarray of float, shape (n_orders, n_sample)
-        Bottom-edge array; filled in place.
-    top_rows : ndarray of float, shape (n_orders, n_sample)
-        Top-edge array; filled in place.
-    poly_degree : int
-        Polynomial degree for the centre-extrapolation fits.
-    ybuffer, intensity_fraction, com_half_width, slit_height_range :
-        Passed through to the single-order tracing helper.
-    order_sample_cols_list : list of int ndarrays, optional
-        Per-order sample column arrays (IDL ``sranges``).  When provided,
-        each order is traced on its own column set; results are mapped back
-        to the shared *sample_cols* index space.  ``None`` → all orders use
-        *sample_cols* directly (auto-detect fallback).
-    """
-    n_orders = center_rows.shape[0]
-    nrows = flat.shape[0]
-
-    # Compute the Sobel gradient magnitude once for all orders.
-    sflat = _compute_sobel_magnitude(flat)
-
-    for order_i in range(n_orders):
-        # Per-order column array: IDL sranges[*,i] approach
-        if order_sample_cols_list is not None:
-            s_cols_i = order_sample_cols_list[order_i]
-            # Seed index within this order's own column array
-            guess_col = sample_cols[order_seed_indices[order_i]]
-            seed_idx_i = int(np.argmin(np.abs(s_cols_i - guess_col)))
-        else:
-            s_cols_i = sample_cols
-            seed_idx_i = order_seed_indices[order_i]
-
-        cen_i, bot_i, top_i = _trace_single_order(
-            flat, sflat, s_cols_i, seed_idx_i, float(seed_peaks[order_i]),
-            poly_degree,
-            ybuffer=ybuffer,
-            intensity_fraction=intensity_fraction,
-            com_half_width=com_half_width,
-            slit_height_range=slit_height_range,
-        )
-
-        if order_sample_cols_list is not None:
-            # Map per-order results back to the shared sample_cols index space.
-            # For each column in s_cols_i, find its index in sample_cols and store.
-            for j, col in enumerate(s_cols_i):
-                k = int(np.searchsorted(sample_cols, col))
-                if k < len(sample_cols) and sample_cols[k] == col:
-                    center_rows[order_i, k] = cen_i[j]
-                    bot_rows[order_i, k] = bot_i[j]
-                    top_rows[order_i, k] = top_i[j]
-        else:
-            center_rows[order_i] = cen_i
-            bot_rows[order_i] = bot_i
-            top_rows[order_i] = top_i
-
-
-def _compute_sobel_magnitude(flat: npt.NDArray) -> npt.NDArray:
-    """Return the Sobel gradient magnitude of *flat*.
-
-    Equivalent to IDL's ``sobel()`` built-in, which the IDL ``mc_findorders``
-    routine uses to enhance order edges before the centre-of-mass step.
-    The image is normalised to ``[0, 1]`` before differentiation so that
-    the magnitude is scale-independent (matching IDL: ``sobel(image*1000/max)``).
-    """
-    scl = float(np.max(flat))
-    if scl == 0.0:
-        return np.zeros_like(flat, dtype=float)
-    img_norm = flat.astype(float) / scl
-    s0 = _scipy_sobel(img_norm, axis=0)
-    s1 = _scipy_sobel(img_norm, axis=1)
-    return np.sqrt(s0 ** 2 + s1 ** 2)
-
-
-def _predict_and_find_edges(
-    cen: npt.NDArray,
-    sample_cols: npt.NDArray,
-    k: int,
-    pred_deg: int,
-    fcol: npt.NDArray,
-    rcol: npt.NDArray,
-    row: npt.NDArray,
-    nrows: int,
-    ybuffer: int,
-    intensity_fraction: float,
-    com_half_width: int,
-    do_top: bool,
-    do_bot: bool,
-) -> tuple[float, float, float]:
-    """Predict the centre and find top/bottom edges at column index *k*.
-
-    Returns ``(y_guess_f, com_top, com_bot)`` where edge values are
-    ``NaN`` when the corresponding edge could not be located.
-    """
-    # Fit centre polynomial to predict y_guess.
-    valid = np.isfinite(cen)
-    if valid.sum() >= pred_deg + 1:
-        r = _polyfit_1d(
-            sample_cols[valid].astype(float),
-            cen[valid],
-            pred_deg,
-            justfit=True,
-            silent=True,
-        )
-        y_guess_f = float(
-            np.polynomial.polynomial.polyval(float(sample_cols[k]), r["coeffs"])
-        )
-    else:
-        # Not enough points yet – use the nearest finite value.
-        finite_vals = cen[valid]
-        if len(finite_vals) > 0:
-            y_guess_f = float(finite_vals[0])
-        elif np.isfinite(cen[k]):
-            y_guess_f = float(cen[k])
-        else:
-            y_guess_f = 0.0
-
-    y_guess_f = float(np.clip(y_guess_f, ybuffer, nrows - ybuffer - 1))
-    y_guess = int(round(y_guess_f))
-    z_guess = float(fcol[y_guess])
-    threshold = intensity_fraction * z_guess
-
-    # Find top edge (IDL: ztop = where(fcol lt frac*z_guess and row gt y_guess)).
-    if do_top:
-        ztop_idx = np.where((fcol < threshold) & (row > y_guess_f))[0]
-        if len(ztop_idx) > 0:
-            guessyt = int(ztop_idx[0])
-            bidx = max(0, guessyt - com_half_width)
-            tidx = min(nrows - 1, guessyt + com_half_width)
-            y_sub = row[bidx: tidx + 1]
-            z_sub = rcol[bidx: tidx + 1]
-            total_z = float(np.sum(z_sub))
-            com_top = float(np.sum(y_sub * z_sub) / total_z) if total_z != 0.0 else np.nan
-        else:
-            com_top = np.nan
-    else:
-        com_top = np.nan
-
-    # Find bot edge (IDL: zbot = where(fcol lt frac*z_guess and row lt y_guess)).
-    if do_bot:
-        zbot_idx = np.where((fcol < threshold) & (row < y_guess_f))[0]
-        if len(zbot_idx) > 0:
-            guessyb = int(zbot_idx[-1])
-            bidx = max(0, guessyb - com_half_width)
-            tidx = min(nrows - 1, guessyb + com_half_width)
-            y_sub = row[bidx: tidx + 1]
-            z_sub = rcol[bidx: tidx + 1]
-            total_z = float(np.sum(z_sub))
-            com_bot = float(np.sum(y_sub * z_sub) / total_z) if total_z != 0.0 else np.nan
-        else:
-            com_bot = np.nan
-    else:
-        com_bot = np.nan
-
-    return y_guess_f, com_top, com_bot
-
-
-def _update_centre_and_flags(
-    cen: npt.NDArray,
-    bot: npt.NDArray,
-    top: npt.NDArray,
-    k: int,
-    y_guess_f: float,
-    com_top: float,
-    com_bot: float,
-    nrows: int,
-    ybuffer: int,
-    slit_height_range: tuple[float, float] | None,
-    do_top: bool,
-    do_bot: bool,
-) -> tuple[bool, bool] | str:
-    """Update ``cen[k]``, ``bot[k]``, ``top[k]`` and return updated flags.
-
-    Returns the string ``"break"`` when the sweep should stop, or
-    ``"continue"`` when the column should be skipped (IDL ``goto cont1``).
-
-    Implements the exact IDL ``mc_findorders`` update logic:
-
-    * If both edge COMs are finite and the slit height is within range:
-      store edges, update ``cen[k]``, and check boundary flags.
-    * If the slit height is *outside* range: skip (``goto cont1``);
-      edges remain NaN for this column.
-    * If either edge is NaN: store NaN edges and fall back to ``y_guess_f``
-      for the centre.
-    """
-    if do_top and do_bot and np.isfinite(com_bot) and np.isfinite(com_top):
-        slit_h = abs(com_bot - com_top)
-        height_ok = (
-            slit_height_range is None
-            or (slit_height_range[0] <= slit_h <= slit_height_range[1])
-        )
-        if height_ok:
-            # IDL: edges[k,*] = [com_bot, com_top]; cen[k] = (com_bot+com_top)/2
-            bot[k] = com_bot
-            top[k] = com_top
-            cen[k] = (com_bot + com_top) / 2.0
-            # Boundary checks – stop tracking an edge that reaches the border.
-            # IDL source:
-            #   if com_top le bufpix or com_top ge (nrows-1-bufpix) then dotop=0
-            #   if com_bot le bufpix or com_bot gt (nrows-1-bufpix) then dobot=0
-            # Note the intentional asymmetry: top uses `ge` (>=) while bot uses `gt` (>).
-            if com_top <= ybuffer or com_top >= nrows - 1 - ybuffer:
-                do_top = False
-            if com_bot <= ybuffer or com_bot > nrows - 1 - ybuffer:
-                do_bot = False
-            if not do_top and not do_bot:
-                return "break"
-            return (do_top, do_bot)
-        else:
-            # IDL: goto cont1 – skip column; edges remain NaN.
-            return "continue"
-    else:
-        # Edge detection failed; IDL: edges[k,*] = [nan, nan]; cen[k] = y_guess
-        bot[k] = np.nan
-        top[k] = np.nan
-        cen[k] = y_guess_f
-        # Boundary checks on NaN edges are no-ops (np.isfinite guards).
-        # Same IDL asymmetry as above: top uses `ge` (>=), bot uses `gt` (>).
-        if np.isfinite(com_top) and (com_top <= ybuffer or com_top >= nrows - 1 - ybuffer):
-            do_top = False
-        if np.isfinite(com_bot) and (com_bot <= ybuffer or com_bot > nrows - 1 - ybuffer):
-            do_bot = False
-        if not do_top and not do_bot:
-            return "break"
-        return (do_top, do_bot)
-
-
 def _fit_poly_robust(
     cols: npt.NDArray,
     rows: npt.NDArray,
@@ -1590,46 +1226,6 @@ def _fit_poly_robust(
     else:
         rms = np.nan
     return coeffs, rms
-
-
-def _estimate_half_widths_from_edges(
-    bot_rows: npt.NDArray,
-    top_rows: npt.NDArray,
-    seed_idx: int,
-) -> npt.NDArray:
-    """Estimate per-order half-widths from the traced edge separation.
-
-    For each order, returns half the mean (top − bottom) edge separation
-    across the available sample columns near the seed index.
-
-    Parameters
-    ----------
-    bot_rows : ndarray, shape (n_orders, n_sample)
-        Bottom-edge row positions.
-    top_rows : ndarray, shape (n_orders, n_sample)
-        Top-edge row positions.
-    seed_idx : int
-        Index of the seed/guess sample column (used as a preference centre
-        for the local estimation window).
-
-    Returns
-    -------
-    ndarray of float, shape (n_orders,)
-        Estimated half-widths in pixels.
-    """
-    n_orders = bot_rows.shape[0]
-    half_widths = np.zeros(n_orders, dtype=float)
-
-    for i in range(n_orders):
-        sep = top_rows[i] - bot_rows[i]
-        valid = np.isfinite(sep) & (sep > 0)
-        if valid.sum() > 0:
-            half_widths[i] = float(np.mean(sep[valid]) / 2.0)
-        else:
-            half_widths[i] = 0.0
-
-    return half_widths
-
 
 
 def _polyval_with_xrange(
@@ -1970,9 +1566,9 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
 # ---------------------------------------------------------------------------
 # IDL mc_findorders building-block helpers (blocks A–F)
 # ---------------------------------------------------------------------------
-# These functions are named, minimal Python ports of the corresponding IDL
-# code blocks inside mc_findorders.pro.  They are called by _trace_single_order
-# (and may be called directly by tests).
+# These functions are direct Python ports of the corresponding IDL code
+# blocks inside mc_findorders.pro.  They are called by
+# _trace_single_order_idlstyle (and may be called directly by tests).
 # ---------------------------------------------------------------------------
 
 
@@ -2552,18 +2148,25 @@ def _trace_order_left(
             bottom_edge_samples[k] = com_bot
             top_edge_samples[k]    = com_top
             center_samples[k]      = (com_bot + com_top) / 2.0
+        elif do_top and do_bot and np.isfinite(com_bot) and np.isfinite(com_top):
+            # IDL: goto cont1 — both flags active AND both edges finite, but
+            # slit-height check failed.  IDL jumps to cont1:, which skips the
+            # center assignment entirely; cen[k] stays NaN.
+            bottom_edge_samples[k] = np.nan
+            top_edge_samples[k]    = np.nan
+            # center_samples[k] is intentionally NOT assigned here — it stays NaN.
+            do_top, do_bot = _update_edge_activity_flags(
+                com_top, com_bot, nrows, bufpix, do_top, do_bot,
+            )
+            if not do_top and not do_bot:
+                break
+            continue
         else:
-            if do_top and do_bot:
-                # Both active but edge pair rejected (IDL: goto cont1 path)
-                # Edges stay NaN; center falls back to y_guess.
-                pass
-            # NaN case (IDL: else-branch after the outer if)
+            # IDL else-branch: not both flags active OR at least one edge is NaN.
+            # IDL: cen[k] = y_guess (the predicted centre is used as fallback).
             bottom_edge_samples[k] = np.nan
             top_edge_samples[k]    = np.nan
             center_samples[k]      = y_guess_f
-            # IDL: goto cont1 — activity flags still checked via fall-through
-            # IDL lines 302-303 run for the NaN branch as well; use NaN values
-            # so the float comparisons in _update_edge_activity_flags are safe.
             do_top, do_bot = _update_edge_activity_flags(
                 com_top, com_bot, nrows, bufpix, do_top, do_bot,
             )
@@ -2679,8 +2282,22 @@ def _trace_order_right(
             bottom_edge_samples[k] = com_bot
             top_edge_samples[k]    = com_top
             center_samples[k]      = (com_bot + com_top) / 2.0
+        elif do_top and do_bot and np.isfinite(com_bot) and np.isfinite(com_top):
+            # IDL: goto cont2 — both flags active AND both edges finite, but
+            # slit-height check failed.  IDL jumps to cont2:, which skips the
+            # center assignment entirely; cen[k] stays NaN.
+            bottom_edge_samples[k] = np.nan
+            top_edge_samples[k]    = np.nan
+            # center_samples[k] is intentionally NOT assigned here — it stays NaN.
+            do_top, do_bot = _update_edge_activity_flags(
+                com_top, com_bot, nrows, bufpix, do_top, do_bot,
+            )
+            if not do_top and not do_bot:
+                break
+            continue
         else:
-            # NaN case or rejected pair (IDL else-branch / cont2 path)
+            # IDL else-branch: not both flags active OR at least one edge is NaN.
+            # IDL: cen[k] = y_guess (the predicted centre is used as fallback).
             bottom_edge_samples[k] = np.nan
             top_edge_samples[k]    = np.nan
             center_samples[k]      = y_guess_f
@@ -2730,10 +2347,12 @@ def _fit_order_edge_polynomials(
     equivalent robust-rejection settings (threshold=3, eps=0.01).
 
     .. note::
-        Temporary drift: the Python :func:`_fit_poly_robust` uses iterative
-        sigma-clipping via ``_polyfit_1d`` rather than IDL's Gauss-Jordan
-        implementation (``/GAUSSJ``).  The robust interface is otherwise
-        parameter-compatible (thresh=3, eps=0.01).
+        Known approximation (the only algorithmic difference vs IDL):
+        :func:`_fit_poly_robust` uses iterative sigma-clipping via
+        ``_polyfit_1d`` rather than IDL's Gauss-Jordan implementation
+        (``/GAUSSJ``).  The robust interface is otherwise parameter-compatible
+        (thresh=3, eps=0.01).  The difference affects the outlier-rejection
+        trajectory but not the final polynomial form for well-behaved data.
 
     Parameters
     ----------

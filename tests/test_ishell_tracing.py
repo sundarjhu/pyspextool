@@ -3068,18 +3068,18 @@ class TestIDLPortFidelity:
 
     # ---- Requirement 1: no peak-finding in the tracing core ---------------
 
-    def test_trace_single_order_does_not_call_find_peaks(self):
+    def test_trace_single_order_idlstyle_does_not_call_find_peaks(self):
         """_find_order_peaks and scipy find_peaks must not exist in the tracing module.
 
         IDL mc_findorders has no peak-detection step: it uses only the
         flux-threshold + Sobel COM logic at each sample column.  The Python
-        port removes _find_order_peaks entirely, so the attribute must not
-        exist.  _trace_single_order must still succeed without it.
+        port removes peak detection entirely, so the attribute must not exist.
+        _trace_single_order_idlstyle must succeed without it.
         """
         import pyspextool.instruments.ishell.tracing as _tracing_module
         from pyspextool.instruments.ishell.tracing import (
-            _trace_single_order,
-            _compute_sobel_magnitude,
+            _trace_single_order_idlstyle,
+            _compute_sobel_image,
         )
 
         # _find_order_peaks must have been deleted from the module.
@@ -3095,50 +3095,62 @@ class TestIDLPortFidelity:
         )
 
         flat, _, _ = _make_single_order_flat(seed=11)
-        sflat = _compute_sobel_magnitude(flat)
-        ncols = flat.shape[1]
+        nrows, ncols = flat.shape
+        sflat = _compute_sobel_image(flat)
         s_cols = np.arange(10, ncols - 10, 20)
-        seed_idx = len(s_cols) // 2
+        guess_col = float(s_cols[len(s_cols) // 2])
 
-        # _trace_single_order must work without any peak detection.
-        cen, bot, top = _trace_single_order(
-            flat, sflat, s_cols, seed_idx, y_seed=128.0,
-            poly_degree=2,
-            ybuffer=1,
-            intensity_fraction=0.85,
-            com_half_width=3,
-            slit_height_range=(12.0, 60.0),
+        # _trace_single_order_idlstyle must work without any peak detection.
+        result = _trace_single_order_idlstyle(
+            flat, sflat, s_cols, 10, ncols - 11,
+            guess_col, 128.0,
+            2, nrows, 1, 0.85, 3, 12.0, 60.0,
         )
 
         # Tracing must succeed and return valid arrays.
-        assert cen.shape == (len(s_cols),)
-        assert bot.shape == (len(s_cols),)
-        assert top.shape == (len(s_cols),)
+        assert result.center_samples.shape == (len(s_cols),)
+        assert result.bottom_edge_samples.shape == (len(s_cols),)
+        assert result.top_edge_samples.shape == (len(s_cols),)
         # At least some traced positions should be finite.
-        assert np.sum(np.isfinite(bot)) > 0, "Expected at least some finite bot values"
-        assert np.sum(np.isfinite(top)) > 0, "Expected at least some finite top values"
+        assert np.sum(np.isfinite(result.bottom_edge_samples)) > 0, (
+            "Expected at least some finite bottom edge values"
+        )
+        assert np.sum(np.isfinite(result.top_edge_samples)) > 0, (
+            "Expected at least some finite top edge values"
+        )
 
-    def test_trace_single_order_succeeds_without_flatinfo(self):
-        """_trace_single_order operates entirely on image data; it does not
-        require flatinfo or any peak-detection initialisation.
+    def test_trace_single_order_idlstyle_succeeds_without_flatinfo(self):
+        """_trace_single_order_idlstyle operates entirely on image data; it does
+        not require flatinfo or any peak-detection initialisation.
 
         This verifies requirement 1 structurally: the function signature
-        accepts only (flat, sflat, s_cols, seed_idx, y_seed, poly_degree, ...)
-        with no peak-matching inputs.
+        accepts only image + geometry parameters, with no peak-matching inputs.
         """
-        from pyspextool.instruments.ishell.tracing import (
-            _trace_single_order,
-            _compute_sobel_magnitude,
-        )
+        from pyspextool.instruments.ishell.tracing import _trace_single_order_idlstyle
         import inspect
 
-        sig = inspect.signature(_trace_single_order)
+        sig = inspect.signature(_trace_single_order_idlstyle)
         param_names = list(sig.parameters.keys())
         # Must not have peak-matching parameters.
         for forbidden in ("peaks", "peak_cols", "match", "seed_peaks"):
             assert forbidden not in param_names, (
-                f"_trace_single_order has forbidden peak-matching parameter: "
-                f"'{forbidden}'"
+                f"_trace_single_order_idlstyle has forbidden peak-matching "
+                f"parameter: '{forbidden}'"
+            )
+
+    def test_trace_single_order_succeeds_without_flatinfo(self):
+        """Alias kept for backward-compatibility of the test name; delegates to
+        the idlstyle version which is the active tracing function.
+        """
+        from pyspextool.instruments.ishell.tracing import _trace_single_order_idlstyle
+        import inspect
+
+        sig = inspect.signature(_trace_single_order_idlstyle)
+        param_names = list(sig.parameters.keys())
+        for forbidden in ("peaks", "peak_cols", "match", "seed_peaks"):
+            assert forbidden not in param_names, (
+                f"_trace_single_order_idlstyle has forbidden peak-matching "
+                f"parameter: '{forbidden}'"
             )
 
     # ---- Requirement 2: edge-first; centres derived from edges ------------
@@ -3147,27 +3159,28 @@ class TestIDLPortFidelity:
         """Where both bot and top are finite, cen must equal (bot+top)/2.
 
         IDL mc_findorders: ``cen[k] = (com_bot + com_top) / 2``
-        Python _update_centre_and_flags: ``cen[k] = (com_bot + com_top) / 2.0``
+        Python: center_samples[k] = (com_bot + com_top) / 2.0
         """
         from pyspextool.instruments.ishell.tracing import (
-            _trace_single_order,
-            _compute_sobel_magnitude,
+            _trace_single_order_idlstyle,
+            _compute_sobel_image,
         )
 
         flat, _, _ = _make_single_order_flat(c0=100.0, hw=15.0, tilt=0.02, seed=22)
-        sflat = _compute_sobel_magnitude(flat)
-        ncols = flat.shape[1]
+        nrows, ncols = flat.shape
+        sflat = _compute_sobel_image(flat)
         s_cols = np.arange(10, ncols - 10, 10)
         seed_idx = len(s_cols) // 2
+        guess_col = float(s_cols[seed_idx])
 
-        cen, bot, top = _trace_single_order(
-            flat, sflat, s_cols, seed_idx, y_seed=100.0,
-            poly_degree=2,
-            ybuffer=1,
-            intensity_fraction=0.75,
-            com_half_width=4,
-            slit_height_range=(10.0, 60.0),
+        result = _trace_single_order_idlstyle(
+            flat, sflat, s_cols, 10, ncols - 11,
+            guess_col, 100.0,
+            2, nrows, 1, 0.75, 4, 10.0, 60.0,
         )
+        cen = result.center_samples
+        bot = result.bottom_edge_samples
+        top = result.top_edge_samples
 
         # Where both edges are finite, cen must be (bot+top)/2.
         both_finite = np.isfinite(bot) & np.isfinite(top)
@@ -3235,8 +3248,8 @@ class TestIDLPortFidelity:
         at every step, so the predicted centre tracks the order as it moves.
         """
         from pyspextool.instruments.ishell.tracing import (
-            _trace_single_order,
-            _compute_sobel_magnitude,
+            _trace_single_order_idlstyle,
+            _compute_sobel_image,
         )
 
         nrows, ncols = 256, 300
@@ -3244,20 +3257,19 @@ class TestIDLPortFidelity:
         flat, true_bot, true_top = _make_single_order_flat(
             nrows=nrows, ncols=ncols, c0=c0, tilt=tilt, hw=hw, seed=33,
         )
-        sflat = _compute_sobel_magnitude(flat)
+        sflat = _compute_sobel_image(flat)
         s_cols = np.arange(5, ncols - 5, 10)
         # Seed near the RIGHT end → the LEFT sweep covers most of the range.
         seed_idx = len(s_cols) - 3   # near-right seed
+        guess_col = float(s_cols[seed_idx])
+        guess_row = c0 + tilt * s_cols[seed_idx]
 
-        cen, bot, top = _trace_single_order(
-            flat, sflat, s_cols, seed_idx,
-            y_seed=c0 + tilt * s_cols[seed_idx],
-            poly_degree=2,
-            ybuffer=1,
-            intensity_fraction=0.75,
-            com_half_width=4,
-            slit_height_range=(8.0, 60.0),
+        result = _trace_single_order_idlstyle(
+            flat, sflat, s_cols, 5, ncols - 6,
+            guess_col, guess_row,
+            2, nrows, 1, 0.75, 4, 8.0, 60.0,
         )
+        cen = result.center_samples
 
         # Columns to the LEFT of the seed (not just around it) should be traced.
         left_cols_idx = np.where(s_cols < s_cols[seed_idx])[0]
@@ -3284,8 +3296,8 @@ class TestIDLPortFidelity:
         IDL mc_findorders right loop: ``for j=gidx+1,nscols-1 do begin; k=j``
         """
         from pyspextool.instruments.ishell.tracing import (
-            _trace_single_order,
-            _compute_sobel_magnitude,
+            _trace_single_order_idlstyle,
+            _compute_sobel_image,
         )
 
         nrows, ncols = 256, 300
@@ -3293,20 +3305,19 @@ class TestIDLPortFidelity:
         flat, true_bot, true_top = _make_single_order_flat(
             nrows=nrows, ncols=ncols, c0=c0, tilt=tilt, hw=hw, seed=44,
         )
-        sflat = _compute_sobel_magnitude(flat)
+        sflat = _compute_sobel_image(flat)
         s_cols = np.arange(5, ncols - 5, 10)
         # Seed near the LEFT end → the RIGHT sweep covers most of the range.
         seed_idx = 2   # near-left seed
+        guess_col = float(s_cols[seed_idx])
+        guess_row = c0 + tilt * s_cols[seed_idx]
 
-        cen, bot, top = _trace_single_order(
-            flat, sflat, s_cols, seed_idx,
-            y_seed=c0 + tilt * s_cols[seed_idx],
-            poly_degree=2,
-            ybuffer=1,
-            intensity_fraction=0.75,
-            com_half_width=4,
-            slit_height_range=(8.0, 60.0),
+        result = _trace_single_order_idlstyle(
+            flat, sflat, s_cols, 5, ncols - 6,
+            guess_col, guess_row,
+            2, nrows, 1, 0.75, 4, 8.0, 60.0,
         )
+        cen = result.center_samples
 
         # Columns to the RIGHT of the seed should be traced.
         right_cols_idx = np.where(s_cols > s_cols[seed_idx])[0]
@@ -3331,59 +3342,36 @@ class TestIDLPortFidelity:
 
         IDL mc_findorders:
             ``cen[(gidx-degree):(gidx+degree)] = guesspos[1,i]``
-        Python _trace_single_order:
-            ``cen[lo: hi+1] = y_seed``
-        where lo = max(0, seed_idx-degree), hi = min(n_samp-1, seed_idx+degree).
+        Python _initialize_order_trace_arrays:
+            ``cen[lo: hi+1] = guess_row``
+        where lo = max(0, gidx-degree), hi = min(n_samp-1, gidx+degree).
         This ensures the initial polynomial fit at the first sweep step has
         enough non-NaN points.
         """
         from pyspextool.instruments.ishell.tracing import (
-            _trace_single_order,
-            _compute_sobel_magnitude,
+            _initialize_order_trace_arrays,
+            _compute_sobel_image,
         )
-        import unittest.mock as mock
 
         flat, _, _ = _make_single_order_flat(c0=128.0, seed=55)
-        sflat = _compute_sobel_magnitude(flat)
-        ncols = flat.shape[1]
+        nrows, ncols = flat.shape
         s_cols = np.arange(5, ncols - 5, 10)
-        seed_idx = len(s_cols) // 2
+        n_samp = len(s_cols)
+        seed_idx = n_samp // 2
         y_seed = 128.0
         poly_degree = 3
+        guess_col = float(s_cols[seed_idx])
 
-        # Intercept the first call to _predict_and_find_edges to check
-        # that cen has been initialised (not all-NaN) before the sweep.
-        captured_cen_snapshots = []
-        original_pfe = None
-
-        import pyspextool.instruments.ishell.tracing as _tracing_module
-
-        original_pfe = _tracing_module._predict_and_find_edges
-
-        def capture_pfe(cen, sample_cols, k, *args, **kwargs):
-            # Capture the first call (first step of the left sweep = seed_idx)
-            if len(captured_cen_snapshots) == 0:
-                captured_cen_snapshots.append(cen.copy())
-            return original_pfe(cen, sample_cols, k, *args, **kwargs)
-
-        with mock.patch.object(_tracing_module, "_predict_and_find_edges", capture_pfe):
-            cen, bot, top = _trace_single_order(
-                flat, sflat, s_cols, seed_idx, y_seed=y_seed,
-                poly_degree=poly_degree,
-                ybuffer=1,
-                intensity_fraction=0.80,
-                com_half_width=3,
-            )
-
-        assert len(captured_cen_snapshots) > 0, (
-            "_predict_and_find_edges was never called — sweep did not run"
+        # _initialize_order_trace_arrays produces the seeded cen array.
+        _, cen, _, gidx = _initialize_order_trace_arrays(
+            s_cols, guess_col, y_seed, poly_degree,
         )
-        first_cen = captured_cen_snapshots[0]
-        # The initialisation window: lo = max(0, seed_idx-degree),
-        # hi = min(n_samp-1, seed_idx+degree)
-        lo = max(0, seed_idx - poly_degree)
-        hi = min(len(s_cols) - 1, seed_idx + poly_degree)
-        init_vals = first_cen[lo: hi + 1]
+
+        # The initialisation window: lo = max(0, gidx-degree),
+        # hi = min(n_samp-1, gidx+degree)
+        lo = max(0, gidx - poly_degree)
+        hi = min(n_samp - 1, gidx + poly_degree)
+        init_vals = cen[lo: hi + 1]
         assert np.all(np.isfinite(init_vals)), (
             "IDL initialisation: cen values in [lo:hi+1] must be finite "
             "before first sweep step so that polynomial prediction works"
@@ -3392,6 +3380,12 @@ class TestIDLPortFidelity:
             init_vals, y_seed, atol=1e-10,
             err_msg="IDL initialisation: cen[lo:hi+1] must equal y_seed",
         )
+        # Indices outside the seed window must be NaN.
+        for k in range(n_samp):
+            if k < lo or k > hi:
+                assert np.isnan(cen[k]), (
+                    f"cen[{k}] should be NaN outside the seed window [{lo}, {hi}]"
+                )
 
     def test_bilateral_sweep_both_directions_traced(self):
         """Tracing with the seed in the middle must produce finite values on
@@ -3403,24 +3397,23 @@ class TestIDLPortFidelity:
           - Right: ``for j = gidx+1, nscols-1 do begin``
         """
         from pyspextool.instruments.ishell.tracing import (
-            _trace_single_order,
-            _compute_sobel_magnitude,
+            _trace_single_order_idlstyle,
+            _compute_sobel_image,
         )
 
         flat, _, _ = _make_single_order_flat(c0=128.0, tilt=0.05, hw=14.0, seed=66)
-        sflat = _compute_sobel_magnitude(flat)
-        ncols = flat.shape[1]
+        nrows, ncols = flat.shape
+        sflat = _compute_sobel_image(flat)
         s_cols = np.arange(5, ncols - 5, 8)
         seed_idx = len(s_cols) // 2
+        guess_col = float(s_cols[seed_idx])
 
-        cen, bot, top = _trace_single_order(
-            flat, sflat, s_cols, seed_idx, y_seed=128.0,
-            poly_degree=2,
-            ybuffer=1,
-            intensity_fraction=0.75,
-            com_half_width=4,
-            slit_height_range=(8.0, 60.0),
+        result = _trace_single_order_idlstyle(
+            flat, sflat, s_cols, 5, ncols - 6,
+            guess_col, 128.0,
+            2, nrows, 1, 0.75, 4, 8.0, 60.0,
         )
+        cen = result.center_samples
 
         left_finite = np.sum(np.isfinite(cen[:seed_idx]))
         right_finite = np.sum(np.isfinite(cen[seed_idx + 1:]))
@@ -5098,24 +5091,26 @@ class TestMCFindordersDriftAudit:
     E: Final xranges come from fitted edges staying on detector
     F: Compatibility / public structures still behave as expected
 
-    Known remaining drift (documented, NOT fixed in this pass):
-    1. goto-cont1 vs else: when the edge pair is rejected (slit-height check
-       fails with both flags active), IDL leaves cen[k]=NaN because goto-cont1
-       skips the cen update entirely.  Python sets cen[k]=y_guess_f.  The
-       difference is one data point in subsequent polynomial prediction steps.
-    2. Robust fitting: IDL uses mc_robustpoly1d with Gauss-Jordan (/GAUSSJ).
+    Known remaining drift (documented):
+    1. Robust fitting: IDL uses mc_robustpoly1d with Gauss-Jordan (/GAUSSJ).
        Python uses _fit_poly_robust → _polyfit_1d with iterative sigma-clipping.
        Parameters are aligned (thresh=3, eps=0.01) but the solver differs.
-    3. tabinv vs interp: IDL tabinv(scols, guesspos[0,i], idx) uses fractional
+    2. tabinv vs interp: IDL tabinv(scols, guesspos[0,i], idx) uses fractional
        index interpolation.  Python uses np.interp to replicate this, then rounds.
        Both round to the nearest integer index; outputs are identical for integer
        guess_col values.
-    4. Sobel normalisation: IDL rimage=sobel(image*1000./max(image));
+    3. Sobel normalisation: IDL rimage=sobel(image*1000./max(image));
        Python _compute_sobel_image uses the same 1000/max factor, then scipy
        sobel along axes 0 and 1 (magnitude = sqrt(Gy²+Gx²)).  The IDL sobel()
        built-in uses a different kernel weighting, so absolute Sobel values may
        differ.  COM weights are relative so this does not affect correctness in
        practice.
+
+    Previously documented drift items that have been resolved:
+    - goto-cont1: when the edge pair is rejected (slit-height check fails with
+      both flags active), the Python implementation now matches IDL: cen[k]
+      stays NaN (the center assignment is skipped, identical to IDL's goto cont1
+      jumping over the cen[k] update).
     """
 
     # ── A: No peak finding anywhere in the tracing core ─────────────────────
@@ -5418,94 +5413,107 @@ class TestMCFindordersDriftAudit:
                 "_find_threshold_edge_guesses call"
             )
 
-    # ── Drift: goto-cont1 ─────────────────────────────────────────────────────
+    # ── goto-cont1: now matches IDL ──────────────────────────────────────────
 
-    def test_DRIFT_goto_cont1_cen_set_to_y_guess_not_nan(self):
-        """KNOWN DRIFT: When _accept_edge_pair rejects an edge pair that was
-        found (both flags active, edges finite, but slit height outside range),
-        IDL's ``goto cont1`` leaves cen[k] = NaN (it was never assigned).
-        Python sets cen[k] = y_guess_f.
+    def test_goto_cont1_cen_stays_nan_on_slit_height_rejection(self):
+        """When _accept_edge_pair rejects an edge pair (both flags active, both
+        edges finite, but slit height outside range), the Python implementation
+        now matches IDL's ``goto cont1`` exactly: cen[k] stays at its
+        pre-existing value rather than being overwritten with y_guess_f.
 
-        This test documents the observed Python behaviour so that any future
-        change to bring it in line with IDL is detected.
+        For columns outside the initialization seed window the pre-existing
+        value is NaN, so after goto-cont1 they must remain NaN.
+
+        The old Python bug was: center_samples[k] = y_guess_f on every rejected
+        path (both goto-cont1 AND else-branch).  After the fix, only the
+        else-branch (threshold guess failed → NaN edges) sets center = y_guess_f;
+        the goto-cont1 path (finite edges but height fails) leaves center alone.
         """
         from pyspextool.instruments.ishell.tracing import (
             _trace_order_left,
             _compute_sobel_image,
         )
 
-        # Build a flat where the slit height at every column is exactly hw=14,
-        # but configure slit_height_min > hw so the pair is ALWAYS rejected.
+        # Use a noiseless flat with clear edges (hw=14 → slit~28px) and
+        # slit_height_max=5 so that every detected pair fails the height check,
+        # forcing the goto-cont1 path for columns where both Sobel COMs succeed.
         flat, _, _ = _make_single_order_flat(c0=128.0, hw=14.0, tilt=0.0, noise=0.0, seed=107)
         nrows, ncols = flat.shape
         sobel = _compute_sobel_image(flat)
-        sample_cols = np.unique(np.round(np.linspace(20, ncols - 20, 12)).astype(int))
+        sample_cols = np.unique(np.round(np.linspace(20, ncols - 20, 14)).astype(int))
         n_samp = len(sample_cols)
         gidx = n_samp // 2
 
         edges = np.full((n_samp, 2), np.nan)
         cen = np.full(n_samp, np.nan)
-        # Seed at gidx.
-        cen[max(0, gidx - 2): min(n_samp, gidx + 3)] = 128.0
+        # Seed window: lo=max(0, gidx-2) .. hi=min(n_samp-1, gidx+2)
+        seed_lo = max(0, gidx - 2)
+        seed_hi = min(n_samp - 1, gidx + 2)
+        cen[seed_lo: seed_hi + 1] = 128.0
         bot = edges[:, 0]
         top_arr = edges[:, 1]
 
-        # Use a very wide slit_height range to guarantee pairs ARE accepted first
-        # (so we have a baseline), then also run with a range that rejects them.
+        # slit_height_max=5 << actual slit ~28px → every found edge pair is
+        # rejected via slit-height (goto cont1 path, both edges finite).
         _trace_order_left(
             flat, sobel, sample_cols, cen, bot, top_arr,
             gidx, nrows, bufpix=2, poly_degree=2, frac=0.7,
-            com_half_width=4, slit_height_min=30.0, slit_height_max=100.0,
-        )
-        # With very high slit_height_min, most/all pairs are rejected (goto cont1).
-        # Python sets cen[k] = y_guess_f for rejected columns.
-        # Document: in this path, cen values are finite (y_guess), not NaN.
-        # (IDL would leave them as NaN.)
-        left_of_seed = cen[:gidx]
-        # Some columns left of seed should have a finite cen value (y_guess_f)
-        # even though edges are NaN — this is the known Python drift.
-        finite_cen = np.isfinite(left_of_seed)
-        nan_bot = ~np.isfinite(bot[:gidx])
-        # Where cen is finite but bot is NaN: that's the drift path.
-        drift_columns = np.where(finite_cen & nan_bot)[0]
-        # This assertion documents that the drift exists (not zero drift columns).
-        # If IDL behaviour were matched, all left-of-seed cen would be NaN when
-        # edges are NaN after rejection. Python sets them to y_guess_f instead.
-        assert len(drift_columns) >= 0, (
-            "Drift check: cen[k]=y_guess_f when pair rejected is the known "
-            "Python vs IDL goto-cont1 difference."
+            com_half_width=4, slit_height_min=0.0, slit_height_max=5.0,
         )
 
-    # ── Drift: robust-fit substitution ────────────────────────────────────────
+        # For columns OUTSIDE the seed window and LEFT of gidx, cen was NaN
+        # before the sweep.  On goto-cont1, cen is left unchanged → stays NaN.
+        # Old bug: center_samples[k] = y_guess_f was written even on goto-cont1.
+        #
+        # We cannot distinguish goto-cont1 vs else-branch purely from the output,
+        # but for a NOISELESS flat with tilt=0 the polynomial prediction keeps
+        # y_guess ≈ 128 (correct order centre), so the threshold guess finds
+        # the edges and the Sobel COM succeeds → goto-cont1 (not else-branch).
+        # Therefore cen must be NaN for columns to the left of seed_lo.
+        cols_outside_seed_left = list(range(0, seed_lo))
+        for k in cols_outside_seed_left:
+            assert np.isnan(cen[k]), (
+                f"goto cont1 fix: col index {k} (col {sample_cols[k]}) is outside "
+                f"the seed window [{seed_lo},{seed_hi}] and left of gidx={gidx}; "
+                f"cen was NaN before the sweep.  After goto-cont1 it must stay NaN, "
+                f"but got cen[{k}] = {cen[k]:.3f}.  "
+                f"(edges: bot={bot[k]}, top={top_arr[k]})"
+            )
 
-    def test_DRIFT_robust_fit_uses_iterative_sigma_clip_not_gaussj(self):
-        """KNOWN DRIFT: _fit_order_edge_polynomials uses _fit_poly_robust
-        (iterative sigma-clipping) instead of IDL mc_robustpoly1d with /GAUSSJ.
+    # ── Known approximation: robust-fit solver ────────────────────────────────
 
-        This test documents that the Python solver is NOT the IDL Gauss-Jordan
-        solver, by verifying the Python function is callable and its docstring
-        records the known substitution.
+    def test_robust_fit_approximation_documented(self):
+        """The only remaining algorithmic approximation vs IDL: _fit_order_edge_polynomials
+        uses _fit_poly_robust (iterative sigma-clipping) instead of IDL mc_robustpoly1d
+        with /GAUSSJ.
+
+        This test verifies that the substitution is documented in the function's
+        source, and that the function is callable with aligned parameters
+        (thresh=3, eps=0.01).  For well-behaved data the two solvers produce
+        equivalent results; the difference only appears in outlier-rejection
+        trajectory.
         """
         import inspect
         from pyspextool.instruments.ishell.tracing import _fit_order_edge_polynomials
 
         src = inspect.getsource(_fit_order_edge_polynomials)
-        # The docstring must record the known substitution.
+        # The docstring must record the known approximation.
         assert "Gauss-Jordan" in src or "GAUSSJ" in src, (
             "_fit_order_edge_polynomials docstring must acknowledge the IDL /GAUSSJ "
-            "substitution drift"
+            "substitution — it is the only remaining algorithmic approximation"
         )
 
-    # ── Drift: tabinv vs interp ────────────────────────────────────────────────
+    # ── tabinv vs interp: verified equivalent ─────────────────────────────────
 
-    def test_DRIFT_tabinv_equivalent_uses_interp(self):
-        """KNOWN DRIFT: IDL tabinv(scols, guesspos[0,i], idx) finds a fractional
-        index by linear interpolation.  Python uses np.interp + round, which is
-        semantically equivalent for the integer-index use case.
+    def test_tabinv_equivalent_to_interp(self):
+        """IDL tabinv(scols, guesspos[0,i], idx) finds a fractional index by
+        linear interpolation.  Python uses np.interp + round, which gives the
+        same result: both round to the nearest integer index for the integer seed
+        positions used in practice.  This is NOT outstanding drift — the two
+        implementations are semantically equivalent.
 
         Verify that _initialize_order_trace_arrays returns the correct integer
-        index for a guess_col that is exactly at a sample column (no rounding
-        ambiguity).
+        index for a guess_col that is exactly at a sample column.
         """
         from pyspextool.instruments.ishell.tracing import _initialize_order_trace_arrays
 
