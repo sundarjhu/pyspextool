@@ -703,54 +703,82 @@ def trace_orders_from_flat(
         )
 
     # ------------------------------------------------------------------
-    # 5. Trace each order on its own per-order sample column array.
-    #    Build OrderTraceSamples — the authoritative per-order representation.
-    #    (IDL mc_findorders inner loop with per-order sranges[*,i].)
+    # 5. Trace each order — IDL mc_findorders inner loop, blocks I–N.
+    #    _trace_single_order_idlstyle composes:
+    #      I  initialize trace arrays (edges + centre)
+    #      J  left sweep
+    #      K  right sweep
+    #      L  fit edge polynomials (mc_robustpoly1d substitute)
+    #      M  derive valid xrange from fitted edges
+    #      N  derive center polynomial from edge polynomials
     # ------------------------------------------------------------------
-    sflat = _compute_sobel_magnitude(flat)
+    # IDL: rimage = sobel(image*1000./max(image))
+    sflat = _compute_sobel_image(flat)
+
+    slith_min = float(slit_height_range[0]) if slit_height_range is not None else 0.0
+    slith_max = float(slit_height_range[1]) if slit_height_range is not None else float(nrows)
 
     order_samples: list[OrderTraceSamples] = []
+    bot_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
+    top_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
+    center_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
+    fit_rms = np.full(n_orders, np.nan)
+
     for i in range(n_orders):
         s_cols_i = order_sample_cols_list[i]
-        seed_idx_i = order_seed_indices[i]
-        y_seed_i = float(seed_peaks[i])
 
-        cen_i, bot_i, top_i = _trace_single_order(
-            flat, sflat, s_cols_i, seed_idx_i, y_seed_i, poly_degree,
-            ybuffer=ybuffer,
-            intensity_fraction=intensity_fraction,
-            com_half_width=com_half_width,
-            slit_height_range=slit_height_range,
-        )
-
+        # x_lo / x_hi: nominal order boundaries (IDL sranges[0,i]/[1,i]).
+        # Used by block M to evaluate fitted polynomials on the dense integer
+        # grid [x_lo..x_hi] for xrange derivation.
         if traced_xranges is not None:
-            x_start_i = int(traced_xranges[i, 0])
-            x_end_i = int(traced_xranges[i, 1])
+            x_lo_i = int(traced_xranges[i, 0])
+            x_hi_i = int(traced_xranges[i, 1])
         else:
-            x_start_i = int(s_cols_i[0])
-            x_end_i = int(s_cols_i[-1])
+            x_lo_i = col_lo
+            x_hi_i = col_hi
+
+        # guess_col: IDL guesspos[0,i] (x-coordinate of the guess position).
+        if guess_positions is not None:
+            guess_col_i = float(guess_positions[i][0])
+        else:
+            guess_col_i = float(seed_col)
+
+        result_i = _trace_single_order_idlstyle(
+            flat, sflat, s_cols_i,
+            x_lo_i, x_hi_i,
+            guess_col_i, float(seed_peaks[i]),
+            poly_degree, nrows, ybuffer,
+            intensity_fraction, com_half_width,
+            slith_min, slith_max,
+        )
 
         order_samples.append(OrderTraceSamples(
             order_index=i,
-            sample_cols=s_cols_i,
-            center_rows=cen_i,
-            bot_rows=bot_i,
-            top_rows=top_i,
-            x_start=x_start_i,
-            x_end=x_end_i,
+            sample_cols=result_i.sample_cols,
+            center_rows=result_i.center_samples,
+            bot_rows=result_i.bottom_edge_samples,
+            top_rows=result_i.top_edge_samples,
+            x_start=result_i.x_start,
+            x_end=result_i.x_end,
         ))
 
+        bot_poly_coeffs[i] = result_i.bottom_edge_coeffs
+        top_poly_coeffs[i] = result_i.top_edge_coeffs
+        center_poly_coeffs[i] = result_i.center_coeffs
+
+        # fit_rms: RMS of centre polynomial residuals at valid traced centre samples.
+        cen_valid = np.isfinite(result_i.center_samples)
+        if cen_valid.sum() >= poly_degree + 1:
+            pred = np.polynomial.polynomial.polyval(
+                s_cols_i[cen_valid].astype(float), result_i.center_coeffs,
+            )
+            fit_rms[i] = float(np.std(result_i.center_samples[cen_valid] - pred))
+
     # ------------------------------------------------------------------
-    # 5a. Validate order_samples — assert internal consistency invariants
-    #     before any downstream computation uses them.
-    #
-    #     NOTE: the xrange check below (sample_cols within [x_start, x_end])
-    #     is a PRE-FIT invariant only.  At construction time (step 5),
-    #     sample_cols is built from the initial input xranges so it lies
-    #     within [x_start, x_end] by design.  After step 6a (post-fit
-    #     xrange restriction), x_start/x_end may be narrowed inward, making
-    #     some sample_cols entries legitimately outside [x_start, x_end].
-    #     Do NOT re-run this check after step 6a.
+    # 5a. Validate order_samples — internal consistency invariants.
+    #     NOTE: x_start/x_end are already post-fit (from block M output), so
+    #     sample_cols entries may legitimately fall outside [x_start, x_end].
+    #     The sample_cols-within-xrange check is intentionally omitted here.
     # ------------------------------------------------------------------
     if len(order_samples) != n_orders:
         raise RuntimeError(
@@ -770,119 +798,6 @@ def trace_orders_from_flat(
             raise RuntimeError(
                 f"Order {os_i.order_index}: sample_cols is not strictly increasing"
             )
-        if os_i.sample_cols[0] < os_i.x_start or os_i.sample_cols[-1] > os_i.x_end:
-            raise RuntimeError(
-                f"Order {os_i.order_index}: sample_cols [{os_i.sample_cols[0]}, "
-                f"{os_i.sample_cols[-1]}] outside xrange [{os_i.x_start}, {os_i.x_end}]"
-            )
-
-    # ------------------------------------------------------------------
-    # 6. Fit robust polynomials to bottom and top edges per order,
-    #    using each order's own sample column array.
-    #    (IDL: mc_robustpoly1d on edges[*,0] and edges[*,1])
-    # ------------------------------------------------------------------
-    bot_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
-    top_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
-    center_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
-    fit_rms = np.full(n_orders, np.nan)
-
-    for i, os_i in enumerate(order_samples):
-        good_bot = np.isfinite(os_i.bot_rows)
-        good_top = np.isfinite(os_i.top_rows)
-        good_cen = np.isfinite(os_i.center_rows)
-        n_min = poly_degree + 1
-
-        if good_bot.sum() >= n_min:
-            b_coeffs, _ = _fit_poly_robust(
-                os_i.sample_cols[good_bot].astype(float),
-                os_i.bot_rows[good_bot],
-                poly_degree, sigma_clip,
-            )
-            bot_poly_coeffs[i] = b_coeffs
-        else:
-            logger.warning(
-                "Order %d: only %d valid bottom-edge points; "
-                "polynomial fit skipped.", i, good_bot.sum(),
-            )
-            bot_poly_coeffs[i][:] = np.nan
-
-        if good_top.sum() >= n_min:
-            t_coeffs, _ = _fit_poly_robust(
-                os_i.sample_cols[good_top].astype(float),
-                os_i.top_rows[good_top],
-                poly_degree, sigma_clip,
-            )
-            top_poly_coeffs[i] = t_coeffs
-        else:
-            logger.warning(
-                "Order %d: only %d valid top-edge points; "
-                "polynomial fit skipped.", i, good_top.sum(),
-            )
-            top_poly_coeffs[i][:] = np.nan
-
-        center_poly_coeffs[i] = (bot_poly_coeffs[i] + top_poly_coeffs[i]) / 2.0
-
-        if good_cen.sum() >= n_min:
-            pred = np.polynomial.polynomial.polyval(
-                os_i.sample_cols[good_cen].astype(float), center_poly_coeffs[i]
-            )
-            fit_rms[i] = float(np.std(os_i.center_rows[good_cen] - pred))
-
-    # ------------------------------------------------------------------
-    # 6a. Update per-order xranges from fitted edge polynomials.
-    #     IDL mc_findorders (verbatim port of the end-of-order-loop block):
-    #
-    #       x = findgen(stop-start+1)+start   ; all integer cols in srange
-    #       bot = poly(x, edgecoeffs[*,0,i])
-    #       top = poly(x, edgecoeffs[*,1,i])
-    #       z = where(top gt 0.0 and top lt nrows-1
-    #                 and bot gt 0 and bot lt nrows-1)
-    #       xranges[*,i] = [min(x[z],MAX=max), max]
-    #
-    #     i.e. restrict xrange to columns where BOTH fitted edge polynomials
-    #     evaluate to strictly valid pixel positions (inside [0, nrows-1]).
-    #     This prevents a pathological polynomial (one that shoots outside
-    #     the detector at one end of the input xrange) from being applied
-    #     over that extrapolated, unsupported region.
-    #
-    #     Python mismatch that this corrects: before this step the Python
-    #     code carried the input sranges straight through to order_xranges
-    #     without ever evaluating whether the fitted polynomial remained
-    #     within the detector.  IDL always performs this restriction.
-    # ------------------------------------------------------------------
-    for i, os_i in enumerate(order_samples):
-        b_coeffs = bot_poly_coeffs[i]
-        t_coeffs = top_poly_coeffs[i]
-        if np.any(np.isnan(b_coeffs)) or np.any(np.isnan(t_coeffs)):
-            # Fit failed — keep original xrange (degenerate fallback,
-            # matching IDL's implicit cancel-on-failure behaviour).
-            logger.warning(
-                "Order %d: edge fit has NaN coefficients; xrange not updated.", i,
-            )
-            continue
-        # Evaluate on every integer column in the order's current xrange
-        # (IDL: x = findgen(stop-start+1)+start).
-        x_dense = np.arange(os_i.x_start, os_i.x_end + 1, dtype=float)
-        bot_vals = np.polynomial.polynomial.polyval(x_dense, b_coeffs)
-        top_vals = np.polynomial.polynomial.polyval(x_dense, t_coeffs)
-        # IDL condition: top gt 0.0 and top lt nrows-1 and bot gt 0 and bot lt nrows-1
-        valid_mask = (
-            (bot_vals > 0.0) & (bot_vals < float(nrows - 1)) &
-            (top_vals > 0.0) & (top_vals < float(nrows - 1))
-        )
-        valid_x = x_dense[valid_mask].astype(int)
-        if len(valid_x) > 0:
-            os_i.x_start = int(valid_x[0])
-            os_i.x_end = int(valid_x[-1])
-        else:
-            # No valid columns — set degenerate range matching IDL's
-            # initialisation (xranges[0,i] = sranges[0,i], xranges[1,i] = sranges[0,i]).
-            logger.warning(
-                "Order %d: fitted edge polynomials evaluate outside detector in "
-                "all columns [%d, %d]; setting degenerate xrange.",
-                i, os_i.x_start, os_i.x_end,
-            )
-            os_i.x_end = os_i.x_start  # degenerate: start == end
 
     # ------------------------------------------------------------------
     # 7. Estimate order half-widths from traced edge separation.
@@ -2966,3 +2881,167 @@ def _center_coeffs_from_edge_coeffs(
             f"got {bot.shape} vs {top.shape}"
         )
     return (bot + top) / 2.0
+
+
+# ---------------------------------------------------------------------------
+# IDL mc_findorders building-block helpers (block O)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SingleOrderResult:
+    """Container returned by :func:`_trace_single_order_idlstyle`.
+
+    Attributes
+    ----------
+    sample_cols : ndarray, shape (n_samp,)
+        Per-order sample column indices (IDL ``scols``).
+    bottom_edge_samples : ndarray, shape (n_samp,)
+        Traced bottom-edge rows (IDL ``edges[*,0]``); NaN where not detected.
+    top_edge_samples : ndarray, shape (n_samp,)
+        Traced top-edge rows (IDL ``edges[*,1]``); NaN where not detected.
+    center_samples : ndarray, shape (n_samp,)
+        Center-row estimates (IDL ``cen``); derived from edges or y_guess.
+    bottom_edge_coeffs : ndarray, shape (poly_degree + 1,)
+        Bottom-edge polynomial coefficients (IDL ``edgecoeffs[*,0,i]``).
+    top_edge_coeffs : ndarray, shape (poly_degree + 1,)
+        Top-edge polynomial coefficients (IDL ``edgecoeffs[*,1,i]``).
+    center_coeffs : ndarray, shape (poly_degree + 1,)
+        Center polynomial coefficients, derived as ``(bot + top) / 2``.
+    x_start : int
+        First valid column (IDL ``xranges[0,i]``).
+    x_end : int
+        Last valid column (IDL ``xranges[1,i]``).
+    """
+
+    sample_cols: npt.NDArray
+    bottom_edge_samples: npt.NDArray
+    top_edge_samples: npt.NDArray
+    center_samples: npt.NDArray
+    bottom_edge_coeffs: npt.NDArray
+    top_edge_coeffs: npt.NDArray
+    center_coeffs: npt.NDArray
+    x_start: int
+    x_end: int
+
+
+def _trace_single_order_idlstyle(
+    image: npt.NDArray,
+    sobel_image: npt.NDArray,
+    sample_cols: npt.NDArray,
+    x_lo: int,
+    x_hi: int,
+    guess_col: float,
+    guess_row: float,
+    poly_degree: int,
+    nrows: int,
+    bufpix: int,
+    frac: float,
+    com_half_width: int,
+    slit_height_min: float,
+    slit_height_max: float,
+) -> _SingleOrderResult:
+    """Per-order orchestration: IDL ``mc_findorders`` inner loop for one order.
+
+    Composes blocks I–N to perform the full tracing workflow for a single order:
+
+    1. Initialize trace arrays (block I: :func:`_initialize_order_trace_arrays`)
+    2. Left sweep (block J: :func:`_trace_order_left`)
+    3. Right sweep (block K: :func:`_trace_order_right`)
+    4. Fit edge polynomials (block L: :func:`_fit_order_edge_polynomials`)
+    5. Derive valid xrange (block M: :func:`_derive_order_xrange_from_fitted_edges`)
+    6. Derive center polynomial (block N: :func:`_center_coeffs_from_edge_coeffs`)
+
+    The sample-column array is passed pre-built (block H is the caller's
+    responsibility).  ``x_lo``/``x_hi`` are the nominal order boundaries
+    used by block M to evaluate the dense integer grid for xrange derivation
+    (IDL ``start``/``stop`` = ``sranges[0,i]``/``sranges[1,i]``).
+
+    IDL reference (mc_findorders.pro, lines 164–431):
+        for i = 0, norders-1 do begin
+            start = sranges[0,i]; stop = sranges[1,i]
+            scols = build(start,stop,step)            ; block H (caller)
+            edges = replicate(NaN,nscols,2)           ; block I
+            cen[gidx-deg:gidx+deg] = guesspos[1,i]   ; block I
+            [left sweep j=0..gidx]                    ; block J
+            [right sweep j=gidx+1..nscols-1]          ; block K
+            edgecoeffs[*,*,i] = robustfit(scols,edges) ; block L
+            bot/top = poly(x, edgecoeffs[*,j,i])      ; block M
+            xranges[*,i] = [min(x[z]),max]             ; block M
+        endfor
+
+    Parameters
+    ----------
+    image : ndarray, shape (nrows, ncols)
+    sobel_image : ndarray, shape (nrows, ncols)
+    sample_cols : ndarray of int, shape (n_samp,)
+        Pre-built per-order sample column indices (IDL ``scols``).
+    x_lo : int
+        First column of the nominal order range (IDL ``sranges[0,i]``).
+    x_hi : int
+        Last column of the nominal order range (IDL ``sranges[1,i]``).
+    guess_col : float
+        X-coordinate of the guess position (IDL ``guesspos[0,i]``).
+    guess_row : float
+        Y-coordinate of the guess position (IDL ``guesspos[1,i]``).
+    poly_degree : int
+    nrows : int
+    bufpix : int
+    frac : float
+        Intensity threshold fraction (IDL ``frac``).
+    com_half_width : int
+        Half-width of the Sobel COM window (IDL ``halfwin``).
+    slit_height_min : float
+        Minimum accepted slit height in pixels (IDL ``slith_pix[0]``).
+    slit_height_max : float
+        Maximum accepted slit height in pixels (IDL ``slith_pix[1]``).
+
+    Returns
+    -------
+    _SingleOrderResult
+    """
+    # Block I: initialize trace arrays (edges + centre, seeded at guess).
+    edges, cen, _, gidx = _initialize_order_trace_arrays(
+        sample_cols, guess_col, guess_row, poly_degree,
+    )
+    bot = edges[:, 0]  # mutable view of edges[:,0] — written by sweeps
+    top = edges[:, 1]  # mutable view of edges[:,1] — written by sweeps
+
+    # Block J: left sweep (gidx → 0).
+    _trace_order_left(
+        image, sobel_image, sample_cols, cen, bot, top,
+        gidx, nrows, bufpix, poly_degree, frac, com_half_width,
+        slit_height_min, slit_height_max,
+    )
+
+    # Block K: right sweep (gidx+1 → n_samp-1).
+    _trace_order_right(
+        image, sobel_image, sample_cols, cen, bot, top,
+        gidx, nrows, bufpix, poly_degree, frac, com_half_width,
+        slit_height_min, slit_height_max,
+    )
+
+    # Block L: fit robust polynomials to finite bottom and top edge samples.
+    bottom_coeffs, top_coeffs = _fit_order_edge_polynomials(
+        sample_cols, bot, top, poly_degree,
+    )
+
+    # Block M: derive valid column range from fitted edge polynomials.
+    x_start, x_end = _derive_order_xrange_from_fitted_edges(
+        x_lo, x_hi, bottom_coeffs, top_coeffs, nrows,
+    )
+
+    # Block N: derive center polynomial coefficients from edge polynomials.
+    center_coeffs = _center_coeffs_from_edge_coeffs(bottom_coeffs, top_coeffs)
+
+    return _SingleOrderResult(
+        sample_cols=sample_cols,
+        bottom_edge_samples=bot.copy(),
+        top_edge_samples=top.copy(),
+        center_samples=cen.copy(),
+        bottom_edge_coeffs=bottom_coeffs,
+        top_edge_coeffs=top_coeffs,
+        center_coeffs=center_coeffs,
+        x_start=x_start,
+        x_end=x_end,
+    )

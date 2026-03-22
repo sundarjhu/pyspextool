@@ -4839,3 +4839,242 @@ class TestIDLHelperFunctionsLMN:
                 np.array([1.0, 2.0, 3.0]),
                 np.array([1.0, 2.0]),
             )
+
+
+# ---------------------------------------------------------------------------
+# TestIDLHelperFunctionOP  (mc_findorders blocks O–P)
+# ---------------------------------------------------------------------------
+
+
+class TestIDLHelperFunctionOP:
+    """Verify blocks O (_trace_single_order_idlstyle) and P (trace_orders_from_flat
+    wired to the new IDL-style core)."""
+
+    # ── Shared fixture: single-order Gaussian synthetic flat ────────────────
+    # Use the same 512-column flat that the other TestIDLPortFidelity tests use
+    # to avoid the singular-matrix failure that arises from too few samples.
+
+    @pytest.fixture(scope="class")
+    def syn_flat_path(self, tmp_path_factory):
+        """Write the standard _make_synthetic_flat (single order) to a FITS file."""
+        rng = np.random.default_rng(42)
+        nrows, ncols = _NROWS, _NCOLS
+        img = rng.normal(0.0, 50.0, size=(nrows, ncols)).astype(float)
+        # One Gaussian order centred at row 100, half-width ~10 px
+        for col in range(ncols):
+            center = 100.0 + 0.01 * col
+            sigma = 10.0 / 2.355
+            rows = np.arange(nrows, dtype=float)
+            img[:, col] += 2000.0 * np.exp(-0.5 * ((rows - center) / sigma) ** 2)
+        img = np.clip(img, 0, None).astype(np.float32)
+        tmp = tmp_path_factory.mktemp("op")
+        p = str(tmp / "syn1.fits")
+        from astropy.io import fits as _fits
+        _fits.PrimaryHDU(img).writeto(p, overwrite=True)
+        return p, nrows, ncols
+
+    @pytest.fixture(scope="class")
+    def single_order_result(self, syn_flat_path):
+        """Run _trace_single_order_idlstyle on the synthetic flat once."""
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order_idlstyle,
+            _compute_sobel_image,
+        )
+        from astropy.io import fits as _fits
+        p, nrows, ncols = syn_flat_path
+        img = _fits.open(p)[0].data.astype(float)
+        sobel = _compute_sobel_image(img)
+        # Use linspace sample cols (no per-order step in guess_rows mode)
+        sample_cols = np.unique(
+            np.round(np.linspace(50, ncols - 50, 30)).astype(int)
+        )
+        x_lo, x_hi = 0, ncols - 1
+        guess_col = float(ncols // 2)
+        guess_row = 100.0
+        return _trace_single_order_idlstyle(
+            img, sobel, sample_cols, x_lo, x_hi,
+            guess_col, guess_row,
+            poly_degree=2, nrows=nrows, bufpix=2, frac=0.5,
+            com_half_width=3, slit_height_min=5.0, slit_height_max=40.0,
+        )
+
+    # ── O: _trace_single_order_idlstyle ────────────────────────────────────
+
+    def test_O_returns_SingleOrderResult(self, single_order_result):
+        """Return type is _SingleOrderResult."""
+        from pyspextool.instruments.ishell.tracing import _SingleOrderResult
+        assert isinstance(single_order_result, _SingleOrderResult)
+
+    def test_O_edges_independently_traced(self, single_order_result):
+        """bottom_edge_samples and top_edge_samples are distinct arrays."""
+        r = single_order_result
+        assert not np.array_equal(r.bottom_edge_samples, r.top_edge_samples)
+
+    def test_O_bottom_below_top(self, single_order_result):
+        """At finite samples, bottom_edge < top_edge (bottom is lower row)."""
+        r = single_order_result
+        ok = np.isfinite(r.bottom_edge_samples) & np.isfinite(r.top_edge_samples)
+        assert ok.sum() > 0, "No finite edge samples found"
+        bot_vals = r.bottom_edge_samples[ok]
+        top_vals = r.top_edge_samples[ok]
+        assert np.all(bot_vals < top_vals), (
+            "bottom_edge_samples must be below top_edge_samples at all finite positions"
+        )
+
+    def test_O_center_is_mean_of_edge_coeffs(self, single_order_result):
+        """center_coeffs == (bottom_edge_coeffs + top_edge_coeffs) / 2."""
+        r = single_order_result
+        expected = (r.bottom_edge_coeffs + r.top_edge_coeffs) / 2.0
+        np.testing.assert_allclose(r.center_coeffs, expected, rtol=1e-12)
+
+    def test_O_xrange_from_fitted_edges_not_sample_coverage(self, syn_flat_path):
+        """x_start / x_end come from block M (fitted-edge validity), not raw samples."""
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order_idlstyle,
+            _compute_sobel_image,
+        )
+        from astropy.io import fits as _fits
+
+        p, nrows, ncols = syn_flat_path
+        img = _fits.open(p)[0].data.astype(float)
+        sobel = _compute_sobel_image(img)
+
+        # Sparse samples covering only the middle third of the detector
+        sample_cols = np.unique(
+            np.round(np.linspace(ncols // 3, 2 * ncols // 3, 20)).astype(int)
+        )
+        x_lo, x_hi = 0, ncols - 1  # nominal order range = full width
+
+        result = _trace_single_order_idlstyle(
+            img, sobel, sample_cols, x_lo, x_hi,
+            guess_col=float(ncols // 2), guess_row=100.0,
+            poly_degree=1, nrows=nrows, bufpix=2, frac=0.5,
+            com_half_width=3, slit_height_min=5.0, slit_height_max=40.0,
+        )
+        # Block M evaluates over [0, ncols-1], so if the polynomial is valid
+        # everywhere, x_start should be smaller than the leftmost sample col.
+        assert result.x_start < sample_cols[0] or result.x_end > sample_cols[-1], (
+            f"xrange [{result.x_start}, {result.x_end}] should extend beyond "
+            f"the raw sample coverage [{sample_cols[0]}, {sample_cols[-1]}]; "
+            "xrange is based on fitted-edge evaluation, not raw sample coverage"
+        )
+
+    def test_O_result_arrays_have_same_length_as_sample_cols(self, single_order_result):
+        """All per-sample arrays have the same length as sample_cols."""
+        r = single_order_result
+        n = len(r.sample_cols)
+        assert r.bottom_edge_samples.shape == (n,)
+        assert r.top_edge_samples.shape == (n,)
+        assert r.center_samples.shape == (n,)
+
+    def test_O_edge_coeffs_shape(self, single_order_result):
+        """Edge coefficient arrays have shape (poly_degree + 1,)."""
+        r = single_order_result
+        # poly_degree=2 → 3 coefficients
+        assert r.bottom_edge_coeffs.shape == (3,)
+        assert r.top_edge_coeffs.shape == (3,)
+        assert r.center_coeffs.shape == (3,)
+
+    # ── P: trace_orders_from_flat wired to new IDL core ────────────────────
+
+    def test_P_trace_orders_uses_idlstyle_core(self, syn_flat_path):
+        """trace_orders_from_flat calls _trace_single_order_idlstyle, not _trace_single_order."""
+        import unittest.mock as mock
+        from pyspextool.instruments.ishell import tracing as _tracing_module
+
+        p, nrows, ncols = syn_flat_path
+        calls = []
+        original = _tracing_module._trace_single_order_idlstyle
+
+        def capture(*args, **kwargs):
+            calls.append(True)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(_tracing_module, "_trace_single_order_idlstyle", capture):
+            _tracing_module.trace_orders_from_flat(
+                [p], guess_rows=[100.0], n_sample_cols=20,
+                col_range=(50, ncols - 50), poly_degree=2,
+                slit_height_range=(5.0, 40.0),
+            )
+
+        assert len(calls) >= 1, (
+            "trace_orders_from_flat must call _trace_single_order_idlstyle at least once"
+        )
+
+    def test_P_bot_top_edges_independently_stored(self, syn_flat_path):
+        """FlatOrderTrace stores independently-traced bot and top edge polynomials."""
+        p, nrows, ncols = syn_flat_path
+        result = trace_orders_from_flat(
+            [p], guess_rows=[100.0], n_sample_cols=20,
+            col_range=(50, ncols - 50), poly_degree=2,
+            slit_height_range=(5.0, 40.0),
+        )
+        assert result.bot_poly_coeffs is not None
+        assert result.top_poly_coeffs is not None
+        assert not np.array_equal(result.bot_poly_coeffs, result.top_poly_coeffs)
+
+    def test_P_center_coeffs_derived_from_edges(self, syn_flat_path):
+        """center_poly_coeffs == (bot + top) / 2 for every order."""
+        p, nrows, ncols = syn_flat_path
+        result = trace_orders_from_flat(
+            [p], guess_rows=[100.0], n_sample_cols=20,
+            col_range=(50, ncols - 50), poly_degree=2,
+            slit_height_range=(5.0, 40.0),
+        )
+        for i in range(result.n_orders):
+            expected = (result.bot_poly_coeffs[i] + result.top_poly_coeffs[i]) / 2.0
+            np.testing.assert_allclose(
+                result.center_poly_coeffs[i], expected, rtol=1e-12,
+                err_msg=f"Order {i}: center_poly_coeffs != (bot + top) / 2",
+            )
+
+    def test_P_order_xranges_from_fitted_edge_validity(self, syn_flat_path):
+        """order_xranges come from fitted-edge validity (block M), not raw sample coverage."""
+        p, nrows, ncols = syn_flat_path
+        result = trace_orders_from_flat(
+            [p], guess_rows=[100.0], n_sample_cols=20,
+            col_range=(50, ncols - 50), poly_degree=2,
+            slit_height_range=(5.0, 40.0),
+        )
+        assert result.order_xranges is not None
+        # Both fitted edges must evaluate within (0, nrows-1) at every column
+        # in the reported xrange.
+        for i in range(result.n_orders):
+            x0, x1 = result.order_xranges[i, 0], result.order_xranges[i, 1]
+            x = np.arange(x0, x1 + 1, dtype=float)
+            bot_vals = np.polynomial.polynomial.polyval(x, result.bot_poly_coeffs[i])
+            top_vals = np.polynomial.polynomial.polyval(x, result.top_poly_coeffs[i])
+            assert np.all(bot_vals > 0) and np.all(bot_vals < nrows - 1), (
+                f"Order {i}: bottom edge outside detector within reported xrange"
+            )
+            assert np.all(top_vals > 0) and np.all(top_vals < nrows - 1), (
+                f"Order {i}: top edge outside detector within reported xrange"
+            )
+
+    def test_P_downstream_geometry_still_works(self, syn_flat_path):
+        """to_order_geometry_set still produces valid OrderGeometrySet after new core."""
+        p, nrows, ncols = syn_flat_path
+        result = trace_orders_from_flat(
+            [p], guess_rows=[100.0], n_sample_cols=20,
+            col_range=(50, ncols - 50), poly_degree=2,
+            slit_height_range=(5.0, 40.0),
+        )
+        geom = result.to_order_geometry_set("test_mode")
+        assert geom.n_orders == result.n_orders
+        for g in geom.geometries:
+            assert g.x_start <= g.x_end
+
+    def test_P_old_heuristic_helpers_not_in_new_core(self):
+        """_predict_and_find_edges and _update_centre_and_flags are not called by
+        _trace_single_order_idlstyle (old heuristic path is gone from the new core)."""
+        import inspect
+        from pyspextool.instruments.ishell.tracing import _trace_single_order_idlstyle
+
+        src = inspect.getsource(_trace_single_order_idlstyle)
+        assert "_predict_and_find_edges" not in src, (
+            "_trace_single_order_idlstyle must not call the old heuristic "
+            "_predict_and_find_edges; the new core uses _trace_order_left/_right"
+        )
+        assert "_update_centre_and_flags" not in src, (
+            "_trace_single_order_idlstyle must not call the old _update_centre_and_flags"
+        )
