@@ -2785,3 +2785,184 @@ def _trace_order_right(
         # IDL: if not dotop and not dobot then goto, moveon2
         if not do_top and not do_bot:
             break
+
+
+# ---------------------------------------------------------------------------
+# IDL mc_findorders building-block helpers (blocks L–N)
+# ---------------------------------------------------------------------------
+
+
+def _fit_order_edge_polynomials(
+    sample_cols: npt.NDArray,
+    bottom_edge_samples: npt.NDArray,
+    top_edge_samples: npt.NDArray,
+    poly_degree: int,
+) -> tuple[npt.NDArray, npt.NDArray]:
+    """Fit final robust polynomials to the traced bottom and top edges.
+
+    IDL block (mc_findorders.pro, lines 405–421):
+        for j = 0,1 do begin
+            coeff = mc_robustpoly1d(scols, edges[*,j], degree, 3, 0.01,
+                                    OGOODBAD=goodbad, /SILENT, /GAUSSJ,
+                                    CANCEL=cancel)
+            if cancel then return
+            edgecoeffs[*,j,i] = coeff
+        endfor
+
+    IDL's ``mc_robustpoly1d`` automatically skips NaN samples via its
+    internal goodbad mask.  Here we filter finite samples explicitly before
+    passing to :func:`_fit_poly_robust`, which wraps ``_polyfit_1d`` with
+    equivalent robust-rejection settings (threshold=3, eps=0.01).
+
+    .. note::
+        Temporary drift: the Python :func:`_fit_poly_robust` uses iterative
+        sigma-clipping via ``_polyfit_1d`` rather than IDL's Gauss-Jordan
+        implementation (``/GAUSSJ``).  The robust interface is otherwise
+        parameter-compatible (thresh=3, eps=0.01).
+
+    Parameters
+    ----------
+    sample_cols : ndarray of float, shape (n_samp,)
+        Column positions of all samples (IDL ``scols``).
+    bottom_edge_samples : ndarray of float, shape (n_samp,)
+        Traced bottom-edge row values; NaN where not traced (IDL ``edges[*,0]``).
+    top_edge_samples : ndarray of float, shape (n_samp,)
+        Traced top-edge row values; NaN where not traced (IDL ``edges[*,1]``).
+    poly_degree : int
+        Polynomial degree (IDL ``degree``).
+
+    Returns
+    -------
+    bottom_coeffs : ndarray, shape (poly_degree + 1,)
+        Coefficients for the bottom edge (IDL ``edgecoeffs[*,0,i]``), in
+        ``numpy.polynomial.polynomial`` convention.
+    top_coeffs : ndarray, shape (poly_degree + 1,)
+        Coefficients for the top edge (IDL ``edgecoeffs[*,1,i]``).
+    """
+    cols = np.asarray(sample_cols, dtype=float)
+
+    # IDL j=0: bottom edge
+    bot = np.asarray(bottom_edge_samples, dtype=float)
+    bot_ok = np.isfinite(bot)
+    bottom_coeffs, _ = _fit_poly_robust(cols[bot_ok], bot[bot_ok], poly_degree)
+
+    # IDL j=1: top edge
+    top = np.asarray(top_edge_samples, dtype=float)
+    top_ok = np.isfinite(top)
+    top_coeffs, _ = _fit_poly_robust(cols[top_ok], top[top_ok], poly_degree)
+
+    return bottom_coeffs, top_coeffs
+
+
+def _derive_order_xrange_from_fitted_edges(
+    x_lo: int,
+    x_hi: int,
+    bottom_edge_coeffs: npt.NDArray,
+    top_edge_coeffs: npt.NDArray,
+    nrows: int,
+) -> tuple[int, int]:
+    """Derive the valid column range where both fitted edges remain on detector.
+
+    IDL block (mc_findorders.pro, lines 403+426–430):
+        x   = findgen(stop-start+1)+start
+        bot = poly(x, edgecoeffs[*,0,i])
+        top = poly(x, edgecoeffs[*,1,i])
+        z   = where(top gt 0.0 and top lt nrows-1 and
+                    bot gt 0  and bot lt nrows-1)
+        xranges[*,i] = [min(x[z],MAX=max), max]
+
+    Both fitted-edge polynomials are evaluated on the dense integer grid
+    ``x = [x_lo, x_lo+1, …, x_hi]``.  The valid sub-range is determined
+    purely from where both evaluated curves lie strictly inside the detector
+    row extent, i.e.:
+        0 < bot < nrows-1  AND  0 < top < nrows-1
+
+    No sample-coverage heuristics and no center-based logic are used.
+
+    Parameters
+    ----------
+    x_lo : int
+        First column of the nominal order range (IDL ``start = sranges[0,i]``).
+    x_hi : int
+        Last column of the nominal order range (IDL ``stop = sranges[1,i]``).
+    bottom_edge_coeffs : ndarray, shape (degree + 1,)
+        ``numpy.polynomial.polynomial`` coefficients for the bottom edge.
+    top_edge_coeffs : ndarray, shape (degree + 1,)
+        ``numpy.polynomial.polynomial`` coefficients for the top edge.
+    nrows : int
+        Number of detector rows.
+
+    Returns
+    -------
+    xrange_lo : int
+        Minimum column where both edges are on detector.
+    xrange_hi : int
+        Maximum column where both edges are on detector.
+        If no valid column exists, returns ``(x_lo, x_lo)`` (IDL would
+        error on an empty ``where``; we return a degenerate range instead).
+    """
+    # IDL: x = findgen(stop-start+1)+start
+    x = np.arange(x_lo, x_hi + 1, dtype=float)
+
+    # IDL: bot = poly(x, edgecoeffs[*,0,i])
+    #      top = poly(x, edgecoeffs[*,1,i])
+    bot = np.polynomial.polynomial.polyval(x, bottom_edge_coeffs)
+    top = np.polynomial.polynomial.polyval(x, top_edge_coeffs)
+
+    # IDL: z = where(top gt 0.0 and top lt nrows-1 and
+    #                bot gt 0  and bot lt nrows-1)
+    valid = (top > 0.0) & (top < nrows - 1) & (bot > 0) & (bot < nrows - 1)
+
+    # IDL: xranges[*,i] = [min(x[z],MAX=max), max]
+    if not np.any(valid):
+        # Degenerate: no column has both edges on detector.
+        return int(x_lo), int(x_lo)
+
+    valid_x = x[valid]
+    return int(np.min(valid_x)), int(np.max(valid_x))
+
+
+def _center_coeffs_from_edge_coeffs(
+    bottom_edge_coeffs: npt.NDArray,
+    top_edge_coeffs: npt.NDArray,
+) -> npt.NDArray:
+    """Derive centre polynomial coefficients from the fitted edge coefficients.
+
+    IDL semantic (mc_findorders.pro, line 283 / line 373):
+        cen[k] = (com_bot + com_top) / 2.
+
+    At the polynomial level this means:
+        center(x) = (bot(x) + top(x)) / 2
+
+    For polynomials with the same degree this is equivalent to averaging the
+    corresponding coefficients element-wise:
+        center_coeffs = (bottom_coeffs + top_coeffs) / 2
+
+    The centre is therefore derived from the edge polynomials, never fitted
+    independently.
+
+    Parameters
+    ----------
+    bottom_edge_coeffs : ndarray, shape (degree + 1,)
+        ``numpy.polynomial.polynomial`` coefficients for the bottom edge.
+    top_edge_coeffs : ndarray, shape (degree + 1,)
+        ``numpy.polynomial.polynomial`` coefficients for the top edge.
+
+    Returns
+    -------
+    ndarray, shape (degree + 1,)
+        Center polynomial coefficients.
+
+    Raises
+    ------
+    ValueError
+        If the two coefficient arrays have different lengths.
+    """
+    bot = np.asarray(bottom_edge_coeffs, dtype=float)
+    top = np.asarray(top_edge_coeffs, dtype=float)
+    if bot.shape != top.shape:
+        raise ValueError(
+            f"bottom_edge_coeffs and top_edge_coeffs must have the same shape; "
+            f"got {bot.shape} vs {top.shape}"
+        )
+    return (bot + top) / 2.0

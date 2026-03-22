@@ -4639,3 +4639,203 @@ class TestIDLHelperFunctionsJK:
             slit_height_min=self.SLITH_MIN, slit_height_max=self.SLITH_MAX,
         )
         # The test succeeds simply by completing (no hang / exception).
+
+
+# ---------------------------------------------------------------------------
+# TestIDLHelperFunctionsLMN  (mc_findorders blocks L–N)
+# ---------------------------------------------------------------------------
+
+
+class TestIDLHelperFunctionsLMN:
+    """Unit tests for IDL mc_findorders building-block helpers L, M, and N."""
+
+    # ── L: _fit_order_edge_polynomials ──────────────────────────────────────
+
+    def test_L_fit_ignores_nan_samples(self):
+        """Edge polynomial fit uses only finite samples, ignoring NaN entries."""
+        from pyspextool.instruments.ishell.tracing import _fit_order_edge_polynomials
+
+        # Gently tilted order (linear tilt + small noise avoids zero-residual
+        # singularity in the robust sigma-clipping algorithm).
+        rng = np.random.default_rng(42)
+        scols = np.arange(0, 100, 5, dtype=float)
+        noise = rng.normal(0, 0.05, len(scols))
+        bot = 90.0 + 0.01 * scols + noise
+        top = 110.0 + 0.01 * scols + noise
+
+        # Corrupt some samples with NaN — fit should still succeed.
+        bot[[0, 1, 2]] = np.nan
+        top[[-1, -2]] = np.nan
+
+        bc, tc = _fit_order_edge_polynomials(scols, bot, top, poly_degree=3)
+
+        # Recovered edge at x=50 should be close to the true values.
+        assert np.polynomial.polynomial.polyval(50.0, bc) == pytest.approx(90.5, abs=1.0)
+        assert np.polynomial.polynomial.polyval(50.0, tc) == pytest.approx(110.5, abs=1.0)
+
+    def test_L_returns_degree_plus_one_coefficients(self):
+        """Returned coefficient arrays have shape (poly_degree + 1,)."""
+        from pyspextool.instruments.ishell.tracing import _fit_order_edge_polynomials
+
+        # Use a tilted edge with small noise to keep the robust fit non-singular.
+        rng = np.random.default_rng(7)
+        scols = np.arange(0, 50, 5, dtype=float)
+        noise = rng.normal(0, 0.05, len(scols))
+        bot = 80.0 + 0.02 * scols + noise
+        top = 120.0 + 0.02 * scols + noise
+
+        for deg in (1, 2, 3, 4):
+            bc, tc = _fit_order_edge_polynomials(scols, bot, top, poly_degree=deg)
+            assert bc.shape == (deg + 1,), f"bottom coeffs wrong shape for degree {deg}"
+            assert tc.shape == (deg + 1,), f"top coeffs wrong shape for degree {deg}"
+
+    def test_L_fit_recovers_linear_edge(self):
+        """Fit returns coefficients that reconstruct a tilted linear edge."""
+        from pyspextool.instruments.ishell.tracing import _fit_order_edge_polynomials
+
+        scols = np.arange(10, 90, 5, dtype=float)
+        # bot(x) = 80 + 0.05*x  (linear tilt)
+        bot = 80.0 + 0.05 * scols
+        top = 110.0 + 0.05 * scols  # parallel top edge
+
+        bc, tc = _fit_order_edge_polynomials(scols, bot, top, poly_degree=1)
+        # Intercept ~ 80, slope ~ 0.05
+        assert bc[0] == pytest.approx(80.0, abs=1.0)
+        assert bc[1] == pytest.approx(0.05, abs=0.01)
+        assert tc[0] == pytest.approx(110.0, abs=1.0)
+
+    # ── M: _derive_order_xrange_from_fitted_edges ───────────────────────────
+
+    def test_M_xrange_from_fitted_edges_on_detector(self):
+        """xrange is determined by where fitted edges are strictly inside detector."""
+        from pyspextool.instruments.ishell.tracing import _derive_order_xrange_from_fitted_edges
+
+        nrows = 200
+        # Constant edges well inside the detector.
+        bot_coeffs = np.array([90.0])   # constant 90
+        top_coeffs = np.array([110.0])  # constant 110
+        xlo, xhi = _derive_order_xrange_from_fitted_edges(
+            x_lo=0, x_hi=99, bottom_edge_coeffs=bot_coeffs,
+            top_edge_coeffs=top_coeffs, nrows=nrows,
+        )
+        # Both edges valid everywhere → full range.
+        assert xlo == 0
+        assert xhi == 99
+
+    def test_M_xrange_excludes_columns_where_edge_exits_detector(self):
+        """Columns where a fitted edge goes outside [0, nrows-1] are excluded."""
+        from pyspextool.instruments.ishell.tracing import _derive_order_xrange_from_fitted_edges
+
+        nrows = 200
+        # Top edge starts at row 110 and rises steeply — exits at column ~89.
+        # top(x) = 110 + 1.0*x  → top(89) = 199 = nrows-1  (boundary),
+        #                          top(90) = 200 > nrows-1  (off-detector)
+        top_coeffs = np.array([110.0, 1.0])  # c0 + c1*x
+        bot_coeffs = np.array([90.0, 0.0])   # constant 90
+
+        xlo, xhi = _derive_order_xrange_from_fitted_edges(
+            x_lo=0, x_hi=100, bottom_edge_coeffs=bot_coeffs,
+            top_edge_coeffs=top_coeffs, nrows=nrows,
+        )
+        # top < nrows-1  strictly, so top(88)=198 valid, top(89)=199 invalid.
+        assert xlo == 0
+        assert xhi <= 88
+
+    def test_M_xrange_not_based_on_sample_coverage(self):
+        """xrange uses fitted-edge evaluation, not where raw samples are finite."""
+        from pyspextool.instruments.ishell.tracing import (
+            _derive_order_xrange_from_fitted_edges,
+            _fit_order_edge_polynomials,
+        )
+
+        nrows = 200
+        # Sparse samples: only the middle third of the detector range has data.
+        # Use a gentle linear tilt with small noise to keep the robust fit stable.
+        rng = np.random.default_rng(99)
+        all_cols = np.arange(0, 100, 5, dtype=float)
+        bot_samples = np.full(len(all_cols), np.nan)
+        top_samples = np.full(len(all_cols), np.nan)
+        # Only columns 40–60 have finite samples.
+        mid = (all_cols >= 40) & (all_cols <= 60)
+        n_mid = int(mid.sum())
+        noise = rng.normal(0, 0.05, n_mid)
+        bot_samples[mid] = 90.0 + 0.01 * all_cols[mid] + noise
+        top_samples[mid] = 110.0 + 0.01 * all_cols[mid] + noise
+
+        bot_c, top_c = _fit_order_edge_polynomials(
+            all_cols, bot_samples, top_samples, poly_degree=1,
+        )
+
+        xlo, xhi = _derive_order_xrange_from_fitted_edges(
+            x_lo=0, x_hi=99, bottom_edge_coeffs=bot_c,
+            top_edge_coeffs=top_c, nrows=nrows,
+        )
+        # Because edges are on-detector everywhere, the fitted polynomial extends
+        # validly beyond the raw sample range [40,60].
+        assert xlo < 40 or xhi > 60, (
+            "xrange should extend beyond the raw sample coverage when the "
+            f"fitted polynomial is valid across the full range; got [{xlo},{xhi}]"
+        )
+
+    def test_M_degenerate_no_valid_columns(self):
+        """When no column has both edges on detector, (x_lo, x_lo) is returned."""
+        from pyspextool.instruments.ishell.tracing import _derive_order_xrange_from_fitted_edges
+
+        nrows = 200
+        # Both edges are way off detector.
+        bot_coeffs = np.array([500.0])  # off-detector
+        top_coeffs = np.array([600.0])  # off-detector
+        xlo, xhi = _derive_order_xrange_from_fitted_edges(
+            x_lo=10, x_hi=50, bottom_edge_coeffs=bot_coeffs,
+            top_edge_coeffs=top_coeffs, nrows=nrows,
+        )
+        assert xlo == 10
+        assert xhi == 10
+
+    # ── N: _center_coeffs_from_edge_coeffs ──────────────────────────────────
+
+    def test_N_center_is_mean_of_edge_coeffs(self):
+        """Center coefficients equal (bottom + top) / 2 element-wise."""
+        from pyspextool.instruments.ishell.tracing import _center_coeffs_from_edge_coeffs
+
+        bot = np.array([90.0, 0.1, -0.001])
+        top = np.array([110.0, 0.3, 0.001])
+        cen = _center_coeffs_from_edge_coeffs(bot, top)
+
+        expected = (bot + top) / 2.0
+        np.testing.assert_allclose(cen, expected)
+
+    def test_N_center_evaluates_as_midpoint(self):
+        """center(x) == (bottom(x) + top(x)) / 2 at every x."""
+        from pyspextool.instruments.ishell.tracing import _center_coeffs_from_edge_coeffs
+
+        bot_c = np.array([90.0, 0.05, 0.0])
+        top_c = np.array([110.0, 0.05, 0.0])
+        cen_c = _center_coeffs_from_edge_coeffs(bot_c, top_c)
+
+        x = np.linspace(0, 100, 50)
+        bot_vals = np.polynomial.polynomial.polyval(x, bot_c)
+        top_vals = np.polynomial.polynomial.polyval(x, top_c)
+        cen_vals = np.polynomial.polynomial.polyval(x, cen_c)
+
+        np.testing.assert_allclose(cen_vals, (bot_vals + top_vals) / 2.0, rtol=1e-12)
+
+    def test_N_center_not_independently_fitted(self):
+        """Center coefficients are derived from edge coefficients, not a new fit."""
+        from pyspextool.instruments.ishell.tracing import _center_coeffs_from_edge_coeffs
+
+        bot = np.array([80.0, 0.0])
+        top = np.array([120.0, 0.0])
+        cen = _center_coeffs_from_edge_coeffs(bot, top)
+        # Independent fit of center would give 100; so does (80+120)/2.
+        assert cen[0] == pytest.approx(100.0)
+
+    def test_N_raises_on_mismatched_shapes(self):
+        """ValueError raised when bottom and top coefficient arrays differ in length."""
+        from pyspextool.instruments.ishell.tracing import _center_coeffs_from_edge_coeffs
+
+        with pytest.raises(ValueError, match="same shape"):
+            _center_coeffs_from_edge_coeffs(
+                np.array([1.0, 2.0, 3.0]),
+                np.array([1.0, 2.0]),
+            )
