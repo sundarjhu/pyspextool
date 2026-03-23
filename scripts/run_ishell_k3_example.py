@@ -758,18 +758,28 @@ def _plot_flat_orders(
             vmax=vmax,
         )
 
-        # Evaluate each order's centre polynomial continuously across columns
-        col_range = np.arange(
-            int(trace.sample_cols[0]), int(trace.sample_cols[-1]) + 1
-        )
+        # Evaluate each order's centre polynomial within its valid column range.
+        # Using the full shared sample_cols range for orders with a restricted
+        # xrange (e.g. order 203 with xrange 300-1310 vs 300-1750 for others)
+        # causes high-degree polynomial extrapolation that produces rogue curves
+        # far from the actual order position.
         for i in range(trace.n_orders):
             coeffs = trace.center_poly_coeffs[i]
-            centers_smooth = np.polynomial.polynomial.polyval(col_range, coeffs)
-            ax.plot(col_range, centers_smooth, lw=0.9, alpha=0.85)
-            # Overlay sampled points in a light grey for reference
+            if trace.order_xranges is not None:
+                x0_i = int(trace.order_xranges[i, 0])
+                x1_i = int(trace.order_xranges[i, 1])
+            else:
+                x0_i = int(trace.sample_cols[0])
+                x1_i = int(trace.sample_cols[-1])
+            col_range_i = np.arange(x0_i, x1_i + 1)
+            centers_smooth = np.polynomial.polynomial.polyval(col_range_i, coeffs)
+            ax.plot(col_range_i, centers_smooth, lw=0.9, alpha=0.85)
+            # Overlay sampled points in a light grey for reference,
+            # restricted to this order's valid column range.
+            valid = (trace.sample_cols >= x0_i) & (trace.sample_cols <= x1_i)
             ax.plot(
-                trace.sample_cols,
-                trace.center_rows[i],
+                trace.sample_cols[valid],
+                trace.center_rows[i, valid],
                 ".",
                 ms=2,
                 alpha=0.25,
@@ -1011,16 +1021,16 @@ def _plot_wavecal_residuals(
         )
 
         fig.suptitle(
-            "Python scaffold QA — K3 1DXD residuals (analogue of manual Fig. 3)\n"
+            "Python scaffold QA — Stage 3 provisional scaffold residuals\n"
             f"Accepted: {len(r)}  Rejected/unmatched: {len(rej_cols)}  "
-            f"RMS: {rms:.3f} nm   NOTE: not IDL-equivalent",
+            f"Match-dist RMS: {rms:.3f} nm   NOTE: scaffold — not IDL-equivalent",
             fontsize=10,
         )
         fig.tight_layout()
 
         if save:
             out_path = os.path.join(
-                out_dir, f"{prefix}_wavecal_residuals.png"
+                out_dir, f"{prefix}_scaffold_wavecal_residuals.png"
             )
             fig.savefig(out_path, dpi=120, bbox_inches="tight")
             print(f"  [QA] Saved: {out_path}")
@@ -1045,18 +1055,20 @@ def _plot_rectified_order(
         import matplotlib.pyplot as plt
         import numpy as np
 
-        # Pick the first order that has data
-        img = None
-        order_num = None
-        for ro in rect_set.rectified_orders:
-            if ro.flux is not None and ro.flux.size > 0:
-                img = ro.flux
-                order_num = ro.order
-                break
-
-        if img is None:
+        # Pick the middle available order for display.  Edge orders (e.g.
+        # order 203, the first in K3) are at the detector boundary where flat
+        # lamp illumination shows the optical system's circular boundary, not
+        # a clean order strip.  Middle orders give a more representative QA view.
+        available = [
+            ro for ro in rect_set.rectified_orders
+            if ro.flux is not None and ro.flux.size > 0
+        ]
+        if not available:
             print("  [QA] No rectified order images available.")
             return
+        mid = available[len(available) // 2]
+        img = mid.flux
+        order_num = mid.order
 
         fig, ax = plt.subplots(figsize=(10, 4))
         vmin, vmax = np.nanpercentile(img, [1, 99])
@@ -1186,14 +1198,20 @@ def _plot_2d_coeff_fit(
         # ----------------------------------------------------------------
         # Panel 3: Wavelength solution curves per order
         # ----------------------------------------------------------------
-        col_eval = np.linspace(0, 2047, 200)
+        # Restrict each order's polynomial to its valid detector column range
+        # from the traced geometry.  Evaluating outside the fitted range
+        # causes high-degree polynomial extrapolation and non-physical curves.
         for sol in prov_map.order_solutions:
             if sol.wave_coeffs is None or len(sol.accepted_matches) == 0:
                 continue
+            geom_i = prov_map.geometry.geometries[sol.order_index]
+            col_eval_i = np.linspace(
+                float(geom_i.x_start), float(geom_i.x_end), 200
+            )
             wave_nm = np.polynomial.polynomial.polyval(
-                col_eval, sol.wave_coeffs
+                col_eval_i, sol.wave_coeffs
             ) * 1000.0  # µm → nm
-            axes[1, 0].plot(col_eval, wave_nm, lw=0.8, alpha=0.8)
+            axes[1, 0].plot(col_eval_i, wave_nm, lw=0.8, alpha=0.8)
         axes[1, 0].set_xlabel("Detector column (pixels)")
         axes[1, 0].set_ylabel("Wavelength (nm)")
         axes[1, 0].set_title(
@@ -1389,13 +1407,22 @@ def _plot_k3_1dxd_residuals(
     out_dir: str,
     save: bool,
     prefix: str,
+    out_stem: str = "k3_1dxd_residuals",
 ) -> Optional[str]:
     """Point-based K3 1DXD residual QA plot.
 
     Uses the explicit matched-point arrays stored on the model to produce the
     primary K3 1DXD QA figure.  The output file is named::
 
-        {prefix}_k3_1dxd_residuals.png
+        {prefix}_{out_stem}.png
+
+    Parameters
+    ----------
+    out_stem : str, optional
+        Stem used for the output filename.  Default is ``"k3_1dxd_residuals"``.
+        Pass ``"wavecal_residuals"`` to produce the standard
+        ``qa_wavecal_residuals.png`` artifact (the primary K3 path replaces
+        the scaffold placeholder).
 
     Panels
     ------
@@ -1512,7 +1539,7 @@ def _plot_k3_1dxd_residuals(
 
         out_path: Optional[str] = None
         if save:
-            out_path = os.path.join(out_dir, f"{prefix}_k3_1dxd_residuals.png")
+            out_path = os.path.join(out_dir, f"{prefix}_{out_stem}.png")
             fig.savefig(out_path, dpi=120, bbox_inches="tight")
             print(f"  [QA] Saved: {out_path}")
         else:
@@ -1911,6 +1938,13 @@ def run_k3_example(
     if not no_plots and k3_model is not None:
         _plot_k3_1dxd_qa(k3_model, out_dir, save=save_plots, prefix=prefix)
         _plot_k3_1dxd_residuals(k3_model, out_dir, save=save_plots, prefix=prefix)
+        # The K3 1DXD model is the primary K3 wavecal path; produce the
+        # standard qa_wavecal_residuals.png from the 1DXD SIGNED fit residuals
+        # rather than the Stage 3 provisional scaffold match distances.
+        _plot_k3_1dxd_residuals(
+            k3_model, out_dir, save=save_plots, prefix=prefix,
+            out_stem="wavecal_residuals",
+        )
 
     # ------------------------------------------------------------------
     # Stage 4: Global wavelength surface (scaffold — kept for reference)
