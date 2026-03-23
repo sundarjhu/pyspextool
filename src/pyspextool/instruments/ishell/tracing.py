@@ -206,6 +206,15 @@ _RMS_THRESHOLD: float = 5.0          # px -- flag if rms_residual exceeds this
 _CURVATURE_THRESHOLD: float = 1e-3   # px/col^2 -- flag if max |d2y/dx2| exceeds this
 _SEPARATION_THRESHOLD: float = 3.0   # px -- flag if min absolute inter-order gap drops below this
 _OSCILLATION_THRESHOLD: float = 0.05 # px/col -- flag if peak-to-peak slope variation exceeds this
+# Minimum fraction of sampled columns that must have a *real* valid edge pair
+# (both COM edges finite AND slit-height check passed) for polynomial fitting
+# to proceed normally.  Below this fraction the edge polynomial fit would be
+# driven mainly by fallback-propagated y_guess values, which can produce
+# arbitrarily wrong polynomials (the K3 order-203 rogue trace is an example).
+# 0.3 is conservative: IDL production data typically achieves > 0.5 on real
+# detector illumination; 0.3 rejects clearly under-constrained fits while
+# leaving headroom for orders near the detector edge.
+_MIN_VALID_EDGE_FRACTION: float = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +269,16 @@ class OrderTraceStats:
         ``True`` if the fitted centre curve crosses (or touches) the upper
         neighbouring order at any sample column.  ``False`` if there is no
         upper neighbour or the fit failed.
+    n_valid_edge_pairs : int
+        Number of sampled columns where **both** bottom and top edge COMs
+        were finite *and* the slit-height check passed.  These are the
+        columns that contributed real data to the edge polynomial fit.
+        Fallback-only columns (where ``cen[k] = y_guess`` was used for sweep
+        continuity but ``edges[k,*] = NaN``) are **not** counted here.
+    valid_edge_fraction : float
+        ``n_valid_edge_pairs / n_sample_cols`` for this order.  Values below
+        ``_MIN_VALID_EDGE_FRACTION`` indicate a fit that is under-constrained
+        by real detections and may be unreliable.
     trace_valid : bool
         Composite validity flag.  ``True`` if *all* of the following hold:
 
@@ -270,6 +289,7 @@ class OrderTraceStats:
         * ``min_sep_upper`` is ``NaN`` *or* ≥ ``_SEPARATION_THRESHOLD`` (3 px).
         * ``crosses_lower`` is ``False``.
         * ``crosses_upper`` is ``False``.
+        * ``valid_edge_fraction`` ≥ ``_MIN_VALID_EDGE_FRACTION`` (0.3).
 
     Notes
     -----
@@ -285,7 +305,9 @@ class OrderTraceStats:
     min_sep_upper: float
     crosses_lower: bool
     crosses_upper: bool
-    trace_valid: bool
+    n_valid_edge_pairs: int = field(default=0)
+    valid_edge_fraction: float = field(default=float("nan"))
+    trace_valid: bool = field(default=True)
 
 
 @dataclass
@@ -784,6 +806,9 @@ def trace_orders_from_flat(
     top_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
     center_poly_coeffs = np.zeros((n_orders, poly_degree + 1))
     fit_rms = np.full(n_orders, np.nan)
+    # Per-order valid-edge-pair counts for QA diagnostics.
+    n_valid_edge_pairs_list: list[int] = []
+    n_sample_cols_list: list[int] = []
 
     for i in range(n_orders):
         s_cols_i = order_sample_cols_list[i]
@@ -822,6 +847,10 @@ def trace_orders_from_flat(
             x_start=result_i.x_start,
             x_end=result_i.x_end,
         ))
+
+        # Record valid-edge-pair count for per-order QA.
+        n_valid_edge_pairs_list.append(int(result_i.valid_edge_pair_mask.sum()))
+        n_sample_cols_list.append(int(len(result_i.sample_cols)))
 
         bot_poly_coeffs[i] = result_i.bottom_edge_coeffs
         top_poly_coeffs[i] = result_i.top_edge_coeffs
@@ -943,6 +972,8 @@ def trace_orders_from_flat(
     order_stats = _compute_order_trace_stats(
         center_poly_coeffs, fit_rms, union_cols,
         order_xranges=traced_xranges_out,
+        n_valid_edge_pairs_per_order=n_valid_edge_pairs_list,
+        n_sample_cols_per_order=n_sample_cols_list,
     )
     _log_trace_qa_summary(order_stats)
 
@@ -1501,10 +1532,13 @@ def _compute_order_trace_stats(
     sample_cols: npt.NDArray,
     *,
     order_xranges: npt.NDArray | None = None,
+    n_valid_edge_pairs_per_order: list[int] | None = None,
+    n_sample_cols_per_order: list[int] | None = None,
     rms_threshold: float = _RMS_THRESHOLD,
     curvature_threshold: float = _CURVATURE_THRESHOLD,
     separation_threshold: float = _SEPARATION_THRESHOLD,
     oscillation_threshold: float = _OSCILLATION_THRESHOLD,
+    min_valid_edge_fraction: float = _MIN_VALID_EDGE_FRACTION,
 ) -> list[OrderTraceStats]:
     """Compute per-order QA metrics for traced order-centre polynomials.
 
@@ -1524,6 +1558,13 @@ def _compute_order_trace_stats(
         outside that range contribute ``NaN`` and do not corrupt metrics.
         When ``None``, the full ``sample_cols`` grid is used for every order
         (backward-compatible behaviour).
+    n_valid_edge_pairs_per_order : list of int, optional
+        Number of real valid edge-pair columns per order.  When ``None``,
+        ``n_valid_edge_pairs`` is set to 0 and ``valid_edge_fraction`` to
+        ``NaN`` in each ``OrderTraceStats`` (backward-compatible behaviour).
+    n_sample_cols_per_order : list of int, optional
+        Total number of sampled columns per order.  Required when
+        ``n_valid_edge_pairs_per_order`` is supplied.
     rms_threshold : float, default ``_RMS_THRESHOLD``
         Maximum acceptable RMS residual in pixels.
     curvature_threshold : float, default ``_CURVATURE_THRESHOLD``
@@ -1532,6 +1573,9 @@ def _compute_order_trace_stats(
         Minimum acceptable absolute inter-order separation in pixels.
     oscillation_threshold : float, default ``_OSCILLATION_THRESHOLD``
         Maximum acceptable peak-to-peak slope variation (px / col).
+    min_valid_edge_fraction : float, default ``_MIN_VALID_EDGE_FRACTION``
+        Minimum fraction of sampled columns that must have real valid edge
+        pairs.  Below this value the order is marked invalid.
 
     Returns
     -------
@@ -1675,7 +1719,24 @@ def _compute_order_trace_stats(
             and not crosses_lower
             and not crosses_upper
         )
-        trace_valid = bool(rms_ok and curv_ok and osc_ok and sep_ok)
+
+        # ------------------------------------------------------------------
+        # 5. Valid-edge-fraction check.
+        # ------------------------------------------------------------------
+        if n_valid_edge_pairs_per_order is not None and n_sample_cols_per_order is not None:
+            n_valid_i = int(n_valid_edge_pairs_per_order[i])
+            n_samp_i = int(n_sample_cols_per_order[i])
+            valid_edge_frac_i = float(n_valid_i) / float(n_samp_i) if n_samp_i > 0 else 0.0
+        else:
+            n_valid_i = 0
+            valid_edge_frac_i = float("nan")
+
+        edge_frac_ok = (
+            np.isfinite(valid_edge_frac_i)
+            and valid_edge_frac_i >= min_valid_edge_fraction
+        )
+
+        trace_valid = bool(rms_ok and curv_ok and osc_ok and sep_ok and edge_frac_ok)
 
         stats_list.append(
             OrderTraceStats(
@@ -1687,6 +1748,8 @@ def _compute_order_trace_stats(
                 min_sep_upper=min_sep_upper,
                 crosses_lower=crosses_lower,
                 crosses_upper=crosses_upper,
+                n_valid_edge_pairs=n_valid_i,
+                valid_edge_fraction=valid_edge_frac_i,
                 trace_valid=trace_valid,
             )
         )
@@ -1710,12 +1773,12 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
         return
 
     header = (
-        "  {:>5}  {:>9}  {:>11}  {:>10}  {:>9}  {:>9}  {:>6}  {:>6}  {}"
+        "  {:>5}  {:>9}  {:>11}  {:>10}  {:>9}  {:>9}  {:>6}  {:>6}  {:>8}  {:>7}  {}"
     ).format(
         "Order", "RMS(px)", "Curv(p/c²)", "Osc(p/c)",
-        "SepLo(px)", "SepHi(px)", "XLo", "XHi", "Valid"
+        "SepLo(px)", "SepHi(px)", "XLo", "XHi", "NVldEdge", "VldFrac", "Valid"
     )
-    separator = "  " + "-" * 88
+    separator = "  " + "-" * 102
 
     logger.info("Per-order trace QA summary:")
     logger.info(header)
@@ -1745,6 +1808,12 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
         )
         xlo_str = f"{'Y' if s.crosses_lower else 'N':>6}"
         xhi_str = f"{'Y' if s.crosses_upper else 'N':>6}"
+        nve_str = f"{s.n_valid_edge_pairs:8d}"
+        vf_str = (
+            f"{s.valid_edge_fraction:7.3f}"
+            if np.isfinite(s.valid_edge_fraction)
+            else "    NaN"
+        )
 
         # Build a short failure reason string for invalid orders.
         if not s.trace_valid:
@@ -1763,12 +1832,16 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
                 reasons.append("XLo")
             if s.crosses_upper:
                 reasons.append("XHi")
+            if np.isfinite(s.valid_edge_fraction) and s.valid_edge_fraction < _MIN_VALID_EDGE_FRACTION:
+                reasons.append(
+                    f"VldFrac({s.valid_edge_fraction:.2f}<{_MIN_VALID_EDGE_FRACTION})"
+                )
             flag = f"  *** INVALID ({', '.join(reasons)}) ***"
         else:
             flag = ""
 
         line = (
-            "  {:>5}  {}  {}  {}  {}  {}  {}  {}  {}{}".format(
+            "  {:>5}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}{}".format(
                 s.order_index,
                 rms_str,
                 curv_str,
@@ -1777,6 +1850,8 @@ def _log_trace_qa_summary(stats: list[OrderTraceStats]) -> None:
                 sep_hi_str,
                 xlo_str,
                 xhi_str,
+                nve_str,
+                vf_str,
                 str(s.trace_valid),
                 flag,
             )
@@ -2272,6 +2347,8 @@ def _trace_order_left(
     com_half_width: int,
     slit_height_min: float,
     slit_height_max: float,
+    *,
+    valid_edge_pair_mask: npt.NDArray | None = None,
 ) -> None:
     """Trace left from the seeded column index, updating edge and centre arrays.
 
@@ -2290,8 +2367,10 @@ def _trace_order_left(
         endfor
         moveon1:
 
-    Arrays *center_samples*, *bottom_edge_samples*, and *top_edge_samples* are
-    mutated in-place, exactly as in IDL's shared ``cen`` / ``edges`` arrays.
+    Arrays *center_samples*, *bottom_edge_samples*, *top_edge_samples*, and
+    *valid_edge_pair_mask* are mutated in-place.  *valid_edge_pair_mask[k]*
+    is set to ``True`` only when both edge COMs are finite **and** the
+    slit-height check passes — i.e. a real edge detection, not a fallback.
 
     Parameters
     ----------
@@ -2304,6 +2383,9 @@ def _trace_order_left(
         Updated in-place.
     top_edge_samples : ndarray of float, shape (n_samp,)
         Updated in-place.
+    valid_edge_pair_mask : ndarray of bool, shape (n_samp,)
+        Updated in-place.  ``True`` at index *k* iff this column yielded a
+        real valid edge pair (both COMs finite, slit-height passed).
     gidx : int
         Index of the seed column in *sample_cols* (IDL ``gidx``).
     nrows : int
@@ -2319,6 +2401,10 @@ def _trace_order_left(
     slit_height_max : float
         IDL ``slith_pix[1]``.
     """
+    # When no mask array is supplied (backward-compatible callers), use a
+    # local discard array so the mask-update logic below is always uniform.
+    _mask = valid_edge_pair_mask if valid_edge_pair_mask is not None else np.zeros(len(sample_cols), dtype=bool)
+
     # IDL: dotop = 1 & dobot = 1
     do_top = True
     do_bot = True
@@ -2381,6 +2467,7 @@ def _trace_order_left(
             bottom_edge_samples[k] = com_bot
             top_edge_samples[k]    = com_top
             center_samples[k]      = (com_bot + com_top) / 2.0
+            _mask[k] = True   # real detection
         elif do_top and do_bot and np.isfinite(com_bot) and np.isfinite(com_top):
             # IDL: goto cont1 — both flags active AND both edges finite, but
             # slit-height check failed.  IDL jumps to cont1:, which skips the
@@ -2388,6 +2475,7 @@ def _trace_order_left(
             bottom_edge_samples[k] = np.nan
             top_edge_samples[k]    = np.nan
             # center_samples[k] is intentionally NOT assigned here — it stays NaN.
+            # _mask[k] remains False (not a real detection).
             do_top, do_bot = _update_edge_activity_flags(
                 com_top, com_bot, nrows, bufpix, do_top, do_bot,
             )
@@ -2400,12 +2488,23 @@ def _trace_order_left(
             bottom_edge_samples[k] = np.nan
             top_edge_samples[k]    = np.nan
             center_samples[k]      = y_guess_f
+            # _mask[k] remains False (fallback, not a real detection).
             do_top, do_bot = _update_edge_activity_flags(
                 com_top, com_bot, nrows, bufpix, do_top, do_bot,
             )
             if not do_top and not do_bot:
                 break
             continue
+
+        # IDL: if com_top le bufpix or com_top ge (nrows-1-bufpix) then dotop=0
+        # IDL: if com_bot le bufpix or com_bot gt  (nrows-1-bufpix) then dobot=0
+        do_top, do_bot = _update_edge_activity_flags(
+            com_top, com_bot, nrows, bufpix, do_top, do_bot,
+        )
+
+        # IDL: if not dotop and not dobot then goto, moveon1
+        if not do_top and not do_bot:
+            break
 
         # IDL: if com_top le bufpix or com_top ge (nrows-1-bufpix) then dotop=0
         # IDL: if com_bot le bufpix or com_bot gt  (nrows-1-bufpix) then dobot=0
@@ -2433,6 +2532,8 @@ def _trace_order_right(
     com_half_width: int,
     slit_height_min: float,
     slit_height_max: float,
+    *,
+    valid_edge_pair_mask: npt.NDArray | None = None,
 ) -> None:
     """Trace right from the seeded column index, updating edge and centre arrays.
 
@@ -2454,6 +2555,10 @@ def _trace_order_right(
     Parameters are identical to :func:`_trace_order_left` (arrays mutated
     in-place for the right half of *sample_cols*).
     """
+    # When no mask array is supplied (backward-compatible callers), use a
+    # local discard array so the mask-update logic below is always uniform.
+    _mask = valid_edge_pair_mask if valid_edge_pair_mask is not None else np.zeros(len(sample_cols), dtype=bool)
+
     # IDL: dotop = 1 & dobot = 1
     do_top = True
     do_bot = True
@@ -2515,6 +2620,7 @@ def _trace_order_right(
             bottom_edge_samples[k] = com_bot
             top_edge_samples[k]    = com_top
             center_samples[k]      = (com_bot + com_top) / 2.0
+            _mask[k] = True   # real detection
         elif do_top and do_bot and np.isfinite(com_bot) and np.isfinite(com_top):
             # IDL: goto cont2 — both flags active AND both edges finite, but
             # slit-height check failed.  IDL jumps to cont2:, which skips the
@@ -2522,6 +2628,7 @@ def _trace_order_right(
             bottom_edge_samples[k] = np.nan
             top_edge_samples[k]    = np.nan
             # center_samples[k] is intentionally NOT assigned here — it stays NaN.
+            # _mask[k] remains False (not a real detection).
             do_top, do_bot = _update_edge_activity_flags(
                 com_top, com_bot, nrows, bufpix, do_top, do_bot,
             )
@@ -2534,6 +2641,7 @@ def _trace_order_right(
             bottom_edge_samples[k] = np.nan
             top_edge_samples[k]    = np.nan
             center_samples[k]      = y_guess_f
+            # _mask[k] remains False (fallback, not a real detection).
             do_top, do_bot = _update_edge_activity_flags(
                 com_top, com_bot, nrows, bufpix, do_top, do_bot,
             )
@@ -2562,6 +2670,7 @@ def _fit_order_edge_polynomials(
     bottom_edge_samples: npt.NDArray,
     top_edge_samples: npt.NDArray,
     poly_degree: int,
+    valid_edge_pair_mask: npt.NDArray | None = None,
 ) -> tuple[npt.NDArray, npt.NDArray]:
     """Fit final robust polynomials to the traced bottom and top edges.
 
@@ -2581,6 +2690,11 @@ def _fit_order_edge_polynomials(
     unweighted normal-equation solver, sigma-clipping parameters (thresh=3,
     eps=0.01), and iteration count (up to 9 repeat iterations).
 
+    When *valid_edge_pair_mask* is provided, only columns where the mask is
+    ``True`` contribute to the polynomial fit.  Fallback-propagated centre
+    columns (where ``edges[k,*] = NaN`` and ``cen[k] = y_guess``) are allowed
+    for sweep continuity but **must not** influence the edge polynomial fit.
+
     Parameters
     ----------
     sample_cols : ndarray of float, shape (n_samp,)
@@ -2591,6 +2705,11 @@ def _fit_order_edge_polynomials(
         Traced top-edge row values; NaN where not traced (IDL ``edges[*,1]``).
     poly_degree : int
         Polynomial degree (IDL ``degree``).
+    valid_edge_pair_mask : ndarray of bool, shape (n_samp,), optional
+        ``True`` at index *k* iff that column had a real valid edge pair (both
+        COMs finite, slit-height passed).  When supplied, only ``True`` columns
+        are used for fitting; when ``None``, all finite samples are used
+        (IDL-equivalent behaviour, kept for backward compatibility).
 
     Returns
     -------
@@ -2602,14 +2721,22 @@ def _fit_order_edge_polynomials(
     """
     cols = np.asarray(sample_cols, dtype=float)
 
-    # IDL j=0: bottom edge
+    # Build the base selection mask: finite edge values AND (if supplied)
+    # confirmed real edge-pair columns.  Fallback-only columns (NaN edges,
+    # y_guess centre) must not drive the fit even if they happen to be finite.
+    if valid_edge_pair_mask is not None:
+        real_mask = np.asarray(valid_edge_pair_mask, dtype=bool)
+    else:
+        real_mask = np.ones(len(cols), dtype=bool)
+
+    # IDL j=0: bottom edge — restrict to real valid edge pair columns.
     bot = np.asarray(bottom_edge_samples, dtype=float)
-    bot_ok = np.isfinite(bot)
+    bot_ok = np.isfinite(bot) & real_mask
     bottom_coeffs, _ = _ROBUST_FIT_FUNCTION(cols[bot_ok], bot[bot_ok], poly_degree)
 
-    # IDL j=1: top edge
+    # IDL j=1: top edge — restrict to real valid edge pair columns.
     top = np.asarray(top_edge_samples, dtype=float)
-    top_ok = np.isfinite(top)
+    top_ok = np.isfinite(top) & real_mask
     top_coeffs, _ = _ROBUST_FIT_FUNCTION(cols[top_ok], top[top_ok], poly_degree)
 
     return bottom_coeffs, top_coeffs
@@ -2748,6 +2875,12 @@ class _SingleOrderResult:
         Traced top-edge rows (IDL ``edges[*,1]``); NaN where not detected.
     center_samples : ndarray, shape (n_samp,)
         Center-row estimates (IDL ``cen``); derived from edges or y_guess.
+    valid_edge_pair_mask : ndarray of bool, shape (n_samp,)
+        ``True`` at index *k* when **both** bottom and top edge COMs were
+        finite *and* the slit-height check passed at sample column *k*.
+        Fallback-only columns (``edges[k,*] = NaN``, ``cen[k] = y_guess``)
+        are ``False``.  The polynomial fitting step uses only columns where
+        this mask is ``True``.
     bottom_edge_coeffs : ndarray, shape (poly_degree + 1,)
         Bottom-edge polynomial coefficients (IDL ``edgecoeffs[*,0,i]``).
     top_edge_coeffs : ndarray, shape (poly_degree + 1,)
@@ -2764,6 +2897,7 @@ class _SingleOrderResult:
     bottom_edge_samples: npt.NDArray
     top_edge_samples: npt.NDArray
     center_samples: npt.NDArray
+    valid_edge_pair_mask: npt.NDArray
     bottom_edge_coeffs: npt.NDArray
     top_edge_coeffs: npt.NDArray
     center_coeffs: npt.NDArray
@@ -2853,11 +2987,17 @@ def _trace_single_order_idlstyle(
     bot = edges[:, 0]  # mutable view of edges[:,0] — written by sweeps
     top = edges[:, 1]  # mutable view of edges[:,1] — written by sweeps
 
+    # Initialise the valid-edge-pair mask to False for all columns.
+    # Sweeps set an entry to True only when both COMs are finite AND
+    # the slit-height check passes — i.e. a real detection, not a fallback.
+    valid_edge_pair_mask = np.zeros(len(sample_cols), dtype=bool)
+
     # Block J: left sweep (gidx → 0).
     _trace_order_left(
         image, sobel_image, sample_cols, cen, bot, top,
         gidx, nrows, bufpix, poly_degree, frac, com_half_width,
         slit_height_min, slit_height_max,
+        valid_edge_pair_mask=valid_edge_pair_mask,
     )
 
     # Block K: right sweep (gidx+1 → n_samp-1).
@@ -2865,11 +3005,15 @@ def _trace_single_order_idlstyle(
         image, sobel_image, sample_cols, cen, bot, top,
         gidx, nrows, bufpix, poly_degree, frac, com_half_width,
         slit_height_min, slit_height_max,
+        valid_edge_pair_mask=valid_edge_pair_mask,
     )
 
-    # Block L: fit robust polynomials to finite bottom and top edge samples.
+    # Block L: fit robust polynomials to confirmed real edge detections only.
+    # Fallback-propagated centre columns (NaN edges, y_guess centre) are
+    # excluded here even if they contribute to sweep continuity above.
     bottom_coeffs, top_coeffs = _fit_order_edge_polynomials(
         sample_cols, bot, top, poly_degree,
+        valid_edge_pair_mask=valid_edge_pair_mask,
     )
 
     # Block M: derive valid column range from fitted edge polynomials.
@@ -2885,6 +3029,7 @@ def _trace_single_order_idlstyle(
         bottom_edge_samples=bot.copy(),
         top_edge_samples=top.copy(),
         center_samples=cen.copy(),
+        valid_edge_pair_mask=valid_edge_pair_mask.copy(),
         bottom_edge_coeffs=bottom_coeffs,
         top_edge_coeffs=top_coeffs,
         center_coeffs=center_coeffs,
