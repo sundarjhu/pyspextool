@@ -5227,10 +5227,144 @@ class TestValidEdgePairMaskFitIsolation:
             f"x_end ({result.x_end}) must be >= x_start ({result.x_start})"
         )
 
+    # ── Test E: early-exit center_samples must be all-NaN ─────────────────────
 
-# ---------------------------------------------------------------------------
-# TestIDLHelperFunctionOP  (mc_findorders blocks O–P)
-# ---------------------------------------------------------------------------
+    def test_low_valid_fraction_center_samples_are_nan(self):
+        """Early-exit path must return center_samples as all-NaN.
+
+        Returning finite sweep-derived center values alongside NaN coefficients
+        is internally inconsistent; this test enforces the contract.
+        """
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order_idlstyle, _compute_sobel_image,
+            _MIN_VALID_EDGE_FRACTION,
+        )
+        import numpy as np
+
+        nrows, ncols = 256, 512
+        flat = np.zeros((nrows, ncols), dtype=float)
+        sobel = _compute_sobel_image(flat)
+        s_cols = np.arange(50, 450, 10, dtype=int)
+
+        result = _trace_single_order_idlstyle(
+            flat, sobel, s_cols, 50, 449,
+            guess_col=float(ncols // 2), guess_row=100.0,
+            poly_degree=3, nrows=nrows, bufpix=1,
+            frac=0.85, com_half_width=3,
+            slit_height_min=10.0, slit_height_max=40.0,
+        )
+
+        # Confirm this is actually the early-exit path.
+        fraction = result.valid_edge_pair_mask.sum() / len(s_cols)
+        assert fraction < _MIN_VALID_EDGE_FRACTION
+
+        # center_samples must be all-NaN.
+        assert np.all(np.isnan(result.center_samples)), (
+            "center_samples must be all-NaN on the early-exit (low-fraction) path"
+        )
+
+        # Raw edge samples are preserved (useful for diagnostics).
+        assert len(result.bottom_edge_samples) == len(s_cols)
+        assert len(result.top_edge_samples) == len(s_cols)
+
+    # ── Test F: to_order_geometry_set skips NaN-coeff orders ──────────────────
+
+    def test_to_order_geometry_set_skips_nan_coeff_orders(self):
+        """to_order_geometry_set() must not create geometry objects for orders
+        whose bot/top poly coefficients are all-NaN (fraction-guard rejections).
+
+        Constructs a FlatOrderTrace with two orders: one valid (finite coeffs,
+        valid xrange) and one rejected (NaN coeffs, sentinel xrange).
+        Verifies the returned OrderGeometrySet has only one order.
+        """
+        from pyspextool.instruments.ishell.tracing import FlatOrderTrace
+        import numpy as np
+
+        poly_degree = 3
+        n_coeff = poly_degree + 1
+
+        # Valid order: finite coefficients, valid xrange.
+        valid_bot = np.array([100.0, 0.0, 0.0, 0.0])
+        valid_top = np.array([120.0, 0.0, 0.0, 0.0])
+        valid_cen = (valid_bot + valid_top) / 2.0
+
+        # Invalid order (fraction-guard rejection): NaN coefficients, sentinel xrange.
+        nan_coeffs = np.full(n_coeff, np.nan)
+
+        bot_poly = np.stack([valid_bot, nan_coeffs])
+        top_poly = np.stack([valid_top, nan_coeffs])
+        cen_poly = np.stack([valid_cen, nan_coeffs])
+
+        xranges = np.array([[50, 450], [-1, -1]])
+
+        trace = FlatOrderTrace(
+            n_orders=2,
+            sample_cols=np.arange(50, 451, 10, dtype=int),
+            center_rows=np.zeros((2, 41)),
+            center_poly_coeffs=cen_poly,
+            fit_rms=np.array([0.5, np.nan]),
+            half_width_rows=np.array([10.0, 10.0]),
+            poly_degree=poly_degree,
+            seed_col=250,
+            bot_poly_coeffs=bot_poly,
+            top_poly_coeffs=top_poly,
+            order_xranges=xranges,
+        )
+
+        geom_set = trace.to_order_geometry_set(mode="K3")
+
+        # Only the valid order should appear.
+        assert geom_set.n_orders == 1, (
+            f"Expected 1 geometry (valid order only), got {geom_set.n_orders}"
+        )
+        # The geometry that was created must have finite coefficients.
+        g = geom_set.geometries[0]
+        assert np.all(np.isfinite(g.bottom_edge_coeffs)), (
+            "Geometry bottom_edge_coeffs must be finite"
+        )
+        assert np.all(np.isfinite(g.top_edge_coeffs)), (
+            "Geometry top_edge_coeffs must be finite"
+        )
+
+    # ── Test G: _compute_order_trace_stats explicit invalid-fit path ───────────
+
+    def test_compute_stats_explicit_invalid_for_sentinel_xrange(self):
+        """_compute_order_trace_stats must mark an order invalid when its
+        xrange is the sentinel (-1, -1), even if the other NaN-propagation
+        checks were somehow bypassed.
+
+        Uses an order with center_poly_coeffs=NaN (which also causes
+        coeffs_invalid=True in the explicit check).
+        """
+        from pyspextool.instruments.ishell.tracing import _compute_order_trace_stats
+        import numpy as np
+
+        poly_degree = 3
+        n_coeff = poly_degree + 1
+
+        # One order: NaN centre poly (fraction-guard rejection), sentinel xrange.
+        center_coeffs = np.full((1, n_coeff), np.nan)
+        fit_rms = np.array([np.nan])
+        sample_cols = np.arange(50, 450, 10, dtype=int)
+        order_xranges = np.array([[-1, -1]])
+        n_valid = [0]
+        n_samp = [len(sample_cols)]
+
+        stats = _compute_order_trace_stats(
+            center_coeffs, fit_rms, sample_cols,
+            order_xranges=order_xranges,
+            n_valid_edge_pairs_per_order=n_valid,
+            n_sample_cols_per_order=n_samp,
+        )
+
+        assert len(stats) == 1
+        s = stats[0]
+        assert not s.trace_valid, (
+            "trace_valid must be False for an order with sentinel xrange (-1,-1)"
+        )
+
+
+
 
 
 class TestIDLHelperFunctionOP:

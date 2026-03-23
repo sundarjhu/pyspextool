@@ -214,6 +214,8 @@ _OSCILLATION_THRESHOLD: float = 0.05 # px/col -- flag if peak-to-peak slope vari
 # 0.3 is conservative: IDL production data typically achieves > 0.5 on real
 # detector illumination; 0.3 rejects clearly under-constrained fits while
 # leaving headroom for orders near the detector edge.
+# NOTE: This rejection is a Python-side safety override; it is not a literal
+# IDL branch — IDL always fits without this minimum-fraction guard.
 _MIN_VALID_EDGE_FRACTION: float = 0.3
 
 
@@ -460,6 +462,15 @@ class FlatOrderTrace:
         ``x_end`` is taken from the per-order range (matching IDL
         ``xranges``).  Otherwise, *col_range* is applied to all orders.
 
+        **Validity guard**: orders explicitly rejected by the valid-edge-
+        fraction guard (sentinel ``x_start = x_end = -1``) or whose traced
+        edge polynomial coefficients are not all finite (all-NaN arrays
+        produced by the fraction guard) are silently skipped.  The returned
+        :class:`OrderGeometrySet` may therefore contain fewer orders than
+        ``self.n_orders``.  The ``centre ± half_width`` fallback is **not**
+        applied to failed traced orders — it is only for direct-construction
+        paths where ``bot_poly_coeffs`` / ``top_poly_coeffs`` were never set.
+
         Parameters
         ----------
         mode : str
@@ -495,10 +506,21 @@ class FlatOrderTrace:
                 x_start = default_x_start
                 x_end = default_x_end
 
+            # Skip orders with sentinel xrange (-1, -1): these were explicitly
+            # rejected by the fraction guard and have no valid fit geometry.
+            if x_start == -1 and x_end == -1:
+                continue
+
             if self.bot_poly_coeffs is not None and self.top_poly_coeffs is not None:
                 # Use the directly-traced edge polynomials (IDL output path).
                 bot_coeffs = self.bot_poly_coeffs[i].copy()
                 top_coeffs = self.top_poly_coeffs[i].copy()
+                # Skip orders with non-finite edge coefficients.  These are
+                # fraction-guard-rejected orders (NaN arrays).  Do NOT fall back
+                # to centre ± half_width: that fallback is only for the
+                # direct-construction (no-edge-poly) path below.
+                if not (np.all(np.isfinite(bot_coeffs)) and np.all(np.isfinite(top_coeffs))):
+                    continue
             else:
                 # Fallback: approximate edges from centre ± half_width.
                 # Used when bot/top polynomials are not available (e.g. when
@@ -1720,6 +1742,18 @@ def _compute_order_trace_stats(
             and not crosses_upper
         )
 
+        # Explicit invalid-order check: orders rejected by the fraction guard
+        # carry a sentinel xrange (-1, -1) and NaN polynomial coefficients.
+        # Mark these invalid directly rather than relying solely on NaN
+        # propagation through fit_rms / curvature / oscillation.
+        sentinel_xrange = (
+            order_xranges is not None
+            and int(order_xranges[i, 0]) == -1
+            and int(order_xranges[i, 1]) == -1
+        )
+        coeffs_invalid = not np.all(np.isfinite(coeffs))
+        explicit_invalid = sentinel_xrange or coeffs_invalid
+
         # ------------------------------------------------------------------
         # 5. Valid-edge-fraction check.
         # ------------------------------------------------------------------
@@ -1736,7 +1770,8 @@ def _compute_order_trace_stats(
             and valid_edge_frac_i >= min_valid_edge_fraction
         )
 
-        trace_valid = bool(rms_ok and curv_ok and osc_ok and sep_ok and edge_frac_ok)
+        trace_valid = bool(rms_ok and curv_ok and osc_ok and sep_ok and edge_frac_ok
+                           and not explicit_invalid)
 
         stats_list.append(
             OrderTraceStats(
@@ -2865,6 +2900,9 @@ class _SingleOrderResult:
         Traced top-edge rows (IDL ``edges[*,1]``); NaN where not detected.
     center_samples : ndarray, shape (n_samp,)
         Center-row estimates (IDL ``cen``); derived from edges or y_guess.
+        **All NaN** when the order was rejected by the valid-edge-fraction
+        guard (``valid_edge_fraction < _MIN_VALID_EDGE_FRACTION``), because
+        no valid fitted geometry exists for the order.
     valid_edge_pair_mask : ndarray of bool, shape (n_samp,)
         ``True`` at index *k* when **both** bottom and top edge COMs were
         finite *and* the slit-height check passed at sample column *k*.
@@ -3020,15 +3058,25 @@ def _trace_single_order_idlstyle(
     valid_edge_fraction = float(n_valid_edge_pairs) / float(n_sample_cols) if n_sample_cols > 0 else 0.0
 
     if valid_edge_fraction < _MIN_VALID_EDGE_FRACTION:
+        # NOTE: This minimum-valid-edge-fraction rejection is a Python-side
+        # safety override to prevent unconstrained fits; it is not a literal
+        # IDL branch.  IDL always fits without this guard.
+        #
         # Too few real edge detections — refuse to fit.  Return NaN coefficient
         # arrays and sentinel xrange (-1, -1) so callers can identify this order
         # as unfittable without inspecting the mask directly.
+        #
+        # Raw traced edge samples (bot, top) are preserved as diagnostics so
+        # that QA tooling can still inspect the sweep output.
+        # center_samples is set to all-NaN: it would be misleading to return
+        # sweep-derived centre values alongside NaN coefficients — there is
+        # no valid fitted geometry for this order.
         nan_coeffs = np.full(poly_degree + 1, np.nan)
         return _SingleOrderResult(
             sample_cols=sample_cols,
             bottom_edge_samples=bot.copy(),
             top_edge_samples=top.copy(),
-            center_samples=cen.copy(),
+            center_samples=np.full(len(cen), np.nan),
             valid_edge_pair_mask=valid_edge_pair_mask.copy(),
             bottom_edge_coeffs=nan_coeffs.copy(),
             top_edge_coeffs=nan_coeffs.copy(),
