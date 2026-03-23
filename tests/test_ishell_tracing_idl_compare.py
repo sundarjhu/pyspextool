@@ -180,8 +180,20 @@ _IDL_REF_DIR = os.path.join(_REPO_ROOT, "tests", "test_data", "idl_reference")
 _LFS_MAGIC = b"version https://git-lfs"
 
 # Tolerance for polynomial-position comparison (pixels).
-# Acceptable max absolute position deviation at any column in the valid range.
-_POSITION_TOL_PX = 1.0
+# This is the *decisive* acceptance threshold: the max absolute deviation
+# between Python and IDL edge-polynomial positions evaluated over the
+# overlapping valid column range.
+#
+# 0.5 px is chosen as the natural sub-pixel accuracy criterion for this
+# comparison.  The Sobel-COM edge detector computes a weighted centroid
+# over a small window (2–5 pixels); the theoretical precision of a
+# centre-of-mass estimate on a well-sampled gradient peak is ≪1 pixel.
+# Using half a pixel (0.5 px) as the threshold enforces that any systematic
+# drift between the IDL (float32) and Python (float64) implementations must
+# be well within the detector noise floor of ≈1 pixel, while still
+# comfortably clearing rounding differences introduced by the float32 vs
+# float64 arithmetic paths.
+_POSITION_TOL_PX = 0.5
 
 # Tolerance for polynomial-coefficient comparison.
 # This is looser since coefficient sensitivity depends on the normalisation.
@@ -234,21 +246,35 @@ class OrderComparisonResult:
         Zero-based order index.
     bot_coeff_max_abs_diff : float
         Max absolute coefficient difference for the bottom-edge polynomial.
+        **Diagnostic only** — coefficient vectors can differ while the
+        evaluated polynomial positions agree over the valid column range,
+        because the differences cancel when the polynomial is summed.
+        Use ``bot_pos_max_diff`` as the decisive acceptance metric.
     top_coeff_max_abs_diff : float
         Max absolute coefficient difference for the top-edge polynomial.
+        **Diagnostic only** — same caveat as ``bot_coeff_max_abs_diff``.
     xstart_diff : int
         ``python_xstart - idl_xstart`` (signed, in columns).
     xend_diff : int
         ``python_xend - idl_xend`` (signed, in columns).
+    has_valid_overlap : bool
+        ``True`` if the Python and IDL valid column ranges overlap, i.e.
+        ``max(py_xstart, idl_xstart) <= min(py_xend, idl_xend)``.
+        When ``False``, the position-difference fields below are NaN
+        and the order is treated as a domain disagreement failure.
     bot_pos_max_diff : float
-        Max absolute position difference for the bottom-edge polynomial
-        evaluated over the order's valid column range (pixels).
+        **Primary acceptance metric.**  Max absolute position difference
+        (pixels) for the bottom-edge polynomial evaluated at every column
+        in the overlapping valid range.  NaN when ``has_valid_overlap`` is
+        ``False``.
     top_pos_max_diff : float
-        Max absolute position difference for the top-edge polynomial
-        evaluated over the order's valid column range (pixels).
+        **Primary acceptance metric.**  Max absolute position difference
+        (pixels) for the top-edge polynomial over the overlapping valid
+        range.  NaN when ``has_valid_overlap`` is ``False``.
     center_pos_max_diff : float
-        Max absolute position difference for the derived centre polynomial
-        ``(bot + top) / 2`` evaluated over the valid column range (pixels).
+        Max absolute position difference (pixels) for the derived centre
+        polynomial ``(bot + top) / 2`` over the overlapping valid range.
+        NaN when ``has_valid_overlap`` is ``False``.
     """
 
     order_index: int
@@ -256,6 +282,7 @@ class OrderComparisonResult:
     top_coeff_max_abs_diff: float
     xstart_diff: int
     xend_diff: int
+    has_valid_overlap: bool
     bot_pos_max_diff: float
     top_pos_max_diff: float
     center_pos_max_diff: float
@@ -447,10 +474,22 @@ def compare_tracing_to_idl(
 ) -> TracingComparisonSummary:
     """Compare Python tracing output to IDL reference outputs.
 
-    Evaluates per-order differences in:
-    - polynomial coefficients (bottom and top edges)
-    - derived polynomial-position values over the valid column range
-    - per-order xranges
+    **Decisive metric**: the max absolute polynomial-position difference
+    evaluated at every column in the overlapping valid column range
+    (``bot_pos_max_diff`` / ``top_pos_max_diff`` in
+    :class:`OrderComparisonResult`).  An order passes when both values are
+    ≤ ``_POSITION_TOL_PX``.
+
+    **Diagnostic fields**: ``bot_coeff_max_abs_diff`` /
+    ``top_coeff_max_abs_diff`` are recorded for debugging but are *not* used
+    in the acceptance decision.  Coefficient vectors can differ while the
+    evaluated polynomial positions agree over the valid column range, so
+    coefficient differences alone are not reliable as a pass/fail criterion.
+
+    **No-overlap case**: when the Python and IDL valid column ranges do not
+    overlap for an order, ``has_valid_overlap`` is ``False``, position diffs
+    are NaN, and ``agreement_acceptable`` is set to ``False`` for the overall
+    summary.
 
     Parameters
     ----------
@@ -520,8 +559,9 @@ def compare_tracing_to_idl(
         # Evaluate polynomials over the intersection of valid column ranges.
         x_start = int(max(py_xr[0], ixr[0]))
         x_end = int(min(py_xr[1], ixr[1]))
+        has_overlap = x_end >= x_start
 
-        if x_end > x_start:
+        if has_overlap:
             cols = np.arange(x_start, x_end + 1, dtype=float)
             # numpy.polynomial.polynomial.polyval uses same convention as IDL poly()
             py_bot_pos = npp.polyval(cols, py_bot)
@@ -547,6 +587,7 @@ def compare_tracing_to_idl(
                 top_coeff_max_abs_diff=top_coeff_diff,
                 xstart_diff=int(py_xr[0]) - int(ixr[0]),
                 xend_diff=int(py_xr[1]) - int(ixr[1]),
+                has_valid_overlap=has_overlap,
                 bot_pos_max_diff=bot_pos_diff,
                 top_pos_max_diff=top_pos_diff,
                 center_pos_max_diff=cen_pos_diff,
@@ -566,6 +607,7 @@ def compare_tracing_to_idl(
 
     acceptable = (
         n_py == n_idl
+        and all(r.has_valid_overlap for r in per_order)
         and (not finite_bot or max_bot <= _POSITION_TOL_PX)
         and (not finite_top or max_top <= _POSITION_TOL_PX)
         and max_xs <= _XRANGE_TOL_COLS
@@ -837,6 +879,42 @@ class TestCompareTracingToIdl:
             summary.n_orders_python, summary.n_orders_idl
         )
 
+    def test_round_trip_has_valid_overlap(self, syn_result_and_ref):
+        """Round-trip (identical xranges) → has_valid_overlap=True for every order."""
+        py_result, idl_ref = syn_result_and_ref
+        summary = compare_tracing_to_idl(py_result, idl_ref)
+        for r in summary.per_order:
+            assert r.has_valid_overlap, (
+                f"Order {r.order_index}: expected has_valid_overlap=True "
+                "for round-trip comparison with identical xranges."
+            )
+
+    def test_no_overlap_sets_flag_and_nan_diffs(self, syn_result_and_ref):
+        """When IDL xranges don't overlap with Python xranges, has_valid_overlap
+        is False and position diffs are NaN; agreement_acceptable is False."""
+        py_result, idl_ref = syn_result_and_ref
+        # Shift all IDL xranges completely off the Python valid range
+        idl_ref_bad = {k: v.copy() if isinstance(v, np.ndarray) else v
+                       for k, v in idl_ref.items()}
+        idl_ref_bad["xranges"] = idl_ref["xranges"].copy()
+        # Place IDL xranges far to the right of the Python xranges
+        idl_ref_bad["xranges"][:, 0] = idl_ref["xranges"][:, 1] + 100
+        idl_ref_bad["xranges"][:, 1] = idl_ref["xranges"][:, 1] + 200
+        summary = compare_tracing_to_idl(py_result, idl_ref_bad)
+        for r in summary.per_order:
+            assert not r.has_valid_overlap, (
+                f"Order {r.order_index}: expected has_valid_overlap=False."
+            )
+            assert np.isnan(r.bot_pos_max_diff), (
+                f"Order {r.order_index}: expected NaN bot_pos_max_diff."
+            )
+            assert np.isnan(r.top_pos_max_diff), (
+                f"Order {r.order_index}: expected NaN top_pos_max_diff."
+            )
+        assert not summary.agreement_acceptable, (
+            "No-overlap case must produce agreement_acceptable=False."
+        )
+
     def test_detects_large_position_error(self, syn_result_and_ref):
         """Injecting a large coefficient shift → agreement_acceptable=False."""
         py_result, idl_ref = syn_result_and_ref
@@ -1059,9 +1137,11 @@ class TestRealIdlComparison:
     def test_bottom_edge_position_within_tolerance(self, comparison_summary):
         s = comparison_summary
         for r in s.per_order:
-            assert np.isfinite(r.bot_pos_max_diff), (
-                f"Order {r.order_index}: bot_pos_max_diff is NaN "
-                "(no valid column overlap between Python and IDL xranges)."
+            assert r.has_valid_overlap, (
+                f"Order {r.order_index}: Python and IDL xranges do not overlap "
+                "(NO COLUMN OVERLAP). Python xrange differs from IDL xrange "
+                "by more than the full valid domain — cannot evaluate position "
+                "agreement. Check xstart_diff and xend_diff."
             )
             assert r.bot_pos_max_diff <= _POSITION_TOL_PX, (
                 f"Order {r.order_index}: bottom-edge position deviation "
@@ -1072,8 +1152,9 @@ class TestRealIdlComparison:
     def test_top_edge_position_within_tolerance(self, comparison_summary):
         s = comparison_summary
         for r in s.per_order:
-            assert np.isfinite(r.top_pos_max_diff), (
-                f"Order {r.order_index}: top_pos_max_diff is NaN."
+            assert r.has_valid_overlap, (
+                f"Order {r.order_index}: Python and IDL xranges do not overlap "
+                "(NO COLUMN OVERLAP). Cannot evaluate top-edge position agreement."
             )
             assert r.top_pos_max_diff <= _POSITION_TOL_PX, (
                 f"Order {r.order_index}: top-edge position deviation "
@@ -1107,8 +1188,9 @@ class TestRealIdlComparison:
                 "  Per-order breakdown:",
             ]
             for r in s.per_order:
+                overlap_tag = "" if r.has_valid_overlap else " [NO COLUMN OVERLAP]"
                 lines.append(
-                    f"    order {r.order_index}: "
+                    f"    order {r.order_index}{overlap_tag}: "
                     f"bot_pos={r.bot_pos_max_diff:.3f} px, "
                     f"top_pos={r.top_pos_max_diff:.3f} px, "
                     f"xstart_diff={r.xstart_diff}, "
