@@ -1028,35 +1028,40 @@ def _adjust_guess_positions(
     ycororder: int,
     ybuffer: int,
 ) -> tuple[list[tuple[float, float]], npt.NDArray]:
-    """Adjust stored guess positions via cross-correlation.
+    """Adjust stored guess positions via per-order cross-correlation.
 
     This is a Python port of the IDL ``mc_adjustguesspos`` procedure from
-    Spextool.  It computes the vertical shift between the reference order
-    mask stored in the flatinfo FITS file and the raw flat being calibrated,
-    then subtracts that shift from the reference guess positions and
-    recomputes the per-order valid column ranges.
+    Spextool, extended to use a **per-order 1-D cross-correlation** at each
+    order's seed column.  The IDL implementation applies a single global
+    offset derived from ``ycororder``; that approach fails when the echelle
+    orders are strongly tilted (e.g. iSHELL K3 mode), because the actual
+    vertical shift changes sign over the detector column range.  Using the
+    flat column that is the midpoint of each order's ``xranges`` interval
+    instead measures the true local shift for every order independently.
 
-    **Algorithm (IDL ``mc_adjustguesspos`` transliteration):**
+    **Algorithm:**
 
     1. Compute initial guess positions from the stored ``edge_coeffs`` and
        ``xranges`` (midpoint x of each order; midpoint y between bot/top
        edges at that x).  [IDL lines: ``guesspos[*,i]``]
 
-    2. Isolate ``ycororder`` in the mask (set all other order pixels to 0).
+    2–5. (Per order *i*, using its seed column ``x_guess[i]``)
 
-    3. Clip a sub-image of ``flat`` and the binary mask for ``ycororder``
-       spanning ``[min(botedge) − slith_pix, max(topedge) + slith_pix]``
-       rows.
+    2. Build a 1-D binary mask column: ``mask_col = (omask[:, x_i] == orders[i])``.
 
-    4. Sweep ``nshifts = int(slith_pix * 1.8) + 1`` integer vertical shifts
-       centred on zero.  For each shift *s*, compute the overlap integral
+    3. Clip a row sub-vector spanning
+       ``[round(bot_edge(x_i)) − slith_h, round(top_edge(x_i)) + slith_h]``
+       where ``slith_h = ceil(top_edge(x_i) − bot_edge(x_i))``.
+
+    4. Sweep ``nshifts = int(slith_h * 1.8) + 1`` integer vertical shifts
+       centred on zero.  For each shift *s* compute the 1-D overlap
        ``sum(flat_sub * roll(mask_sub, s))``.  The shift that maximises this
-       sum is the vertical offset of the raw flat relative to the reference
-       mask.
+       integral is the local vertical offset at ``x_i``.  If the mask column
+       is entirely zero at ``x_i`` (reference order outside detector at that
+       column) the per-order offset falls back to zero.
 
-    5. Subtract the detected shift from all guess y-positions and recompute
-       per-order valid column ranges (columns where both edges, shifted by
-       the offset, remain within ``[ybuffer, nrows − ybuffer − 1]``).
+    5. Apply the per-order offset: ``guesspos_y[i] -= offset_i``.  Recompute
+       the per-order valid column range using ``offset_i``.
 
     Parameters
     ----------
@@ -1064,15 +1069,14 @@ def _adjust_guess_positions(
         Reference edge polynomial coefficients (``FlatInfo.edge_coeffs``).
     xranges : ndarray, shape (n_orders, 2)
         Reference per-order column ranges (``FlatInfo.xranges``).
-    flat : ndarray, shape (ncols, nrows) in IDL convention, (nrows, ncols) here
-        Raw flat-field image (not yet Sobel-enhanced).  The array is in
-        Python (row-major, rows=0 axis) convention.
+    flat : ndarray, shape (nrows, ncols)
+        Raw flat-field image in Python (row-major, rows=0 axis) convention.
     omask : ndarray, shape (nrows, ncols)
         Reference order mask (integer dtype; zero = inter-order).
     orders : list of int
         Echelle order numbers, in the same order as ``edge_coeffs``.
     ycororder : int
-        Echelle order number to use for the cross-correlation.
+        Retained for API compatibility; not used in the per-order algorithm.
     ybuffer : int
         Detector-edge buffer in rows.
 
@@ -1085,14 +1089,8 @@ def _adjust_guess_positions(
 
     Notes
     -----
-    IDL uses column-major arrays (IDL ``image[col, row]``), so ``xranges``
-    refers to column indices and ``omask[col,row]``.  The Python arrays are
-    row-major (``flat[row, col]``), which is handled transparently because
-    the cross-correlation is purely row-based and the poly evaluations use
-    column as the independent variable.
-
-    The IDL ``nshifts = slith_pix * 1.8 + 1`` expression (IDL 2019-04-14
-    change to avoid picking up adjacent orders).
+    The IDL ``nshifts = slith_pix * 1.8 + 1`` formula (2019-04-14 change to
+    avoid picking up adjacent orders) is preserved per order.
     """
     nrows, ncols = flat.shape
     n_orders = len(orders)
@@ -1113,64 +1111,79 @@ def _adjust_guess_positions(
         guesspos_y[i] = (bot_y + top_y) / 2.0
 
     # ------------------------------------------------------------------ #
-    # 2. Isolate ycororder in the mask                                      #
-    #    IDL: z = where(omask ne ycororder); omask[z]=0; omask[good]=1      #
+    # 2–5. Per-order 1-D cross-correlation at each order's seed column.    #
+    #                                                                       #
+    # The IDL algorithm uses a single global offset derived from a 2-D     #
+    # cross-correlation of the full flat image against the ycororder mask.  #
+    # That fails for modes (e.g. iSHELL K3) where (a) the echelle tilt     #
+    # causes the true vertical shift to vary across the column range,       #
+    # sometimes even changing sign, and (b) the stored omask is            #
+    # inconsistent with the stored edge_coeffs for some orders.  Instead   #
+    # we build a **synthetic 1-D mask** from each order's edge_coeffs at   #
+    # its seed column and correlate against the flat at that same column.  #
+    # This gives the correct per-order offset without relying on omask      #
+    # consistency and handles the tilt correctly because the measurement is #
+    # local to the seed column.                                             #
     # ------------------------------------------------------------------ #
-    cor_idx = orders.index(ycororder)
-    binary_mask = (omask == ycororder).astype(np.float32)  # 0/1
+    offsets = np.zeros(n_orders, dtype=int)
 
-    # ------------------------------------------------------------------ #
-    # 3. Clip sub-image for ycororder                                       #
-    #    IDL: find max slit height for ycororder; clip flat/mask            #
-    # ------------------------------------------------------------------ #
-    x0_c, x1_c = int(xranges[cor_idx, 0]), int(xranges[cor_idx, 1])
-    cols_c = np.arange(x0_c, x1_c + 1)
-    bot_edge_c = polyval(cols_c.astype(float), edge_coeffs[cor_idx, 0, :])
-    top_edge_c = polyval(cols_c.astype(float), edge_coeffs[cor_idx, 1, :])
-    slith_pix = int(np.ceil(np.max(top_edge_c - bot_edge_c)))
+    for i in range(n_orders):
+        x_i = int(np.clip(round(guesspos_x[i]), 0, ncols - 1))
+        bot_ref = float(polyval(float(x_i), edge_coeffs[i, 0, :]))
+        top_ref = float(polyval(float(x_i), edge_coeffs[i, 1, :]))
+        slith_h = max(1, int(np.ceil(top_ref - bot_ref)))
 
-    botidx = max(0, int(np.round(np.min(bot_edge_c))) - slith_pix)
-    topidx = min(nrows - 1, int(np.round(np.max(top_edge_c))) + slith_pix)
+        # Sub-vector row bounds
+        botidx_i = max(0, int(round(bot_ref)) - slith_h)
+        topidx_i = min(nrows - 1, int(round(top_ref)) + slith_h)
+        sub_n = topidx_i - botidx_i + 1
 
-    subflat = flat[botidx: topidx + 1, :].astype(np.float32)    # (sub_rows, ncols)
-    submask = binary_mask[botidx: topidx + 1, :]                  # (sub_rows, ncols)
-    sub_nrows = subflat.shape[0]
+        flat_sub = flat[botidx_i: topidx_i + 1, x_i].astype(np.float32)
 
-    # ------------------------------------------------------------------ #
-    # 4. Cross-correlation sweep                                            #
-    #    IDL: nshifts = slith_pix*1.8+1; shifts = indgen(nshifts)-nshifts/2#
-    # ------------------------------------------------------------------ #
-    nshifts = int(slith_pix * 1.8) + 1
-    half = nshifts // 2
-    shifts = np.arange(nshifts) - half   # centred integer shifts
+        # Synthetic mask: 1 inside the reference order window, 0 outside.
+        # Built from edge_coeffs so it is guaranteed consistent with
+        # guesspos_y regardless of omask accuracy.
+        mask_sub = np.zeros(sub_n, dtype=np.float32)
+        ref_bot_idx = int(round(bot_ref)) - botidx_i
+        ref_top_idx = int(round(top_ref)) - botidx_i
+        ref_bot_idx = max(0, min(sub_n - 1, ref_bot_idx))
+        ref_top_idx = max(0, min(sub_n - 1, ref_top_idx))
+        mask_sub[ref_bot_idx: ref_top_idx + 1] = 1.0
 
-    overlap = np.zeros(nshifts, dtype=float)
-    for k, s in enumerate(shifts):
-        # IDL shift convention:
-        #   hbot = -s > 0  (max(-s, 0))
-        #   htop = (sub_nrows-1-s) < (sub_nrows-1)
-        #   mbot = s > 0
-        #   mtop = (sub_nrows-1+s) < (sub_nrows-1)
-        hbot = max(-s, 0)
-        htop = min(sub_nrows - 1 - s, sub_nrows - 1)
-        mbot = max(s, 0)
-        mtop = min(sub_nrows - 1 + s, sub_nrows - 1)
-        if htop < hbot or mtop < mbot:
+        if mask_sub.sum() == 0:
+            logger.debug(
+                "_adjust_guess_positions: order index %d (%d): synthetic mask "
+                "is empty at seed col %d; offset=0",
+                i, orders[i], x_i,
+            )
             continue
-        overlap[k] = float(np.sum(subflat[hbot: htop + 1, :] * submask[mbot: mtop + 1, :]))
 
-    offset = int(shifts[int(np.argmax(overlap))])
-    logger.debug(
-        "_adjust_guess_positions: ycororder=%d, slith_pix=%d, "
-        "nshifts=%d, detected offset=%d rows",
-        ycororder, slith_pix, nshifts, offset,
-    )
+        # IDL: nshifts = slith_pix*1.8+1
+        nshifts_i = int(slith_h * 1.8) + 1
+        half_i = nshifts_i // 2
+        shifts_i = np.arange(nshifts_i) - half_i
 
-    # ------------------------------------------------------------------ #
-    # 5. Subtract offset from guess y-positions                            #
-    #    IDL: guesspos[1,*] = guesspos[1,*] - offset                       #
-    # ------------------------------------------------------------------ #
-    guesspos_y -= offset
+        overlap_i = np.zeros(nshifts_i, dtype=float)
+        for k, s in enumerate(shifts_i):
+            hbot = max(-s, 0)
+            htop = min(sub_n - 1 - s, sub_n - 1)
+            mbot = max(s, 0)
+            mtop = min(sub_n - 1 + s, sub_n - 1)
+            if htop < hbot or mtop < mbot:
+                continue
+            overlap_i[k] = float(
+                np.dot(flat_sub[hbot: htop + 1], mask_sub[mbot: mtop + 1])
+            )
+
+        offset_i = int(shifts_i[int(np.argmax(overlap_i))])
+        offsets[i] = offset_i
+        logger.debug(
+            "_adjust_guess_positions: order index %d (%d): seed_col=%d, "
+            "slith_h=%d, nshifts=%d, offset=%d rows",
+            i, orders[i], x_i, slith_h, nshifts_i, offset_i,
+        )
+
+    guesspos_y -= offsets
 
     # ------------------------------------------------------------------ #
     # 6. Recompute per-order xranges with shifted edges                    #
@@ -1181,8 +1194,8 @@ def _adjust_guess_positions(
     for i in range(n_orders):
         x0, x1 = int(xranges[i, 0]), int(xranges[i, 1])
         cols_i = np.arange(x0, x1 + 1)
-        bot_i = polyval(cols_i.astype(float), edge_coeffs[i, 0, :]) - offset
-        top_i = polyval(cols_i.astype(float), edge_coeffs[i, 1, :]) - offset
+        bot_i = polyval(cols_i.astype(float), edge_coeffs[i, 0, :]) - offsets[i]
+        top_i = polyval(cols_i.astype(float), edge_coeffs[i, 1, :]) - offsets[i]
 
         valid = np.where(
             (bot_i > ybuffer - 1) & (top_i < nrows - ybuffer - 1)
@@ -1192,7 +1205,7 @@ def _adjust_guess_positions(
             # All columns fall outside detector; keep original range.
             logger.warning(
                 "_adjust_guess_positions: order index %d: no valid columns "
-                "after offset=%d; keeping original xrange.", i, offset,
+                "after offset=%d; keeping original xrange.", i, offsets[i],
             )
             new_xranges[i] = xranges[i]
         else:
