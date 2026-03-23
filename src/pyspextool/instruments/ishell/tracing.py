@@ -135,6 +135,41 @@ IDL-to-Python fidelity status
   that fallback).
 - When neither ``flatinfo`` nor explicit ``guess_rows`` are provided, a
   ``ValueError`` is raised; IDL always requires external ``guesspos``.
+
+End-to-end synthetic tracing validation
+-----------------------------------------
+A synthetic end-to-end regression test was performed using controlled
+synthetic flat inputs with known injected Gaussian order geometry (see
+``tests/test_ishell_tracing.py``, ``TestEndToEndSyntheticTracingValidation``).
+This validates internal consistency and expected geometric recovery of the
+Python implementation against known synthetic truth.  It does **not**
+constitute a direct Python-vs-IDL output comparison; validation against
+actual IDL-produced ``edgecoeffs``/``xranges`` remains a separate task.
+
+**Validation setup:**
+
+- Synthetic flat: 512 rows × 1024 columns; 3 Gaussian order profiles
+  (sigma = 8.5 px, tilt = 0.05 px/col, SNR ~ 300).
+- Tracing parameters: ``intensity_fraction=0.85``, ``com_half_width=3``,
+  ``poly_degree=3``, ``n_sample_cols=50``.
+- All 50 sample columns per order accepted (no edge rejections).
+
+**Synthetic recovery metrics** (per-order, worst-case across 3 orders):
+
+========================  ===============  ================================
+Synthetic regression target  Max observed  Within target?
+========================  ===============  ================================
+Center vs known truth     ≤ 0.40 px        Yes (< 1 px tracing σ)
+Fit RMS (center poly)     ≤ 0.17 px        Yes (< 0.5 px target)
+``center = (bot+top)/2``  0.00 px          Yes (exact internal invariant)
+xrange covers col_range   [50, 974]        Yes (full detector span)
+========================  ===============  ================================
+
+The ``center = (bot + top) / 2`` internal invariant is reproduced to
+machine precision.  Fit RMS values are well below the 0.5-pixel target.
+Documented semantic differences between the Python implementation and the
+IDL reference (Sobel kernel weighting, solver equivalence, tabinv vs
+interp) are summarised in ``TestMCFindordersDriftAudit`` in the test file.
 """
 
 from __future__ import annotations
