@@ -2506,16 +2506,6 @@ def _trace_order_left(
         if not do_top and not do_bot:
             break
 
-        # IDL: if com_top le bufpix or com_top ge (nrows-1-bufpix) then dotop=0
-        # IDL: if com_bot le bufpix or com_bot gt  (nrows-1-bufpix) then dobot=0
-        do_top, do_bot = _update_edge_activity_flags(
-            com_top, com_bot, nrows, bufpix, do_top, do_bot,
-        )
-
-        # IDL: if not dotop and not dobot then goto, moveon1
-        if not do_top and not do_bot:
-            break
-
 
 def _trace_order_right(
     image: npt.NDArray,
@@ -2883,14 +2873,20 @@ class _SingleOrderResult:
         this mask is ``True``.
     bottom_edge_coeffs : ndarray, shape (poly_degree + 1,)
         Bottom-edge polynomial coefficients (IDL ``edgecoeffs[*,0,i]``).
+        **All NaN** when the order was rejected by the valid-edge-fraction
+        guard (``valid_edge_fraction < _MIN_VALID_EDGE_FRACTION``).
     top_edge_coeffs : ndarray, shape (poly_degree + 1,)
         Top-edge polynomial coefficients (IDL ``edgecoeffs[*,1,i]``).
+        **All NaN** when the order was rejected by the fraction guard.
     center_coeffs : ndarray, shape (poly_degree + 1,)
         Center polynomial coefficients, derived as ``(bot + top) / 2``.
+        **All NaN** when the order was rejected by the fraction guard.
     x_start : int
-        First valid column (IDL ``xranges[0,i]``).
+        First valid column (IDL ``xranges[0,i]``).  **-1** when the order
+        was rejected by the valid-edge-fraction guard.
     x_end : int
-        Last valid column (IDL ``xranges[1,i]``).
+        Last valid column (IDL ``xranges[1,i]``).  **-1** when the order
+        was rejected by the valid-edge-fraction guard.
     """
 
     sample_cols: npt.NDArray
@@ -3011,6 +3007,36 @@ def _trace_single_order_idlstyle(
     # Block L: fit robust polynomials to confirmed real edge detections only.
     # Fallback-propagated centre columns (NaN edges, y_guess centre) are
     # excluded here even if they contribute to sweep continuity above.
+    #
+    # IMPORTANT: before fitting, enforce the minimum real-data fraction guard.
+    # If fewer than _MIN_VALID_EDGE_FRACTION of the sampled columns have a
+    # genuine valid edge pair, the remaining "real" samples are too sparse to
+    # constrain the polynomial — the fit would be driven by noise or by the
+    # initialisation zeros.  We return NaN coefficients and an invalid xrange
+    # (-1, -1) so that downstream consumers (xrange derivation, QA stats, the
+    # FlatOrderTrace builder) can detect and handle the failure explicitly.
+    n_valid_edge_pairs = int(valid_edge_pair_mask.sum())
+    n_sample_cols = len(sample_cols)
+    valid_edge_fraction = float(n_valid_edge_pairs) / float(n_sample_cols) if n_sample_cols > 0 else 0.0
+
+    if valid_edge_fraction < _MIN_VALID_EDGE_FRACTION:
+        # Too few real edge detections — refuse to fit.  Return NaN coefficient
+        # arrays and sentinel xrange (-1, -1) so callers can identify this order
+        # as unfittable without inspecting the mask directly.
+        nan_coeffs = np.full(poly_degree + 1, np.nan)
+        return _SingleOrderResult(
+            sample_cols=sample_cols,
+            bottom_edge_samples=bot.copy(),
+            top_edge_samples=top.copy(),
+            center_samples=cen.copy(),
+            valid_edge_pair_mask=valid_edge_pair_mask.copy(),
+            bottom_edge_coeffs=nan_coeffs.copy(),
+            top_edge_coeffs=nan_coeffs.copy(),
+            center_coeffs=nan_coeffs.copy(),
+            x_start=-1,
+            x_end=-1,
+        )
+
     bottom_coeffs, top_coeffs = _fit_order_edge_polynomials(
         sample_cols, bot, top, poly_degree,
         valid_edge_pair_mask=valid_edge_pair_mask,

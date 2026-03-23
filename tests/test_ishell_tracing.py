@@ -4864,8 +4864,7 @@ class TestValidEdgePairMaskFitIsolation:
     C. valid_edge_fraction below _MIN_VALID_EDGE_FRACTION marks order invalid.
     """
 
-    def _make_flat_with_order(self, nrows=256, ncols=512,
-                              bot=90, top=110, noise_std=0.1):
+    def _make_flat_with_order(self, nrows=256, ncols=512, bot=90, top=110):
         """Return a minimal synthetic flat with one detectable order.
 
         The order occupies [bot, top] in rows, has uniform high flux.
@@ -5123,6 +5122,109 @@ class TestValidEdgePairMaskFitIsolation:
         assert fraction > 0.3, (
             f"Expected > 30% valid edge pairs on a clean order, got {fraction:.2f} "
             f"({n_valid}/{n_total})"
+        )
+
+    # ── Test D: low-fraction path returns NaN coefficients and sentinel xrange ─
+
+    def test_low_valid_fraction_returns_nan_coeffs_and_invalid_xrange(self):
+        """When valid_edge_fraction < _MIN_VALID_EDGE_FRACTION, _trace_single_order_idlstyle
+        must return NaN coefficients and x_start = x_end = -1.
+
+        We simulate a completely dark flat (zero flux everywhere) so that
+        edge detection always fails and valid_edge_pair_mask stays all-False.
+        """
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order_idlstyle, _compute_sobel_image,
+            _MIN_VALID_EDGE_FRACTION,
+        )
+        import numpy as np
+
+        nrows, ncols = 256, 512
+        # Completely dark flat — no edges detectable, all columns fall back.
+        flat = np.zeros((nrows, ncols), dtype=float)
+        sobel = _compute_sobel_image(flat)
+        s_cols = np.arange(50, 450, 10, dtype=int)
+
+        result = _trace_single_order_idlstyle(
+            flat, sobel, s_cols, 50, 449,
+            guess_col=float(ncols // 2), guess_row=100.0,
+            poly_degree=3, nrows=nrows, bufpix=1,
+            frac=0.85, com_half_width=3,
+            slit_height_min=10.0, slit_height_max=40.0,
+        )
+
+        # Fraction must be below the threshold (all-dark → no valid pairs).
+        n_valid = int(result.valid_edge_pair_mask.sum())
+        n_total = len(s_cols)
+        fraction = n_valid / n_total
+        assert fraction < _MIN_VALID_EDGE_FRACTION, (
+            f"Expected fraction < {_MIN_VALID_EDGE_FRACTION} on a dark flat, "
+            f"got {fraction:.3f} ({n_valid}/{n_total})"
+        )
+
+        # All coefficient arrays must be NaN.
+        assert np.all(np.isnan(result.bottom_edge_coeffs)), (
+            "bottom_edge_coeffs must be all-NaN when fraction < threshold"
+        )
+        assert np.all(np.isnan(result.top_edge_coeffs)), (
+            "top_edge_coeffs must be all-NaN when fraction < threshold"
+        )
+        assert np.all(np.isnan(result.center_coeffs)), (
+            "center_coeffs must be all-NaN when fraction < threshold"
+        )
+
+        # Sentinel xrange.
+        assert result.x_start == -1, (
+            f"x_start must be -1 when fraction < threshold, got {result.x_start}"
+        )
+        assert result.x_end == -1, (
+            f"x_end must be -1 when fraction < threshold, got {result.x_end}"
+        )
+
+    def test_good_order_has_finite_coeffs_and_valid_xrange(self):
+        """On a clean illuminated order, _trace_single_order_idlstyle must return
+        finite coefficients and a valid (non-sentinel) xrange.
+
+        This guards against the fraction gate accidentally rejecting real orders.
+        """
+        from pyspextool.instruments.ishell.tracing import (
+            _trace_single_order_idlstyle, _compute_sobel_image,
+        )
+        import numpy as np
+
+        flat = self._make_flat_with_order()
+        sobel = _compute_sobel_image(flat)
+        nrows, ncols = flat.shape
+        s_cols = np.arange(50, 450, 10, dtype=int)
+
+        result = _trace_single_order_idlstyle(
+            flat, sobel, s_cols, 50, 449,
+            guess_col=float(ncols // 2), guess_row=100.0,
+            poly_degree=3, nrows=nrows, bufpix=1,
+            frac=0.85, com_half_width=3,
+            slit_height_min=10.0, slit_height_max=40.0,
+        )
+
+        # Coefficients must be finite.
+        assert np.all(np.isfinite(result.bottom_edge_coeffs)), (
+            "bottom_edge_coeffs must be finite on a clean order"
+        )
+        assert np.all(np.isfinite(result.top_edge_coeffs)), (
+            "top_edge_coeffs must be finite on a clean order"
+        )
+        assert np.all(np.isfinite(result.center_coeffs)), (
+            "center_coeffs must be finite on a clean order"
+        )
+
+        # xrange must be valid (not the sentinel -1/-1).
+        assert result.x_start >= 0, (
+            f"x_start must be >= 0 on a clean order, got {result.x_start}"
+        )
+        assert result.x_end >= 0, (
+            f"x_end must be >= 0 on a clean order, got {result.x_end}"
+        )
+        assert result.x_end >= result.x_start, (
+            f"x_end ({result.x_end}) must be >= x_start ({result.x_start})"
         )
 
 
