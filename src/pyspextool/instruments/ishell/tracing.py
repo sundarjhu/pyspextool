@@ -136,11 +136,15 @@ IDL-to-Python fidelity status
 - When neither ``flatinfo`` nor explicit ``guess_rows`` are provided, a
   ``ValueError`` is raised; IDL always requires external ``guesspos``.
 
-End-to-end IDL parity validation
----------------------------------
-A full end-to-end parity validation was performed using controlled synthetic
-flat inputs that mirror realistic iSHELL tracing conditions (see
-``tests/test_ishell_tracing.py``, ``TestEndToEndIDLParityValidation``).
+End-to-end synthetic tracing validation
+-----------------------------------------
+A synthetic end-to-end regression test was performed using controlled
+synthetic flat inputs with known injected Gaussian order geometry (see
+``tests/test_ishell_tracing.py``, ``TestEndToEndSyntheticTracingValidation``).
+This validates internal consistency and expected geometric recovery of the
+Python implementation against known synthetic truth.  It does **not**
+constitute a direct Python-vs-IDL output comparison; validation against
+actual IDL-produced ``edgecoeffs``/``xranges`` remains a separate task.
 
 **Validation setup:**
 
@@ -150,26 +154,22 @@ flat inputs that mirror realistic iSHELL tracing conditions (see
   ``poly_degree=3``, ``n_sample_cols=50``.
 - All 50 sample columns per order accepted (no edge rejections).
 
-**Python vs IDL comparison table** (per-order, worst-case across 3 orders):
+**Synthetic recovery metrics** (per-order, worst-case across 3 orders):
 
-========================  ===============  ========================
-Validation target         Max difference   Acceptable?
-========================  ===============  ========================
-Center samples vs known   ≤ 0.40 px        Yes (< 1 px tracing σ)
+========================  ===============  ================================
+Synthetic regression target  Max observed  Within target?
+========================  ===============  ================================
+Center vs known truth     ≤ 0.40 px        Yes (< 1 px tracing σ)
 Fit RMS (center poly)     ≤ 0.17 px        Yes (< 0.5 px target)
-``center = (bot+top)/2``  0.00 px          Yes (exact IDL invariant)
+``center = (bot+top)/2``  0.00 px          Yes (exact internal invariant)
 xrange covers col_range   [50, 974]        Yes (full detector span)
-========================  ===============  ========================
+========================  ===============  ================================
 
-The IDL center invariant (``center = (bot + top) / 2`` at all accepted
-columns) is reproduced to machine precision.  Fit RMS values are well
-below the 0.5-pixel target.  All documented residual differences from
-the IDL reference (Sobel kernel weighting, solver equivalence, tabinv
-vs interp) are sub-pixel and summarised in ``TestMCFindordersDriftAudit``
-in the test file.
-
-**Outcome: CASE A — End-to-end tracing agreement acceptable;
-no behavioral change required.**
+The ``center = (bot + top) / 2`` internal invariant is reproduced to
+machine precision.  Fit RMS values are well below the 0.5-pixel target.
+Documented semantic differences between the Python implementation and the
+IDL reference (Sobel kernel weighting, solver equivalence, tabinv vs
+interp) are summarised in ``TestMCFindordersDriftAudit`` in the test file.
 """
 
 from __future__ import annotations

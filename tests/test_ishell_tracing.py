@@ -5798,16 +5798,21 @@ class TestMCFindordersDriftAudit:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end IDL parity validation
+# End-to-end synthetic tracing validation
 # ---------------------------------------------------------------------------
 
 
-class TestEndToEndIDLParityValidation:
-    """End-to-end parity validation of the Python iSHELL tracing port.
+class TestEndToEndSyntheticTracingValidation:
+    """Synthetic end-to-end regression test for the Python iSHELL tracing port.
+
+    Validates internal consistency and expected geometric recovery against
+    known injected order geometry in a controlled synthetic flat.  This is
+    **not** a direct comparison against IDL-produced outputs; validation
+    against actual IDL ``edgecoeffs``/``xranges`` remains a separate task.
 
     Validation setup
     ----------------
-    Controlled synthetic flat mirroring realistic iSHELL tracing inputs:
+    Controlled synthetic flat with known injected Gaussian order geometry:
 
     - Detector: 512 rows × 1024 columns
     - 3 Gaussian order profiles: sigma = 8.5 px (hw=20 px, sigma=hw/2.355),
@@ -5817,24 +5822,22 @@ class TestEndToEndIDLParityValidation:
       ``poly_degree=3``, 50 sample columns, ``slit_height_range=None``
     - Guess positions supplied at the midpoint column (explicit-guess path)
 
-    Python vs IDL comparison table (worst-case across all 3 orders)
-    ----------------------------------------------------------------
+    Synthetic recovery metrics (worst-case across all 3 orders)
+    -----------------------------------------------------------
     ========================  =============  ===========================
-    Validation target         Max observed   Acceptable?
+    Synthetic regression target  Max observed  Within target?
     ========================  =============  ===========================
     |center − known center|   ≤ 0.40 px     Yes (< 1 px tracing σ)
     fit_rms (center poly)     ≤ 0.17 px     Yes (< 0.5 px target)
-    |center − (bot+top)/2|    0.00 px       Yes (exact IDL invariant)
+    |center − (bot+top)/2|    0.00 px       Yes (exact internal invariant)
     xrange covers col_range   [50, 974]     Yes (full detector span)
     ========================  =============  ===========================
 
-    All known residual drifts from the IDL reference (Sobel kernel
-    weighting, numpy.linalg.solve vs IDL mc_gaussj, tabinv vs interp)
-    are documented as sub-pixel in ``TestMCFindordersDriftAudit``; all
-    have been confirmed acceptable and none require a behavioral fix.
-
-    **Outcome: CASE A — End-to-end tracing agreement acceptable;
-    no behavioral change required.**
+    Documented semantic differences between the Python implementation and the
+    IDL reference (Sobel kernel weighting, numpy.linalg.solve vs IDL
+    mc_gaussj, tabinv vs interp) are summarised in
+    ``TestMCFindordersDriftAudit``; all are sub-pixel and do not require a
+    behavioral fix.
     """
 
     # ── Synthetic flat parameters ────────────────────────────────────────────
