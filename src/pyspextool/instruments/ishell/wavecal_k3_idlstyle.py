@@ -59,7 +59,6 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import numpy.typing as npt
 from scipy.signal import correlate as _scipy_correlate
-from scipy.signal import find_peaks as _scipy_find_peaks
 
 if TYPE_CHECKING:
     from .calibrations import LineList, WaveCalInfo
@@ -190,8 +189,11 @@ class OrderMatchStats:
         to align the extracted spectrum with the reference comb.  ``0.0``
         if cross-correlation could not be computed for this order.
     n_candidate : int
-        Number of arc-line peaks detected in the 1-D spectrum before
-        matching.
+        Number of reference-line windows that yielded a convincing local peak
+        during the local expected-line search.  This is the count of
+        successfully found local candidates, one per reference line whose
+        predicted column fell within the spectrum and whose local window
+        contained a peak above the prominence threshold.
     n_matched : int
         Number of peaks that matched a reference line within the tolerance
         window and passed monotonicity filtering (before global sigma
@@ -593,6 +595,7 @@ def fit_1dxd_wavelength_model(
     sigma_thresh: float = 3.0,
     max_sigma_iter: int = 5,
     xcorr_max_shift_px: int = 50,
+    local_search_window_px: int = 6,
 ) -> IdlStyle1DXDModel:
     """Fit a global IDL-style 1DXD wavelength model across all echelle orders.
 
@@ -602,10 +605,12 @@ def fit_1dxd_wavelength_model(
        reference comb (Gaussians placed at each reference-line column position
        predicted by the coarse wavelength grid) to determine a per-order
        column shift.
-    2. **Detect peaks** in the shift-corrected arc spectrum using
-       :func:`scipy.signal.find_peaks`.
-    3. **Match peaks** to the nearest reference line within *match_tol_um*,
-       using the shifted coarse grid for wavelength prediction.
+    2. **Local expected-line search** — for each reference line expected in
+       this order, predict its detector column from the shifted coarse grid,
+       then search only within ``±local_search_window_px`` pixels of that
+       predicted column for the strongest local peak.  This replaces the
+       former global :func:`scipy.signal.find_peaks` + nearest-reference
+       matching strategy, yielding higher match yield and fewer ambiguities.
 
     Then fit a single global 2-D polynomial across all matched points:
 
@@ -635,18 +640,15 @@ def fit_1dxd_wavelength_model(
     odeg : int, default 1
         Polynomial degree in ``v = order_ref / order``.
     min_prominence : float, default 50.0
-        Minimum peak prominence (detector counts) for a peak to be
-        considered as an arc line.
+        Minimum local prominence (peak value minus window floor, in detector
+        counts) required for a local peak to be accepted as an arc-line
+        candidate.
     min_distance : int, default 5
-        Minimum peak separation in pixels.
+        Kept for API compatibility; not used by the local search strategy.
     match_tol_um : float, default 0.002
-        Maximum allowed wavelength residual (µm) between predicted and
-        reference wavelength for a match to be accepted.
+        Kept for API compatibility; not used by the local search strategy.
     max_col_residual_px : float, default 5.0
-        Maximum allowed column residual (pixels) between the detected peak
-        column and the predicted detector column for the matched reference
-        line.  Used together with *match_tol_um* as a dual-constraint
-        acceptance criterion to prevent incorrect peak↔line associations.
+        Kept for API compatibility; not used by the local search strategy.
     min_lines_per_order : int, default 4
         Minimum number of matched (post-monotonicity-filter) arc lines
         required for an order to contribute to the global fit.  Orders
@@ -666,6 +668,11 @@ def fit_1dxd_wavelength_model(
     xcorr_max_shift_px : int, default 50
         Maximum absolute column shift (pixels) allowed by the
         cross-correlation.  Shifts larger than this are clipped to ±50.
+    local_search_window_px : int, default 6
+        Half-width of the local search window in pixels.  For each
+        reference line, the arc-line candidate is searched in the range
+        ``[predicted_col - local_search_window_px,
+        predicted_col + local_search_window_px]``.
 
     Returns
     -------
@@ -762,18 +769,26 @@ def fit_1dxd_wavelength_model(
         # columns to compensate.
         shifted_coarse_cols = coarse_cols + xcorr_shift
 
-        # Replace NaNs with zero for peak finding
-        flux_for_peaks = np.where(valid_mask, flux, 0.0)
-
-        peak_idxs, _ = _scipy_find_peaks(
-            flux_for_peaks,
-            prominence=min_prominence,
-            distance=min_distance,
+        # ------------------------------------------------------------------
+        # Step 2: Local expected-line search.
+        # For each reference line, search only within a small window of
+        # ±local_search_window_px pixels near its predicted detector column.
+        # n_candidate = number of reference-line windows that yielded a peak.
+        # This IDL-style approach avoids the ambiguity that arises when
+        # hundreds of global peaks are matched against a sparse reference list.
+        # ------------------------------------------------------------------
+        candidates, local_diag = _find_local_line_peaks(
+            flux,
+            spec.col_start,
+            shifted_coarse_cols,
+            coarse_wavs,
+            ref_entries,
+            local_window_px=local_search_window_px,
+            min_prominence=min_prominence,
         )
-
-        n_candidate = len(peak_idxs)
+        n_candidate = local_diag["n_windows_with_peak"]
         if n_candidate == 0:
-            logger.debug("Order %d: no peaks found in 1D arc spectrum", order_num)
+            logger.debug("Order %d: no local peaks found near reference lines", order_num)
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=xcorr_shift,
                 n_candidate=0, n_matched=0, n_ambiguous_removed=0,
@@ -786,18 +801,10 @@ def fit_1dxd_wavelength_model(
             ))
             continue
 
-        # Convert peak indices to detector columns
-        peak_cols = spec.col_start + peak_idxs.astype(float)
-
-        # Match peaks to reference lines using the shift-corrected coarse grid
-        matches, n_ambiguous_removed = _match_1d_peaks(
-            peak_cols,
-            shifted_coarse_cols,
-            coarse_wavs,
-            ref_entries,
-            match_tol_um,
-            max_col_residual_px,
-        )
+        # The local search already produces matched (col, ref_wav) pairs — one
+        # per reference line — so n_ambiguous_removed is 0 by construction.
+        n_ambiguous_removed = 0
+        matches = candidates
 
         # Enforce monotonicity: wavelength must increase with column
         matches, n_monotonic_removed = _enforce_monotonic_matches(matches)
@@ -1335,3 +1342,125 @@ def _enforce_monotonic_matches(
 
     n_removed = len(sorted_matches) - len(filtered)
     return filtered, n_removed
+
+
+def _find_local_line_peaks(
+    flux: npt.NDArray,
+    col_start: int,
+    shifted_coarse_cols: npt.NDArray,
+    coarse_wavs: npt.NDArray,
+    ref_entries: list[tuple[float, str]],
+    *,
+    local_window_px: int = 6,
+    min_prominence: float = 50.0,
+) -> tuple[list[tuple[float, float]], dict]:
+    """Search locally near each expected reference-line column for a peak.
+
+    For each reference line in *ref_entries*, predicts its detector column by
+    interpolating on the (shifted) coarse wavelength grid, then searches
+    within ``±local_window_px`` pixels of that predicted column for the
+    strongest local peak.  This is the IDL-style approach: instead of
+    detecting all peaks globally and then matching against a reference list,
+    we search *only* near where each line is expected, avoiding the ambiguity
+    that arises when hundreds of global peaks are matched against a sparse
+    reference list.
+
+    Parameters
+    ----------
+    flux : ndarray, shape (n_cols,)
+        Extracted 1-D arc spectrum for this order.
+    col_start : int
+        Detector column corresponding to ``flux[0]``.
+    shifted_coarse_cols : ndarray
+        Coarse column lookup already shifted by the xcorr-derived offset.
+    coarse_wavs : ndarray
+        Coarse wavelength values (µm) corresponding to *shifted_coarse_cols*.
+        Must be monotonically ordered for :func:`numpy.interp` to work
+        correctly.
+    ref_entries : list of (float, str)
+        Reference line ``(wavelength_um, species)`` pairs for this order.
+    local_window_px : int, default 6
+        Half-width of the local search window in pixels.  For each reference
+        line the window spans
+        ``[predicted_col - local_window_px, predicted_col + local_window_px]``.
+    min_prominence : float, default 50.0
+        Minimum local prominence (peak value minus window floor, in detector
+        counts) required for a peak to be accepted as a candidate.
+
+    Returns
+    -------
+    candidates : list of (col, ref_wavelength_um)
+        One entry per reference line for which a convincing local peak was
+        found.  ``col`` is the detector column of the peak (float).
+    diagnostics : dict
+        Contains three integer counts:
+
+        ``n_reference_lines_considered``
+            Number of reference lines whose predicted column fell within the
+            valid flux array range.
+        ``n_windows_with_peak``
+            Number of those windows that yielded a convincing local peak
+            (i.e., local prominence ≥ *min_prominence*).
+        ``n_windows_empty``
+            Number of windows searched but yielding no convincing peak
+            (``n_reference_lines_considered - n_windows_with_peak``).
+    """
+    candidates: list[tuple[float, float]] = []
+    n_considered = 0
+    n_with_peak = 0
+    n_flux = len(flux)
+
+    if n_flux == 0 or len(ref_entries) == 0 or len(shifted_coarse_cols) == 0:
+        return [], {
+            "n_reference_lines_considered": 0,
+            "n_windows_with_peak": 0,
+            "n_windows_empty": 0,
+        }
+
+    wav_lo = float(np.min(coarse_wavs))
+    wav_hi = float(np.max(coarse_wavs))
+
+    for ref_wav, _species in ref_entries:
+        ref_wav = float(ref_wav)
+        # Skip reference lines outside the coarse wavelength range
+        if ref_wav < wav_lo or ref_wav > wav_hi:
+            continue
+
+        # Predict detector column for this reference line via interpolation
+        pred_col = float(np.interp(ref_wav, coarse_wavs, shifted_coarse_cols))
+
+        # Convert predicted column to a flux-array index and build the window
+        pred_idx = pred_col - col_start
+        pred_idx_int = int(round(pred_idx))
+        lo_idx = max(0, pred_idx_int - local_window_px)
+        hi_idx = min(n_flux - 1, pred_idx_int + local_window_px)
+        if lo_idx > hi_idx:
+            continue
+
+        n_considered += 1
+        window_flux = flux[lo_idx: hi_idx + 1]
+        finite_mask = np.isfinite(window_flux)
+        if not finite_mask.any():
+            continue
+
+        # Find the index of the highest finite value in the window
+        masked_flux = np.where(finite_mask, window_flux, -np.inf)
+        peak_local_idx = int(np.argmax(masked_flux))
+        peak_val = float(window_flux[peak_local_idx])
+        window_floor = float(np.nanmin(window_flux))
+        local_prominence = peak_val - window_floor
+
+        if local_prominence < min_prominence:
+            # No convincing peak in this window; skip this reference line
+            continue
+
+        n_with_peak += 1
+        peak_col = float(col_start + lo_idx + peak_local_idx)
+        candidates.append((peak_col, ref_wav))
+
+    n_empty = n_considered - n_with_peak
+    return candidates, {
+        "n_reference_lines_considered": n_considered,
+        "n_windows_with_peak": n_with_peak,
+        "n_windows_empty": n_empty,
+    }

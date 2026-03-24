@@ -593,6 +593,60 @@ class TestFit1DXDWavelengthModel:
             fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=1, odeg=1,
                                       min_lines_total=5)
 
+    def test_accepts_local_search_window_px_param(self):
+        """fit_1dxd_wavelength_model accepts the local_search_window_px parameter."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        spectra_set, wci, ll = self._build_inputs()
+        # Should not raise with an explicit local_search_window_px
+        model = fit_1dxd_wavelength_model(
+            spectra_set, wci, ll, wdeg=2, odeg=1, local_search_window_px=8
+        )
+        assert model.n_lines > 0
+
+    def test_n_candidate_is_nonneg_int(self):
+        """n_candidate on each OrderMatchStats is a non-negative integer."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        spectra_set, wci, ll = self._build_inputs()
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+        for stat in model.per_order_stats:
+            assert isinstance(stat.n_candidate, int)
+            assert stat.n_candidate >= 0
+
+    def test_n_ambiguous_removed_is_zero_with_local_search(self):
+        """With local search strategy, n_ambiguous_removed should be 0 per order."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        spectra_set, wci, ll = self._build_inputs()
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+        # Local search: one peak per reference line → no "multiple peaks → one ref" ambiguity
+        for stat in model.per_order_stats:
+            assert stat.n_ambiguous_removed == 0, (
+                f"Order {stat.order_number}: expected n_ambiguous_removed=0 "
+                f"with local search, got {stat.n_ambiguous_removed}"
+            )
+
+    def test_per_order_support_with_local_search(self):
+        """At least one order should have >= 4 matched lines with the synthetic data."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        spectra_set, wci, ll = self._build_inputs(n_orders=3)
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+        # With 6 lines per order and well-placed peaks, every participating
+        # order should have >= 4 matches.
+        participating = [s for s in model.per_order_stats if s.participated]
+        assert len(participating) >= 1
+        for stat in participating:
+            assert stat.n_matched >= 4, (
+                f"Order {stat.order_number}: expected >= 4 matched lines, "
+                f"got {stat.n_matched}"
+            )
+
 
 # ===========================================================================
 # 5. Rectification with 1DXD model (Option B)
@@ -997,6 +1051,213 @@ class TestXCorrOrderShift:
         # Shifted matching should find at least as many matches for this data
         # (for a perfect synthetic case the shift perfectly compensates)
         assert len(matches_shifted) >= len(matches_unshifted)
+
+
+
+# ===========================================================================
+# 8a. Local expected-line search helper
+# ===========================================================================
+
+
+class TestFindLocalLinePeaks:
+    """_find_local_line_peaks searches for peaks near predicted reference columns."""
+
+    def _make_inputs(self, ncols=512, n_lines=5, order_num=200, peak_amplitude=5000.0):
+        """Build flux array with peaks at known positions matching reference lines."""
+        order_nums = [order_num]
+        wci = _make_synthetic_wavecalinfo(
+            n_orders=1, n_pixels=ncols, order_nums=order_nums
+        )
+        ll = _make_synthetic_line_list(
+            n_orders=1, order_nums=order_nums, n_lines_per_order=n_lines
+        )
+        # Coarse grid: cols 0..ncols-1, wavelengths from wci.data
+        coarse_cols = np.arange(ncols, dtype=float)
+        coarse_wavs = wci.data[0, 0, :]
+
+        ref_entries = [
+            (float(e.wavelength_um), str(e.species))
+            for e in ll.entries
+            if e.order == order_num
+        ]
+
+        # Build flux with Gaussian peaks at predicted columns
+        flux = np.full(ncols, 10.0, dtype=float)
+        for ref_wav, _ in ref_entries:
+            col_idx = int(np.argmin(np.abs(coarse_wavs - ref_wav)))
+            for dc in range(-2, 3):
+                c = col_idx + dc
+                if 0 <= c < ncols:
+                    flux[c] += peak_amplitude * np.exp(-0.5 * dc ** 2)
+
+        return flux, coarse_cols, coarse_wavs, ref_entries
+
+    def test_returns_tuple_of_list_and_dict(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        flux, cols, wavs, refs = self._make_inputs()
+        result = _find_local_line_peaks(flux, 0, cols, wavs, refs)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        candidates, diag = result
+        assert isinstance(candidates, list)
+        assert isinstance(diag, dict)
+
+    def test_diagnostics_keys_present(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        flux, cols, wavs, refs = self._make_inputs()
+        _, diag = _find_local_line_peaks(flux, 0, cols, wavs, refs)
+        assert "n_reference_lines_considered" in diag
+        assert "n_windows_with_peak" in diag
+        assert "n_windows_empty" in diag
+
+    def test_finds_peaks_near_predicted_columns(self):
+        """Peaks placed at predicted reference columns are found."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        flux, cols, wavs, refs = self._make_inputs(n_lines=5, peak_amplitude=5000.0)
+        candidates, diag = _find_local_line_peaks(
+            flux, 0, cols, wavs, refs, local_window_px=6, min_prominence=100.0
+        )
+        # Should find all 5 reference lines (peaks are large and well-placed)
+        assert len(candidates) == 5
+        assert diag["n_windows_with_peak"] == 5
+        assert diag["n_windows_empty"] == 0
+
+    def test_candidate_columns_close_to_predicted(self):
+        """Returned peak columns should be within the search window of predicted cols."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        ncols = 256
+        flux, cols, wavs, refs = self._make_inputs(ncols=ncols, n_lines=4)
+        window_px = 6
+        candidates, _ = _find_local_line_peaks(
+            flux, 0, cols, wavs, refs, local_window_px=window_px, min_prominence=100.0
+        )
+        for peak_col, ref_wav in candidates:
+            pred_col = float(np.interp(ref_wav, wavs, cols))
+            assert abs(peak_col - pred_col) <= window_px, (
+                f"Peak col {peak_col:.1f} too far from predicted {pred_col:.1f} "
+                f"for ref_wav={ref_wav:.5f}"
+            )
+
+    def test_ignores_far_away_peaks(self):
+        """Peaks far from all reference lines are not returned."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        ncols = 512
+        order_nums = [200]
+        wci = _make_synthetic_wavecalinfo(n_orders=1, n_pixels=ncols, order_nums=order_nums)
+        ll = _make_synthetic_line_list(n_orders=1, order_nums=order_nums, n_lines_per_order=3)
+        coarse_cols = np.arange(ncols, dtype=float)
+        coarse_wavs = wci.data[0, 0, :]
+        ref_entries = [
+            (float(e.wavelength_um), str(e.species))
+            for e in ll.entries
+            if e.order == 200
+        ]
+
+        # Build flux with ONLY a large spike far from all predicted columns
+        # Reference lines are at roughly evenly spaced wavelengths; cols ~100-400
+        # Place the spike at col 10 (far from any reference line prediction)
+        flux = np.full(ncols, 10.0, dtype=float)
+        flux[10] = 50000.0
+        flux[9] = 20000.0
+        flux[11] = 20000.0
+
+        # With a small search window, the spike at col 10 should be missed
+        # if all reference lines predict columns far from 10
+        candidates, diag = _find_local_line_peaks(
+            flux, 0, coarse_cols, coarse_wavs, ref_entries,
+            local_window_px=6, min_prominence=100.0
+        )
+        # None of the reference lines' predicted windows should include col 10
+        # (reference lines are placed at fractional positions across ncols=512)
+        pred_cols = [float(np.interp(rw, coarse_wavs, coarse_cols)) for rw, _ in ref_entries]
+        any_near_10 = any(abs(pc - 10) <= 6 for pc in pred_cols)
+        if not any_near_10:
+            # Spike should not appear in candidates
+            for peak_col, _ in candidates:
+                assert abs(peak_col - 10) > 6, (
+                    f"Far-away spike at col 10 should not be in candidates, "
+                    f"but found peak_col={peak_col:.1f}"
+                )
+
+    def test_no_peaks_when_flux_is_flat(self):
+        """No candidates when flux is flat (no local prominence)."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        ncols = 256
+        # Flat flux — no local structure
+        flux = np.full(ncols, 100.0, dtype=float)
+        cols = np.arange(ncols, dtype=float)
+        wavs = np.linspace(2.0, 2.05, ncols)
+        refs = [(2.01, "ArI"), (2.03, "ArI")]
+
+        candidates, diag = _find_local_line_peaks(
+            flux, 0, cols, wavs, refs, local_window_px=6, min_prominence=50.0
+        )
+        # Flat flux → zero local prominence everywhere → no candidates
+        assert len(candidates) == 0
+        assert diag["n_windows_with_peak"] == 0
+
+    def test_empty_ref_entries_returns_empty(self):
+        """Empty reference line list returns empty candidates."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        flux = np.ones(100)
+        cols = np.arange(100, dtype=float)
+        wavs = np.linspace(2.0, 2.05, 100)
+        candidates, diag = _find_local_line_peaks(flux, 0, cols, wavs, [])
+        assert candidates == []
+        assert diag["n_reference_lines_considered"] == 0
+        assert diag["n_windows_with_peak"] == 0
+        assert diag["n_windows_empty"] == 0
+
+    def test_empty_flux_returns_empty(self):
+        """Empty flux array returns empty candidates."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        flux = np.array([], dtype=float)
+        cols = np.array([], dtype=float)
+        wavs = np.array([], dtype=float)
+        refs = [(2.01, "ArI")]
+        candidates, diag = _find_local_line_peaks(flux, 0, cols, wavs, refs)
+        assert candidates == []
+
+    def test_diagnostics_n_empty_consistent(self):
+        """n_windows_empty == n_reference_lines_considered - n_windows_with_peak."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        flux, cols, wavs, refs = self._make_inputs(n_lines=5, peak_amplitude=5000.0)
+        _, diag = _find_local_line_peaks(
+            flux, 0, cols, wavs, refs, local_window_px=6, min_prominence=100.0
+        )
+        assert diag["n_windows_empty"] == (
+            diag["n_reference_lines_considered"] - diag["n_windows_with_peak"]
+        )
+
+    def test_out_of_range_reference_lines_skipped(self):
+        """Reference lines outside the coarse wavelength range are not considered."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        flux = np.ones(100) * 10.0
+        cols = np.arange(100, dtype=float)
+        # Coarse wavelengths span [2.0, 2.05]
+        wavs = np.linspace(2.0, 2.05, 100)
+        # Reference lines: one inside range, two outside
+        refs = [(1.5, "ArI"), (2.02, "ArI"), (3.0, "ArI")]
+
+        # Add a peak at the position matching the in-range reference line
+        pred_col = int(np.argmin(np.abs(wavs - 2.02)))
+        flux[pred_col] += 5000.0
+
+        candidates, diag = _find_local_line_peaks(
+            flux, 0, cols, wavs, refs, local_window_px=6, min_prominence=100.0
+        )
+        # Only the in-range line at 2.02 µm should be considered
+        assert diag["n_reference_lines_considered"] <= 1
 
 
 # ===========================================================================
