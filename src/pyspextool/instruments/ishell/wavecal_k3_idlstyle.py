@@ -194,7 +194,11 @@ class OrderMatchStats:
         matching.
     n_matched : int
         Number of peaks that matched a reference line within the tolerance
-        window (before global sigma clipping).
+        window and passed monotonicity filtering (before global sigma
+        clipping).
+    n_monotonic_removed : int
+        Number of matches removed by monotonicity enforcement (wavelength
+        must increase monotonically with detector column).
     n_accepted : int
         Number of matches retained after global iterative sigma clipping.
     n_rejected : int
@@ -211,6 +215,7 @@ class OrderMatchStats:
     xcorr_shift_px: float
     n_candidate: int
     n_matched: int
+    n_monotonic_removed: int
     n_accepted: int
     n_rejected: int
     rms_resid_um: float
@@ -560,11 +565,13 @@ def fit_1dxd_wavelength_model(
     wavecalinfo: "WaveCalInfo",
     line_list: "LineList",
     *,
-    wdeg: int = 3,
-    odeg: int = 2,
+    wdeg: int = 2,
+    odeg: int = 1,
     min_prominence: float = 50.0,
     min_distance: int = 5,
     match_tol_um: float = 0.002,
+    max_col_residual_px: float = 5.0,
+    min_lines_per_order: int = 3,
     min_lines_total: int = 10,
     sigma_thresh: float = 3.0,
     max_sigma_iter: int = 5,
@@ -606,9 +613,9 @@ def fit_1dxd_wavelength_model(
         Packaged calibration metadata for coarse wavelength prediction.
     line_list : :class:`~pyspextool.instruments.ishell.calibrations.LineList`
         Reference arc-line list.
-    wdeg : int, default 3
+    wdeg : int, default 2
         Polynomial degree in detector column.
-    odeg : int, default 2
+    odeg : int, default 1
         Polynomial degree in ``v = order_ref / order``.
     min_prominence : float, default 50.0
         Minimum peak prominence (detector counts) for a peak to be
@@ -616,8 +623,20 @@ def fit_1dxd_wavelength_model(
     min_distance : int, default 5
         Minimum peak separation in pixels.
     match_tol_um : float, default 0.002
-        Maximum allowed residual (µm) between predicted and reference
-        wavelength for a match to be accepted.
+        Maximum allowed wavelength residual (µm) between predicted and
+        reference wavelength for a match to be accepted.
+    max_col_residual_px : float, default 5.0
+        Maximum allowed column residual (pixels) between the detected peak
+        column and the predicted detector column for the matched reference
+        line.  Used together with *match_tol_um* as a dual-constraint
+        acceptance criterion to prevent incorrect peak↔line associations.
+    min_lines_per_order : int, default 3
+        Minimum number of matched (post-monotonicity-filter) arc lines
+        required for an order to contribute to the global fit.  Orders
+        with fewer accepted matches are recorded in ``per_order_stats``
+        with ``participated=False`` and are excluded from the global
+        polynomial to avoid destabilising the fit with poorly constrained
+        orders.
     min_lines_total : int, default 10
         Minimum total number of matched arc lines required across all orders.
         Raises :exc:`ValueError` if this threshold is not met.
@@ -679,7 +698,8 @@ def fit_1dxd_wavelength_model(
             )
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=0.0,
-                n_candidate=0, n_matched=0, n_accepted=0, n_rejected=0,
+                n_candidate=0, n_matched=0, n_monotonic_removed=0,
+                n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
             ))
             continue
@@ -693,7 +713,8 @@ def fit_1dxd_wavelength_model(
         if not valid_mask.any():
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=0.0,
-                n_candidate=0, n_matched=0, n_accepted=0, n_rejected=0,
+                n_candidate=0, n_matched=0, n_monotonic_removed=0,
+                n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
             ))
             continue
@@ -730,7 +751,8 @@ def fit_1dxd_wavelength_model(
             logger.debug("Order %d: no peaks found in 1D arc spectrum", order_num)
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=xcorr_shift,
-                n_candidate=0, n_matched=0, n_accepted=0, n_rejected=0,
+                n_candidate=0, n_matched=0, n_monotonic_removed=0,
+                n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
             ))
             continue
@@ -739,20 +761,49 @@ def fit_1dxd_wavelength_model(
         peak_cols = spec.col_start + peak_idxs.astype(float)
 
         # Match peaks to reference lines using the shift-corrected coarse grid
-        matches = _match_1d_peaks(
+        matches, n_ambiguous_removed = _match_1d_peaks(
             peak_cols,
             shifted_coarse_cols,
             coarse_wavs,
             ref_entries,
             match_tol_um,
+            max_col_residual_px,
         )
+
+        # Enforce monotonicity: wavelength must increase with column
+        matches, n_monotonic_removed = _enforce_monotonic_matches(matches)
 
         n_matched = len(matches)
         if not matches:
-            logger.debug("Order %d: no arc lines matched", order_num)
+            logger.debug(
+                "Order %d: candidate=%d matched=%d used=0 rejected=0 "
+                "(ambig_removed=%d, mono_removed=%d)",
+                order_num, n_candidate, n_matched,
+                n_ambiguous_removed, n_monotonic_removed,
+            )
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=xcorr_shift,
-                n_candidate=n_candidate, n_matched=0, n_accepted=0, n_rejected=0,
+                n_candidate=n_candidate, n_matched=0,
+                n_monotonic_removed=n_monotonic_removed,
+                n_accepted=0, n_rejected=0,
+                rms_resid_um=float("nan"), participated=False,
+            ))
+            continue
+
+        # ------------------------------------------------------------------
+        # Per-order minimum-match threshold: exclude weakly constrained
+        # orders from the global fit to avoid destabilising the polynomial.
+        # ------------------------------------------------------------------
+        if n_matched < min_lines_per_order:
+            logger.debug(
+                "Order %d skipped: insufficient matches (%d < %d)",
+                order_num, n_matched, min_lines_per_order,
+            )
+            per_order_stats.append(OrderMatchStats(
+                order_number=order_num, xcorr_shift_px=xcorr_shift,
+                n_candidate=n_candidate, n_matched=n_matched,
+                n_monotonic_removed=n_monotonic_removed,
+                n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
             ))
             continue
@@ -768,13 +819,16 @@ def fit_1dxd_wavelength_model(
         per_order_stats.append(OrderMatchStats(
             order_number=order_num, xcorr_shift_px=xcorr_shift,
             n_candidate=n_candidate, n_matched=n_matched,
+            n_monotonic_removed=n_monotonic_removed,
             n_accepted=n_matched, n_rejected=0,
             rms_resid_um=float("nan"), participated=True,
         ))
 
         logger.debug(
-            "Order %d: xcorr=%.1fpx, %d peaks, %d matched",
-            order_num, xcorr_shift, n_candidate, n_matched,
+            "Order %d: xcorr=%.1fpx, candidate=%d ambig_removed=%d "
+            "mono_removed=%d matched=%d",
+            order_num, xcorr_shift, n_candidate,
+            n_ambiguous_removed, n_monotonic_removed, n_matched,
         )
 
     n_lines_total = len(all_cols)
@@ -874,6 +928,11 @@ def fit_1dxd_wavelength_model(
         stat.n_rejected = n_rej
         stat.rms_resid_um = rms_order
         stat.participated = n_acc > 0
+        logger.debug(
+            "Order %d: candidate=%d matched=%d used=%d rejected=%d",
+            stat.order_number, stat.n_candidate, stat.n_matched,
+            stat.n_accepted, stat.n_rejected,
+        )
 
     # Rebuild orders_with_matches from accepted points only
     fitted_orders_final = sorted(
@@ -1081,15 +1140,30 @@ def _match_1d_peaks(
     coarse_wavs: npt.NDArray,
     ref_entries: list[tuple[float, str]],
     match_tol_um: float,
-) -> list[tuple[float, float]]:
+    max_col_residual_px: float = 5.0,
+) -> tuple[list[tuple[float, float]], int]:
     """Match detected 1-D peak positions to reference wavelengths.
 
     For each peak column, predicts a wavelength by linear interpolation on
-    the coarse grid, then finds the nearest reference line.  Accepts the
-    match only if the residual is within *match_tol_um*.
+    the coarse grid, then finds the nearest reference line.  A match is
+    accepted only when **both** criteria are satisfied:
+
+    1. ``|predicted_wavelength - reference_wavelength| < match_tol_um``
+    2. ``|peak_col - predicted_col_for_ref_line| < max_col_residual_px``
+
+    The second criterion uses the coarse grid in reverse
+    (wavelength → predicted column) to ensure the peak column is
+    consistent with where the reference line is expected on the detector.
+    This prevents incorrect associations when the coarse grid is slightly
+    offset or peaks are dense.
 
     Deduplicates: if two peaks match the same reference line, only the
-    one with the smallest residual is retained.
+    one with the smallest wavelength residual is retained.
+
+    Ambiguity rejection: if a reference line has two detected peaks within
+    both tolerances, the match is rejected entirely (both candidates are
+    dropped) rather than keeping the closer one.  This prevents a single
+    bright reference line from pulling in wrong peak columns.
 
     Parameters
     ----------
@@ -1100,22 +1174,33 @@ def _match_1d_peaks(
     ref_entries : list of (float, str)
         Reference line ``(wavelength_um, species)`` pairs for this order.
     match_tol_um : float
-        Acceptance tolerance.
+        Maximum allowed wavelength residual (µm) for a match to be accepted.
+    max_col_residual_px : float, default 5.0
+        Maximum allowed column residual (pixels) between the detected peak
+        column and the predicted detector column for the reference line.
 
     Returns
     -------
-    list of (col, ref_wavelength_um)
-        Accepted matches.
+    matches : list of (col, ref_wavelength_um)
+        Accepted matches after deduplication and ambiguity rejection.
+    n_ambiguous_removed : int
+        Number of reference lines that were flagged as ambiguous (i.e. two
+        or more detected peaks fell within both tolerances of the same
+        reference line).  Each such reference line contributes zero accepted
+        matches regardless of how many peaks claimed it.
     """
     if len(ref_entries) == 0 or len(coarse_cols) == 0:
-        return []
+        return [], 0
 
     ref_wavs = np.array([e[0] for e in ref_entries], dtype=float)
 
     col_min = float(coarse_cols[0])
     col_max = float(coarse_cols[-1])
 
-    best: dict[int, tuple[float, float, float]] = {}  # ref_idx → (col, ref_wav, residual)
+    # best: ref_idx → (col, ref_wav, wav_residual)
+    best: dict[int, tuple[float, float, float]] = {}
+    # ambiguous: ref indices that had more than one candidate within tolerance
+    ambiguous: set[int] = set()
 
     for col in peak_cols:
         col = float(col)
@@ -1125,13 +1210,71 @@ def _match_1d_peaks(
         pred_wav = float(np.interp(col, coarse_cols, coarse_wavs))
         diffs = np.abs(ref_wavs - pred_wav)
         best_ref_idx = int(np.argmin(diffs))
-        residual = float(diffs[best_ref_idx])
+        wav_residual = float(diffs[best_ref_idx])
 
-        if residual > match_tol_um:
+        if wav_residual > match_tol_um:
             continue
 
-        # Deduplication: keep best residual per reference line
-        if best_ref_idx not in best or residual < best[best_ref_idx][2]:
-            best[best_ref_idx] = (col, float(ref_wavs[best_ref_idx]), residual)
+        # Column consistency check: predicted column for the reference line
+        # must be within max_col_residual_px of the detected peak column.
+        ref_wav = float(ref_wavs[best_ref_idx])
+        pred_col_for_ref = float(np.interp(ref_wav, coarse_wavs, coarse_cols))
+        col_residual = abs(col - pred_col_for_ref)
+        if col_residual >= max_col_residual_px:
+            continue
 
-    return [(col, wav) for col, wav, _ in best.values()]
+        if best_ref_idx in ambiguous:
+            # Already flagged ambiguous; ignore any further candidates
+            continue
+
+        if best_ref_idx in best:
+            # Second candidate for this reference line — flag as ambiguous
+            ambiguous.add(best_ref_idx)
+            del best[best_ref_idx]
+        else:
+            best[best_ref_idx] = (col, ref_wav, wav_residual)
+
+    n_ambiguous_removed = len(ambiguous)
+    matches = [(col, wav) for col, wav, _ in best.values()]
+    return matches, n_ambiguous_removed
+
+
+def _enforce_monotonic_matches(
+    matches: list[tuple[float, float]],
+) -> tuple[list[tuple[float, float]], int]:
+    """Remove non-monotonic matches so wavelength increases with column.
+
+    Sorts the match list by detector column and then applies a greedy
+    longest-increasing-subsequence filter on the assigned reference
+    wavelengths.  Any match whose wavelength is not strictly greater than
+    the previous accepted wavelength is removed.
+
+    Parameters
+    ----------
+    matches : list of (col, ref_wavelength_um)
+        Candidate matches, in any order.
+
+    Returns
+    -------
+    filtered : list of (col, ref_wavelength_um)
+        Matches with non-monotonic entries removed, sorted by column.
+    n_removed : int
+        Number of matches removed.
+    """
+    if len(matches) <= 1:
+        return list(matches), 0
+
+    # Sort by column
+    sorted_matches = sorted(matches, key=lambda m: m[0])
+
+    # Greedy forward pass: keep a match only if its wavelength is strictly
+    # greater than the last accepted wavelength.
+    filtered: list[tuple[float, float]] = []
+    last_wav = -float("inf")
+    for col, wav in sorted_matches:
+        if wav > last_wav:
+            filtered.append((col, wav))
+            last_wav = wav
+
+    n_removed = len(sorted_matches) - len(filtered)
+    return filtered, n_removed

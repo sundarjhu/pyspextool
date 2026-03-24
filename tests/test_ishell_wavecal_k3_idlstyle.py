@@ -957,17 +957,158 @@ class TestXCorrOrderShift:
         peak_cols = peak_idxs.astype(float)
 
         # Unshifted matching should find fewer/different matches
-        matches_unshifted = _match_1d_peaks(
+        matches_unshifted, _ = _match_1d_peaks(
             peak_cols, cols, wavs, refs, match_tol_um=0.002
         )
         # Shifted matching
         shifted_cols = cols + shift
-        matches_shifted = _match_1d_peaks(
+        matches_shifted, _ = _match_1d_peaks(
             peak_cols, shifted_cols, wavs, refs, match_tol_um=0.002
         )
         # Shifted matching should find at least as many matches for this data
         # (for a perfect synthetic case the shift perfectly compensates)
         assert len(matches_shifted) >= len(matches_unshifted)
+
+
+# ===========================================================================
+# 8b. Monotonicity enforcement and ambiguity rejection
+# ===========================================================================
+
+
+class TestMonotonicityEnforcement:
+    """_enforce_monotonic_matches removes non-monotone col→wavelength pairs."""
+
+    def test_empty_input(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            _enforce_monotonic_matches,
+        )
+        result, n_removed = _enforce_monotonic_matches([])
+        assert result == []
+        assert n_removed == 0
+
+    def test_single_entry_unchanged(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            _enforce_monotonic_matches,
+        )
+        result, n_removed = _enforce_monotonic_matches([(100.0, 2.1)])
+        assert result == [(100.0, 2.1)]
+        assert n_removed == 0
+
+    def test_already_monotone_unchanged(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            _enforce_monotonic_matches,
+        )
+        matches = [(50.0, 2.0), (100.0, 2.1), (150.0, 2.2)]
+        result, n_removed = _enforce_monotonic_matches(matches)
+        assert n_removed == 0
+        assert len(result) == 3
+
+    def test_removes_non_monotone_entry(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            _enforce_monotonic_matches,
+        )
+        # Third entry has wavelength smaller than second — should be removed
+        matches = [(50.0, 2.0), (100.0, 2.2), (150.0, 2.1)]
+        result, n_removed = _enforce_monotonic_matches(matches)
+        assert n_removed == 1
+        assert len(result) == 2
+        wavs = [w for _, w in result]
+        assert wavs == sorted(wavs)
+
+    def test_sorts_by_column_first(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            _enforce_monotonic_matches,
+        )
+        # Input is not sorted by column; function must sort first
+        matches = [(150.0, 2.2), (50.0, 2.0), (100.0, 2.1)]
+        result, n_removed = _enforce_monotonic_matches(matches)
+        assert n_removed == 0
+        cols = [c for c, _ in result]
+        assert cols == sorted(cols)
+
+    def test_result_wavelengths_strictly_increasing(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            _enforce_monotonic_matches,
+        )
+        # Wavelengths after column-sort: 2.3, 2.1, 2.5, 2.4, 2.6
+        # Greedy pass keeps: 2.3 (first), skip 2.1 (<2.3), keep 2.5, skip 2.4 (<2.5), keep 2.6
+        # → 3 kept, 2 removed
+        matches = [(10.0, 2.3), (20.0, 2.1), (30.0, 2.5), (40.0, 2.4), (50.0, 2.6)]
+        result, n_removed = _enforce_monotonic_matches(matches)
+        assert n_removed == 2
+        assert len(result) == 3
+        wavs = [w for _, w in result]
+        for a, b in zip(wavs, wavs[1:]):
+            assert b > a
+
+
+class TestAmbiguityRejection:
+    """_match_1d_peaks rejects matches where multiple peaks claim the same line."""
+
+    def test_ambiguous_match_removed(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _match_1d_peaks
+        # Two peaks (cols 100 and 101) both predict ~2.1 µm → same ref line
+        # Both should be dropped (ambiguous).
+        coarse_cols = np.array([0.0, 200.0])
+        coarse_wavs = np.array([2.0, 2.2])
+        ref_entries = [(2.1, "OH")]
+        # Two peaks very close together, both within tolerance of the same ref
+        peak_cols = np.array([100.0, 101.0])
+        matches, n_ambiguous = _match_1d_peaks(
+            peak_cols, coarse_cols, coarse_wavs, ref_entries, match_tol_um=0.01
+        )
+        assert n_ambiguous == 1
+        assert len(matches) == 0
+
+    def test_unambiguous_match_kept(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _match_1d_peaks
+        coarse_cols = np.array([0.0, 200.0])
+        coarse_wavs = np.array([2.0, 2.2])
+        ref_entries = [(2.1, "OH")]
+        # Only one peak close to the reference line
+        peak_cols = np.array([100.0])
+        matches, n_ambiguous = _match_1d_peaks(
+            peak_cols, coarse_cols, coarse_wavs, ref_entries, match_tol_um=0.01
+        )
+        assert n_ambiguous == 0
+        assert len(matches) == 1
+
+    def test_returns_tuple(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _match_1d_peaks
+        coarse_cols = np.array([0.0, 200.0])
+        coarse_wavs = np.array([2.0, 2.2])
+        ref_entries = [(2.1, "OH")]
+        result = _match_1d_peaks(
+            np.array([100.0]), coarse_cols, coarse_wavs, ref_entries, match_tol_um=0.01
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+
+class TestOrderMatchStatsMonotonicField:
+    """OrderMatchStats has the n_monotonic_removed field."""
+
+    def test_field_exists(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderMatchStats
+        stat = OrderMatchStats(
+            order_number=215, xcorr_shift_px=1.0,
+            n_candidate=10, n_matched=8, n_monotonic_removed=2,
+            n_accepted=7, n_rejected=1,
+            rms_resid_um=0.001, participated=True,
+        )
+        assert stat.n_monotonic_removed == 2
+
+    def test_per_order_stats_has_field_after_fit(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+            OrderMatchStats,
+        )
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+        for stat in model.per_order_stats:
+            assert isinstance(stat, OrderMatchStats)
+            assert hasattr(stat, "n_monotonic_removed")
+            assert stat.n_monotonic_removed >= 0
 
 
 # ===========================================================================
@@ -1226,7 +1367,8 @@ class TestDiagnosticsExport:
         # Build 1DXD diagnostics
         dxd_diag = mod.OrderDiagnostics1DXD(
             order_number=215, xcorr_shift_px=2.5,
-            n_candidate=8, n_matched=7, n_accepted=6, n_rejected=1,
+            n_candidate=8, n_matched=7, n_monotonic_removed=0,
+            n_accepted=6, n_rejected=1,
             rms_resid_nm=0.03, participated=True,
         )
 
@@ -1242,6 +1384,7 @@ class TestDiagnosticsExport:
         row = rows[0]
         assert "1dxd_xcorr_shift_px" in row
         assert "1dxd_n_accepted" in row
+        assert "1dxd_n_monotonic_removed" in row
         assert "1dxd_rms_nm" in row
         assert float(row["1dxd_xcorr_shift_px"]) == pytest.approx(2.5)
         assert int(row["1dxd_n_accepted"]) == 6
@@ -1269,7 +1412,8 @@ class TestDiagnosticsExport:
         )
         dxd_diag = mod.OrderDiagnostics1DXD(
             order_number=210, xcorr_shift_px=-1.0,
-            n_candidate=5, n_matched=4, n_accepted=4, n_rejected=0,
+            n_candidate=5, n_matched=4, n_monotonic_removed=0,
+            n_accepted=4, n_rejected=0,
             rms_resid_nm=0.02, participated=True,
         )
 
