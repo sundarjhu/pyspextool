@@ -65,7 +65,7 @@ K3 calibration path
   For the K3 benchmark, Stage 3b (wavecal_k3_idlstyle.py) is the PRIMARY
   source of truth for wavelength calibration.  It:
     1. Extracts 1-D arc spectra using the traced flat-field order geometry.
-    2. Fits a global (wdeg=3, odeg=2) 1DXD polynomial across all orders.
+    2. Fits a global (wdeg=2, odeg=1) 1DXD polynomial across all orders.
   The Stage 3b model drives Stage 6 rectification and all downstream outputs.
   Stages 3–5 (scaffold) run for reference and diagnostics but do NOT drive
   K3 results.
@@ -428,7 +428,10 @@ class OrderDiagnostics1DXD:
     n_candidate : int
         Number of peaks found in the 1D arc spectrum.
     n_matched : int
-        Number of peaks matched to a reference line (before sigma clipping).
+        Number of peaks matched to a reference line after monotonicity
+        filtering (before sigma clipping).
+    n_monotonic_removed : int
+        Number of matches removed by monotonicity enforcement.
     n_accepted : int
         Number of matches retained after global sigma clipping.
     n_rejected : int
@@ -444,6 +447,7 @@ class OrderDiagnostics1DXD:
     xcorr_shift_px: float
     n_candidate: int
     n_matched: int
+    n_monotonic_removed: int
     n_accepted: int
     n_rejected: int
     rms_resid_nm: float
@@ -475,13 +479,13 @@ def _build_1dxd_diagnostics(
             xcorr_shift_px=stat.xcorr_shift_px,
             n_candidate=stat.n_candidate,
             n_matched=stat.n_matched,
+            n_monotonic_removed=stat.n_monotonic_removed,
             n_accepted=stat.n_accepted,
             n_rejected=stat.n_rejected,
             rms_resid_nm=rms_nm,
             participated=stat.participated,
         ))
     return diags
-
 
 
 def _build_order_diagnostics(
@@ -620,6 +624,7 @@ def _export_diagnostics(
             row["1dxd_xcorr_shift_px"] = round(dxd.xcorr_shift_px, 3)
             row["1dxd_n_candidate"] = dxd.n_candidate
             row["1dxd_n_matched"] = dxd.n_matched
+            row["1dxd_n_monotonic_removed"] = dxd.n_monotonic_removed
             row["1dxd_n_accepted"] = dxd.n_accepted
             row["1dxd_n_rejected"] = dxd.n_rejected
             row["1dxd_rms_nm"] = (
@@ -1919,7 +1924,7 @@ def run_k3_example(
         print(f"  1D arc spectra extracted : {arc_spectra.n_orders} orders")
 
         k3_model = fit_1dxd_wavelength_model(
-            arc_spectra, wavecalinfo, line_list, wdeg=3, odeg=2
+            arc_spectra, wavecalinfo, line_list, wdeg=2, odeg=1
         )
         print(f"  1DXD fit: {k3_model.n_orders_fit} orders")
         print(f"    total={k3_model.n_lines_total}, "
