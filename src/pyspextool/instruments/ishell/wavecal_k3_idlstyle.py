@@ -748,11 +748,10 @@ def fit_1dxd_wavelength_model(
         # Step 1: Cross-correlate extracted spectrum against reference comb
         # to find the per-order column shift.
         # ------------------------------------------------------------------
-        xcorr_shift = _xcorr_order_shift(
+        xcorr_shift, xcorr_shift_clipped = _xcorr_order_shift(
             flux, coarse_cols, coarse_wavs, ref_entries,
             spec.col_start, max_shift_px=xcorr_max_shift_px,
         )
-        xcorr_shift_clipped = abs(xcorr_shift) >= xcorr_max_shift_px
         logger.debug(
             "Order %d: xcorr shift = %.2f px", order_num, xcorr_shift
         )
@@ -1032,7 +1031,7 @@ def _xcorr_order_shift(
     *,
     max_shift_px: int = 50,
     fwhm_px: float = 3.0,
-) -> float:
+) -> tuple[float, bool]:
     """Compute the per-order column shift via cross-correlation.
 
     Builds a synthetic reference comb from the expected arc-line column
@@ -1043,6 +1042,11 @@ def _xcorr_order_shift(
     The shift is found from the peak of the cross-correlation within
     ``±max_shift_px`` pixels.  Sub-pixel accuracy is obtained by
     fitting a parabola through the three points around the peak.
+
+    The returned shift is always within ``[-max_shift_px, max_shift_px]``.
+    The boolean flag indicates whether the correlation peak landed at the
+    boundary of the search window — which suggests the true peak is outside
+    the allowed shift range and the result should be treated with caution.
 
     Parameters
     ----------
@@ -1061,18 +1065,25 @@ def _xcorr_order_shift(
 
     Returns
     -------
-    float
-        Cross-correlation shift in pixels.  A positive value means the
+    shift : float
+        Cross-correlation shift in pixels, clipped to
+        ``[-max_shift_px, max_shift_px]``.  A positive value means the
         extracted spectrum is shifted *right* relative to the reference.
         Returns ``0.0`` if no reference lines are available, the coarse
         grid is empty, or correlation fails.
+    was_clipped : bool
+        ``True`` if the correlation peak was found at the boundary of the
+        search window (index 0 or ``len(window)-1``), which indicates the
+        true peak is likely outside the allowed shift range and the returned
+        shift has been constrained.  ``False`` in the normal case, including
+        early-return paths that yield ``0.0``.
     """
     if len(ref_entries) == 0 or len(coarse_cols) == 0:
-        return 0.0
+        return 0.0, False
 
     n = len(flux)
     if n == 0:
-        return 0.0
+        return 0.0, False
 
     # Replace NaNs with zero for correlation
     flux_clean = np.where(np.isfinite(flux), flux, 0.0)
@@ -1102,7 +1113,7 @@ def _xcorr_order_shift(
         n_lines_in_comb += 1
 
     if n_lines_in_comb == 0:
-        return 0.0
+        return 0.0, False
 
     # Full cross-correlation (mode="full") gives a (2n-1,)-length result.
     # The zero-lag is at index n-1.
@@ -1114,6 +1125,10 @@ def _xcorr_order_shift(
 
     peak_idx_local = int(np.argmax(xcorr_window))
     peak_idx_global = lo + peak_idx_local
+    # Record whether the peak landed at the boundary of the search window,
+    # which indicates the true correlation peak is likely outside the allowed
+    # shift range.  This is the honest "was clipped" diagnostic.
+    was_clipped = (peak_idx_local == 0 or peak_idx_local == len(xcorr_window) - 1)
 
     # Sub-pixel refinement via parabolic fit through three points
     if 0 < peak_idx_global < len(xcorr) - 1:
@@ -1128,11 +1143,12 @@ def _xcorr_order_shift(
     else:
         sub_shift = 0.0
 
-    # Shift relative to zero lag
-    shift = float(peak_idx_global - zero_lag) + sub_shift
-    # Clip to max_shift
-    shift = float(np.clip(shift, -max_shift_px, max_shift_px))
-    return shift
+    # Raw subpixel shift relative to zero lag
+    raw_shift = float(peak_idx_global - zero_lag) + sub_shift
+    # Clip to allowed window (raw_shift could slightly exceed ±max_shift_px
+    # due to the sub-pixel parabolic correction at the boundary)
+    clipped_shift = float(np.clip(raw_shift, -max_shift_px, max_shift_px))
+    return clipped_shift, was_clipped
 
 
 def _build_coarse_lookup_1d(

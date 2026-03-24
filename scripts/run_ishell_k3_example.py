@@ -626,33 +626,37 @@ def _print_stage3b_order_table(k3_model: "IdlStyle1DXDModel") -> None:
 
 def _print_stage3b_summary(k3_model: "IdlStyle1DXDModel") -> None:
     """Print a grouped Stage 3b diagnostic summary."""
-    stats = k3_model.per_order_stats
+    stats = sorted(k3_model.per_order_stats, key=lambda s: s.order_number)
     skipped = [s for s in stats if s.skipped_insufficient_matches]
     clipped = [s for s in stats if s.xcorr_shift_clipped]
     ambig = [s for s in stats if s.n_ambiguous_removed > 0]
     mono = [s for s in stats if s.n_monotonic_removed > 0]
 
-    print("  Stage 3b summary:")
-    if skipped:
-        nums = ", ".join(str(s.order_number) for s in skipped)
-        print(f"    [!!] Skipped (insufficient matches, {len(skipped)}): {nums}")
-    else:
-        print("    [ok] No orders skipped for insufficient matches.")
-    if clipped:
-        nums = ", ".join(str(s.order_number) for s in clipped)
-        print(f"    [!!] xcorr shift clipped ({len(clipped)}): {nums}")
-    else:
-        print("    [ok] No xcorr shifts clipped.")
-    if ambig:
-        nums = ", ".join(
-            f"{s.order_number}(n={s.n_ambiguous_removed})" for s in ambig
+    print("  Stage 3b grouped diagnostics:")
+    print(
+        "    skipped_insufficient_matches: "
+        + (", ".join(str(s.order_number) for s in skipped) or "none")
+    )
+    print(
+        "    xcorr_shift_clipped: "
+        + (", ".join(str(s.order_number) for s in clipped) or "none")
+    )
+    print(
+        "    ambiguity_removed: "
+        + (
+            ", ".join(
+                f"{s.order_number}(n={s.n_ambiguous_removed})" for s in ambig
+            ) or "none"
         )
-        print(f"    [  ] Ambiguity removals ({len(ambig)} orders): {nums}")
-    if mono:
-        nums = ", ".join(
-            f"{s.order_number}(n={s.n_monotonic_removed})" for s in mono
+    )
+    print(
+        "    monotonic_removed: "
+        + (
+            ", ".join(
+                f"{s.order_number}(n={s.n_monotonic_removed})" for s in mono
+            ) or "none"
         )
-        print(f"    [  ] Monotonic removals ({len(mono)} orders): {nums}")
+    )
 
 
 def _export_diagnostics(
