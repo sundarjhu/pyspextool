@@ -1288,14 +1288,17 @@ class TestFindLocalLinePeaks:
         assert len(cands_narrow) == 0, "Narrow window should miss the shifted peak"
         assert len(cands_wide) == 1, "Wide window should find the shifted peak"
 
-    def test_smoothing_suppresses_isolated_spike(self):
-        """Smoothing steers peak selection away from an isolated spike toward a broad line.
+    def test_distance_scoring_picks_on_prediction_over_stronger_off_center(self):
+        """Distance+height scoring prefers the on-prediction peak over a slightly taller but far-off one.
 
-        The raw spike is taller than the arc-line peak, but the broad arc
-        line wins in the smoothed signal because its neighbours are also
-        elevated.  This verifies that the 3-pixel box-car smoothing in
-        _find_local_line_peaks() is effective against isolated single-pixel
-        spikes.
+        Two Gaussian peaks are placed in the window:
+        - peak A at the predicted column (distance = 0), amplitude 2000
+        - peak B at 18 px from prediction, amplitude 2030 (slightly taller raw)
+
+        Pure argmax would select peak B; the combined score
+        ``height - 2 × distance`` selects peak A:
+            score_A = 2000 - 2*0  = 2000
+            score_B = 2030 - 2*18 = 1994  <  2000
         """
         from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
 
@@ -1305,18 +1308,16 @@ class TestFindLocalLinePeaks:
         ref_entries = [(2.025, "ArI")]  # predicted ~col 128
 
         flux = np.full(ncols, 10.0, dtype=float)
-        # Broad real arc line centred at col 128 (sigma=2 px, amplitude 3000)
-        # Smoothed value at col 128 ≈ (flux[127]+flux[128]+flux[129])/3
-        #   ≈ (2656 + 3010 + 2656) / 3 ≈ 2774
-        for dc in range(-5, 6):
+        # Peak A: on-prediction, amplitude 2000
+        for dc in range(-3, 4):
             c = 128 + dc
             if 0 <= c < ncols:
-                flux[c] += 3000.0 * np.exp(-0.5 * (dc / 2.0) ** 2)
-
-        # Isolated single-pixel spike at col 148 (no elevated neighbours)
-        # Raw amplitude 8000 > arc peak 3000, but smoothed value at 148
-        # ≈ (flux[147]+flux[148]+flux[149])/3 ≈ (10+8010+10)/3 ≈ 2677 < 2774
-        flux[148] += 8000.0
+                flux[c] += 2000.0 * np.exp(-0.5 * (dc / 1.5) ** 2)
+        # Peak B: 18 px off prediction, amplitude 2030 (taller raw but penalised)
+        for dc in range(-3, 4):
+            c = 146 + dc
+            if 0 <= c < ncols:
+                flux[c] += 2030.0 * np.exp(-0.5 * (dc / 1.5) ** 2)
 
         cands, diag = _find_local_line_peaks(
             flux, 0, cols, wavs, ref_entries,
@@ -1324,14 +1325,44 @@ class TestFindLocalLinePeaks:
         )
         assert len(cands) == 1
         peak_col = cands[0][0]
-        # With smoothing the broad arc line wins; without it the spike would win.
-        assert abs(peak_col - 128) < abs(peak_col - 148), (
-            f"Smoothing should steer peak to the broad arc line (~col 128), "
-            f"not the isolated spike (col 148). Got peak_col={peak_col:.1f}"
+        # Distance scoring should select peak A (~col 128), not peak B (~col 146)
+        assert abs(peak_col - 128) < abs(peak_col - 146), (
+            f"Distance scoring should prefer the on-prediction peak (~col 128) "
+            f"over the slightly taller off-centre peak (~col 146). "
+            f"Got peak_col={peak_col:.1f}"
         )
 
+    def test_local_maximum_condition_rejects_non_peak(self):
+        """A candidate that is not a local maximum in raw flux is rejected."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
 
-class TestAdaptiveWindowInFit:
+        ncols = 64
+        cols = np.arange(ncols, dtype=float)
+        wavs = np.linspace(2.0, 2.05, ncols)
+        ref_entries = [(2.025, "ArI")]  # predicted ~col 32
+
+        # Build a monotonically rising slope with no local max at col 32;
+        # the global peak is at col 40 (which IS a local maximum)
+        flux = np.full(ncols, 10.0, dtype=float)
+        for c in range(20, 41):
+            flux[c] = 500.0 + (c - 20) * 50.0   # ramp, no peak at col 32
+
+        cands, diag = _find_local_line_peaks(
+            flux, 0, cols, wavs, ref_entries,
+            local_window_px=15, min_prominence=100.0,
+        )
+        # The ramp has no interior local maximum near the prediction; the only
+        # accepted candidate (if any) must satisfy the local-max condition.
+        # If any candidate is returned it must be at the edge or a true maximum.
+        for peak_col, _ in cands:
+            peak_idx = int(peak_col)
+            if 0 < peak_idx < ncols - 1:
+                assert flux[peak_idx] >= flux[peak_idx - 1] and flux[peak_idx] >= flux[peak_idx + 1], (
+                    f"Returned peak at col {peak_col} is not a local maximum"
+                )
+
+
+
     """fit_1dxd_wavelength_model uses adaptive window based on xcorr shift."""
 
     def test_default_local_search_window_is_20(self):

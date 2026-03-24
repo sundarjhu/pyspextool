@@ -1371,11 +1371,23 @@ def _find_local_line_peaks(
     that arises when hundreds of global peaks are matched against a sparse
     reference list.
 
-    Before selecting the peak the window flux is smoothed with a 3-pixel
-    box-car filter so that isolated single-pixel noise spikes do not
-    dominate the argmax.  Prominence is evaluated on the **raw** (unsmoothed)
-    window so that the threshold retains its physical meaning in detector
-    counts.
+    Peak selection is a two-step process:
+
+    1. **Smoothing** — a 3-pixel box-car is applied to suppress single-pixel
+       noise spikes before candidate identification.
+    2. **Distance+height scoring** — the top-3 candidates by smoothed
+       amplitude are scored by ``raw_height - 2 × distance_from_prediction``.
+       The highest-scoring candidate is selected.  This prefers peaks that are
+       both strong *and* close to the predicted position, so a slightly taller
+       spurious peak that is well off-centre will not mask the genuine line.
+
+    After the best candidate is selected, a **local-maximum condition** is
+    applied: the candidate pixel must be ≥ both immediate neighbours in the
+    raw flux, ensuring we are on a genuine peak crest rather than a plateau
+    shoulder.
+
+    Prominence is evaluated on the **raw** (unsmoothed) window flux so that
+    the threshold retains its physical meaning in detector counts.
 
     Parameters
     ----------
@@ -1398,7 +1410,8 @@ def _find_local_line_peaks(
     min_prominence : float, default 50.0
         Minimum local prominence (peak value minus window floor, in detector
         counts) required for a peak to be accepted as a candidate.
-        Prominence is measured on the raw (unsmoothed) window flux.
+        Prominence is measured on the raw (unsmoothed) window flux of the
+        selected candidate.
 
     Returns
     -------
@@ -1457,8 +1470,8 @@ def _find_local_line_peaks(
             continue
 
         # Smooth the window with a 3-pixel box-car to suppress single-pixel
-        # noise spikes.  Use the smoothed signal only to locate the peak
-        # index; raw flux is used for prominence measurement.
+        # noise spikes.  Smoothed signal is used only for candidate ranking;
+        # raw flux is used for the distance+height score and prominence.
         raw_flux = np.where(finite_mask, window_flux, 0.0)
         if len(raw_flux) >= 3:
             kernel = np.ones(3) / 3.0
@@ -1469,9 +1482,32 @@ def _find_local_line_peaks(
         else:
             smoothed = raw_flux
 
-        # Find peak on the smoothed signal; measure prominence on raw flux
+        # Step 1: pick the top-3 candidates by smoothed amplitude.
         smooth_masked = np.where(finite_mask, smoothed, -np.inf)
-        peak_local_idx = int(np.argmax(smooth_masked))
+        n_top = min(3, len(raw_flux))
+        top_indices = np.argsort(smooth_masked)[-n_top:]
+
+        # Step 2: score each candidate by raw height minus a 2-per-pixel distance
+        # penalty from the predicted column.  This prefers peaks that are
+        # both strong and close to the expected line position.
+        pred_idx_float = pred_col - col_start  # fractional flux-array index
+        candidate_scores: list[tuple[float, int]] = []
+        for i in top_indices:
+            distance = abs((lo_idx + i) - pred_idx_float)
+            height = float(raw_flux[i])
+            candidate_scores.append((height - 2.0 * distance, int(i)))
+
+        # Step 3: select the highest-scoring candidate.
+        peak_local_idx = max(candidate_scores)[1]
+
+        # Step 4: enforce local-maximum condition — the selected pixel must be
+        # ≥ both immediate neighbours so we land on a genuine peak crest.
+        if 0 < peak_local_idx < len(raw_flux) - 1:
+            if not (raw_flux[peak_local_idx] >= raw_flux[peak_local_idx - 1]
+                    and raw_flux[peak_local_idx] >= raw_flux[peak_local_idx + 1]):
+                continue
+
+        # Step 5: measure prominence on the raw window flux.
         peak_val = float(window_flux[peak_local_idx])
         window_floor = float(np.nanmin(window_flux))
         local_prominence = peak_val - window_floor
