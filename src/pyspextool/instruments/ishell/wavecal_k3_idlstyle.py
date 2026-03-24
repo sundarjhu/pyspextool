@@ -196,6 +196,9 @@ class OrderMatchStats:
         Number of peaks that matched a reference line within the tolerance
         window and passed monotonicity filtering (before global sigma
         clipping).
+    n_ambiguous_removed : int
+        Number of reference-line matches rejected because multiple peaks
+        claimed the same reference line (ambiguity filtering).
     n_monotonic_removed : int
         Number of matches removed by monotonicity enforcement (wavelength
         must increase monotonically with detector column).
@@ -209,17 +212,31 @@ class OrderMatchStats:
     participated : bool
         ``True`` if this order contributed at least one accepted point to
         the global fit.
+    xcorr_shift_clipped : bool
+        ``True`` if the cross-correlation shift reached the allowed limit
+        (``±xcorr_max_shift_px``) and was clipped to it.
+    skipped_insufficient_matches : bool
+        ``True`` if the order was excluded from the global fit because it
+        had fewer than the required minimum number of matched lines after
+        filtering.
+    min_lines_required : int
+        The per-order minimum-match threshold used when deciding whether
+        this order should participate in the global fit.
     """
 
     order_number: int
     xcorr_shift_px: float
     n_candidate: int
     n_matched: int
+    n_ambiguous_removed: int
     n_monotonic_removed: int
     n_accepted: int
     n_rejected: int
     rms_resid_um: float
     participated: bool
+    xcorr_shift_clipped: bool
+    skipped_insufficient_matches: bool
+    min_lines_required: int
 
 
 @dataclass
@@ -698,9 +715,13 @@ def fit_1dxd_wavelength_model(
             )
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=0.0,
-                n_candidate=0, n_matched=0, n_monotonic_removed=0,
+                n_candidate=0, n_matched=0, n_ambiguous_removed=0,
+                n_monotonic_removed=0,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=False,
+                skipped_insufficient_matches=False,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -713,9 +734,13 @@ def fit_1dxd_wavelength_model(
         if not valid_mask.any():
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=0.0,
-                n_candidate=0, n_matched=0, n_monotonic_removed=0,
+                n_candidate=0, n_matched=0, n_ambiguous_removed=0,
+                n_monotonic_removed=0,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=False,
+                skipped_insufficient_matches=False,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -727,6 +752,7 @@ def fit_1dxd_wavelength_model(
             flux, coarse_cols, coarse_wavs, ref_entries,
             spec.col_start, max_shift_px=xcorr_max_shift_px,
         )
+        xcorr_shift_clipped = abs(xcorr_shift) >= xcorr_max_shift_px
         logger.debug(
             "Order %d: xcorr shift = %.2f px", order_num, xcorr_shift
         )
@@ -751,9 +777,13 @@ def fit_1dxd_wavelength_model(
             logger.debug("Order %d: no peaks found in 1D arc spectrum", order_num)
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=xcorr_shift,
-                n_candidate=0, n_matched=0, n_monotonic_removed=0,
+                n_candidate=0, n_matched=0, n_ambiguous_removed=0,
+                n_monotonic_removed=0,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=xcorr_shift_clipped,
+                skipped_insufficient_matches=False,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -784,9 +814,13 @@ def fit_1dxd_wavelength_model(
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=xcorr_shift,
                 n_candidate=n_candidate, n_matched=0,
+                n_ambiguous_removed=n_ambiguous_removed,
                 n_monotonic_removed=n_monotonic_removed,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=xcorr_shift_clipped,
+                skipped_insufficient_matches=False,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -802,9 +836,13 @@ def fit_1dxd_wavelength_model(
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=xcorr_shift,
                 n_candidate=n_candidate, n_matched=n_matched,
+                n_ambiguous_removed=n_ambiguous_removed,
                 n_monotonic_removed=n_monotonic_removed,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=xcorr_shift_clipped,
+                skipped_insufficient_matches=True,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -819,9 +857,13 @@ def fit_1dxd_wavelength_model(
         per_order_stats.append(OrderMatchStats(
             order_number=order_num, xcorr_shift_px=xcorr_shift,
             n_candidate=n_candidate, n_matched=n_matched,
+            n_ambiguous_removed=n_ambiguous_removed,
             n_monotonic_removed=n_monotonic_removed,
             n_accepted=n_matched, n_rejected=0,
             rms_resid_um=float("nan"), participated=True,
+            xcorr_shift_clipped=xcorr_shift_clipped,
+            skipped_insufficient_matches=False,
+            min_lines_required=min_lines_per_order,
         ))
 
         logger.debug(

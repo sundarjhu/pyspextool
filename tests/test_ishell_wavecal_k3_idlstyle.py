@@ -1088,14 +1088,23 @@ class TestAmbiguityRejection:
 class TestOrderMatchStatsMonotonicField:
     """OrderMatchStats has the n_monotonic_removed field."""
 
-    def test_field_exists(self):
+    def _make_stat(self, **overrides):
         from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderMatchStats
-        stat = OrderMatchStats(
+        defaults = dict(
             order_number=215, xcorr_shift_px=1.0,
-            n_candidate=10, n_matched=8, n_monotonic_removed=2,
+            n_candidate=10, n_matched=8,
+            n_ambiguous_removed=0, n_monotonic_removed=2,
             n_accepted=7, n_rejected=1,
             rms_resid_um=0.001, participated=True,
+            xcorr_shift_clipped=False,
+            skipped_insufficient_matches=False,
+            min_lines_required=3,
         )
+        defaults.update(overrides)
+        return OrderMatchStats(**defaults)
+
+    def test_field_exists(self):
+        stat = self._make_stat()
         assert stat.n_monotonic_removed == 2
 
     def test_per_order_stats_has_field_after_fit(self):
@@ -1112,8 +1121,246 @@ class TestOrderMatchStatsMonotonicField:
 
 
 # ===========================================================================
-# 9. Sigma clipping
+# 8c. New OrderMatchStats failure-diagnostic fields
 # ===========================================================================
+
+
+class TestOrderMatchStatsNewFields:
+    """New failure-diagnostic fields exist on OrderMatchStats and are populated."""
+
+    def _make_stat(self, **overrides):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderMatchStats
+        defaults = dict(
+            order_number=215, xcorr_shift_px=1.0,
+            n_candidate=10, n_matched=8,
+            n_ambiguous_removed=1, n_monotonic_removed=2,
+            n_accepted=7, n_rejected=1,
+            rms_resid_um=0.001, participated=True,
+            xcorr_shift_clipped=False,
+            skipped_insufficient_matches=False,
+            min_lines_required=3,
+        )
+        defaults.update(overrides)
+        return OrderMatchStats(**defaults)
+
+    def test_n_ambiguous_removed_field_exists(self):
+        stat = self._make_stat(n_ambiguous_removed=2)
+        assert stat.n_ambiguous_removed == 2
+
+    def test_xcorr_shift_clipped_field_exists(self):
+        stat = self._make_stat(xcorr_shift_clipped=True)
+        assert stat.xcorr_shift_clipped is True
+
+    def test_skipped_insufficient_matches_field_exists(self):
+        stat = self._make_stat(skipped_insufficient_matches=True, participated=False)
+        assert stat.skipped_insufficient_matches is True
+
+    def test_min_lines_required_field_exists(self):
+        stat = self._make_stat(min_lines_required=5)
+        assert stat.min_lines_required == 5
+
+    def test_new_fields_present_after_fit(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+            OrderMatchStats,
+        )
+        from dataclasses import fields as dc_fields
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+        field_names = {f.name for f in dc_fields(OrderMatchStats)}
+        for new_field in (
+            "n_ambiguous_removed",
+            "xcorr_shift_clipped",
+            "skipped_insufficient_matches",
+            "min_lines_required",
+        ):
+            assert new_field in field_names, f"Missing field: {new_field}"
+        for stat in model.per_order_stats:
+            assert isinstance(stat.n_ambiguous_removed, int)
+            assert isinstance(stat.xcorr_shift_clipped, bool)
+            assert isinstance(stat.skipped_insufficient_matches, bool)
+            assert isinstance(stat.min_lines_required, int)
+
+    def test_xcorr_shift_clipped_set_when_shift_at_limit(self):
+        """xcorr_shift_clipped is True when shift reaches ±max_shift_px."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        # max_shift_px=0 causes every shift to be clipped (abs(0) >= 0 is True)
+        model_zero = fit_1dxd_wavelength_model(
+            spectra_set, wci, ll, wdeg=2, odeg=1, xcorr_max_shift_px=0
+        )
+        model_normal = fit_1dxd_wavelength_model(
+            spectra_set, wci, ll, wdeg=2, odeg=1, xcorr_max_shift_px=200
+        )
+        # With max_shift_px=0 all shifts are at the boundary: clipped_zero == n_orders
+        clipped_zero = sum(1 for s in model_zero.per_order_stats if s.xcorr_shift_clipped)
+        clipped_normal = sum(1 for s in model_normal.per_order_stats if s.xcorr_shift_clipped)
+        assert clipped_zero == spectra_set.n_orders, (
+            "All orders should be clipped when max_shift_px=0"
+        )
+        # With a max_shift_px of 200 the shift should always be within bounds
+        assert clipped_normal == 0, (
+            "No orders should be clipped when max_shift_px=200"
+        )
+
+    def test_skipped_insufficient_propagated_when_min_lines_high(self):
+        """skipped_insufficient_matches is True when min_lines_per_order is very high."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        # Use an impossibly high threshold so every order is skipped
+        try:
+            model = fit_1dxd_wavelength_model(
+                spectra_set, wci, ll, wdeg=2, odeg=1,
+                min_lines_per_order=1000,
+                min_lines_total=1,
+            )
+            for stat in model.per_order_stats:
+                if stat.n_matched < 1000 and stat.n_candidate > 0:
+                    assert stat.skipped_insufficient_matches is True
+        except ValueError:
+            pass  # raised if total < min_lines_total, which is fine
+
+    def test_min_lines_required_matches_threshold(self):
+        """min_lines_required on each stat equals the threshold passed."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        model = fit_1dxd_wavelength_model(
+            spectra_set, wci, ll, wdeg=2, odeg=1, min_lines_per_order=4
+        )
+        for stat in model.per_order_stats:
+            assert stat.min_lines_required == 4
+
+
+# ===========================================================================
+# 8d. New OrderDiagnostics1DXD export fields
+# ===========================================================================
+
+
+class TestOrderDiagnostics1DXDNewFields:
+    """New fields appear in OrderDiagnostics1DXD and in exported diagnostics rows."""
+
+    def _load_script_module(self):
+        import importlib.util
+        import sys
+        scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "run_ishell_k3_example_diag_test",
+            os.path.join(scripts_dir, "run_ishell_k3_example.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _make_k3_model(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        return fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+
+    def test_order_diagnostics_1dxd_new_fields_exist(self):
+        mod = self._load_script_module()
+        from dataclasses import fields as dc_fields
+        field_names = {f.name for f in dc_fields(mod.OrderDiagnostics1DXD)}
+        for name in (
+            "n_ambiguous_removed",
+            "xcorr_shift_clipped",
+            "skipped_insufficient_matches",
+            "min_lines_required",
+        ):
+            assert name in field_names, f"Missing field in OrderDiagnostics1DXD: {name}"
+
+    def test_build_1dxd_diagnostics_copies_new_fields(self):
+        mod = self._load_script_module()
+        k3_model = self._make_k3_model()
+        diags = mod._build_1dxd_diagnostics(k3_model)
+        assert len(diags) > 0
+        for dxd in diags:
+            assert isinstance(dxd.n_ambiguous_removed, int)
+            assert isinstance(dxd.xcorr_shift_clipped, bool)
+            assert isinstance(dxd.skipped_insufficient_matches, bool)
+            assert isinstance(dxd.min_lines_required, int)
+
+    def test_export_diagnostics_csv_includes_new_columns(self):
+        import csv
+        import tempfile
+        mod = self._load_script_module()
+        k3_model = self._make_k3_model()
+        diags_1dxd = mod._build_1dxd_diagnostics(k3_model)
+        # Build minimal OrderCalibrationDiagnostics stubs
+        from dataclasses import fields as dc_fields
+        OCD = mod.OrderCalibrationDiagnostics
+        # Use same order numbers as stats
+        order_nums = [s.order_number for s in k3_model.per_order_stats]
+        diags = [
+            OCD(
+                order_number=on,
+                n_candidate=0, n_accepted=0, n_rejected=0,
+                poly_degree_requested=2, poly_degree_used=2,
+                fit_rms_nm=float("nan"), skipped=False, non_monotonic=False,
+            )
+            for on in order_nums
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = mod._export_diagnostics(
+                diags, tmpdir, fmt="csv", prefix="test",
+                diags_1dxd=diags_1dxd,
+            )
+            with open(out_path, newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                rows = list(reader)
+        if rows:
+            headers = set(rows[0].keys())
+            for col in (
+                "1dxd_n_ambiguous_removed",
+                "1dxd_xcorr_shift_clipped",
+                "1dxd_skipped_insufficient_matches",
+                "1dxd_min_lines_required",
+            ):
+                assert col in headers, f"Missing CSV column: {col}"
+
+    def test_export_diagnostics_json_includes_new_keys(self):
+        import json
+        import tempfile
+        mod = self._load_script_module()
+        k3_model = self._make_k3_model()
+        diags_1dxd = mod._build_1dxd_diagnostics(k3_model)
+        OCD = mod.OrderCalibrationDiagnostics
+        order_nums = [s.order_number for s in k3_model.per_order_stats]
+        diags = [
+            OCD(
+                order_number=on,
+                n_candidate=0, n_accepted=0, n_rejected=0,
+                poly_degree_requested=2, poly_degree_used=2,
+                fit_rms_nm=float("nan"), skipped=False, non_monotonic=False,
+            )
+            for on in order_nums
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = mod._export_diagnostics(
+                diags, tmpdir, fmt="json", prefix="test",
+                diags_1dxd=diags_1dxd,
+            )
+            with open(out_path, encoding="utf-8") as fh:
+                rows = json.load(fh)
+        if rows:
+            for key in (
+                "1dxd_n_ambiguous_removed",
+                "1dxd_xcorr_shift_clipped",
+                "1dxd_skipped_insufficient_matches",
+                "1dxd_min_lines_required",
+            ):
+                assert key in rows[0], f"Missing JSON key: {key}"
+
+
+
 
 
 class TestSigmaClipping:
@@ -1367,9 +1614,13 @@ class TestDiagnosticsExport:
         # Build 1DXD diagnostics
         dxd_diag = mod.OrderDiagnostics1DXD(
             order_number=215, xcorr_shift_px=2.5,
-            n_candidate=8, n_matched=7, n_monotonic_removed=0,
+            n_candidate=8, n_matched=7,
+            n_ambiguous_removed=0, n_monotonic_removed=0,
             n_accepted=6, n_rejected=1,
             rms_resid_nm=0.03, participated=True,
+            xcorr_shift_clipped=False,
+            skipped_insufficient_matches=False,
+            min_lines_required=3,
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1412,9 +1663,13 @@ class TestDiagnosticsExport:
         )
         dxd_diag = mod.OrderDiagnostics1DXD(
             order_number=210, xcorr_shift_px=-1.0,
-            n_candidate=5, n_matched=4, n_monotonic_removed=0,
+            n_candidate=5, n_matched=4,
+            n_ambiguous_removed=0, n_monotonic_removed=0,
             n_accepted=4, n_rejected=0,
             rms_resid_nm=0.02, participated=True,
+            xcorr_shift_clipped=False,
+            skipped_insufficient_matches=False,
+            min_lines_required=3,
         )
 
         with tempfile.TemporaryDirectory() as tmp:
