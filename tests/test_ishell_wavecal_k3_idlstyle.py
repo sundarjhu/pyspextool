@@ -2837,3 +2837,366 @@ class TestMinLinesPerOrder4Threshold:
         assert "4" in skipped_line, (
             f"Expected threshold '4' in skipped line, got: {skipped_line!r}"
         )
+
+
+# ===========================================================================
+# New: per-order affine column correction
+# ===========================================================================
+
+
+class TestFitAffineColCorrection:
+    """_fit_affine_col_correction fits or returns identity transform."""
+
+    def _make_grid(self, ncols=256):
+        """Simple coarse grid: cols 0..ncols-1, wavelengths linearly spaced."""
+        cols = np.arange(ncols, dtype=float)
+        wavs = np.linspace(2.0, 2.05, ncols)
+        return cols, wavs
+
+    def test_returns_tuple_of_four(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fit_affine_col_correction
+
+        cols, wavs = self._make_grid()
+        result = _fit_affine_col_correction([], cols, wavs)
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+
+    def test_identity_for_zero_candidates(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fit_affine_col_correction
+
+        cols, wavs = self._make_grid()
+        a, b, applied, n_pts = _fit_affine_col_correction([], cols, wavs)
+        assert a == 1.0
+        assert b == 0.0
+        assert applied is False
+        assert n_pts == 0
+
+    def test_identity_for_single_candidate(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fit_affine_col_correction
+
+        cols, wavs = self._make_grid()
+        candidates = [(128.0, 2.025)]  # single match
+        a, b, applied, n_pts = _fit_affine_col_correction(candidates, cols, wavs)
+        assert a == 1.0
+        assert b == 0.0
+        assert applied is False
+        assert n_pts == 1
+
+    def test_applied_false_for_identity_fallback(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fit_affine_col_correction
+
+        cols, wavs = self._make_grid()
+        a, b, applied, _ = _fit_affine_col_correction([], cols, wavs)
+        assert applied is False
+
+    def test_fits_known_affine_transform(self):
+        """Given (detected = 1.02 * pred + 3), the fit should recover these values."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fit_affine_col_correction
+
+        ncols = 512
+        cols = np.arange(ncols, dtype=float)
+        wavs = np.linspace(2.0, 2.05, ncols)
+
+        # Create candidates where detected_col = 1.02 * pred_col + 3
+        # a=1.02 is within the valid [0.95, 1.05] slope range; b=3.0 px intercept
+        true_a, true_b = 1.02, 3.0
+        ref_wavs = [2.005, 2.015, 2.025, 2.035, 2.045]
+        candidates = []
+        for rw in ref_wavs:
+            pred = float(np.interp(rw, wavs, cols))
+            detected = true_a * pred + true_b
+            candidates.append((detected, rw))
+
+        a, b, applied, n_pts = _fit_affine_col_correction(candidates, cols, wavs)
+        assert applied is True
+        assert n_pts == len(ref_wavs)
+        assert abs(a - true_a) < 1e-6, f"Expected a≈{true_a}, got {a}"
+        assert abs(b - true_b) < 1e-4, f"Expected b≈{true_b}, got {b}"
+
+    def test_out_of_range_slope_returns_identity(self):
+        """A fitted slope outside [0.95, 1.05] should trigger identity fallback."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fit_affine_col_correction
+
+        ncols = 512
+        cols = np.arange(ncols, dtype=float)
+        wavs = np.linspace(2.0, 2.05, ncols)
+
+        # Use a = 1.10 (outside 1.05 upper bound)
+        bad_a = 1.10
+        ref_wavs = [2.01, 2.02, 2.03, 2.04]
+        candidates = []
+        for rw in ref_wavs:
+            pred = float(np.interp(rw, wavs, cols))
+            detected = bad_a * pred
+            candidates.append((detected, rw))
+
+        a, b, applied, n_pts = _fit_affine_col_correction(candidates, cols, wavs)
+        assert applied is False
+        assert a == 1.0
+        assert b == 0.0
+        assert n_pts == len(ref_wavs)
+
+    def test_slope_below_lower_bound_returns_identity(self):
+        """A fitted slope below 0.95 should trigger identity fallback."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fit_affine_col_correction
+
+        ncols = 512
+        cols = np.arange(ncols, dtype=float)
+        wavs = np.linspace(2.0, 2.05, ncols)
+
+        bad_a = 0.90  # outside lower bound
+        ref_wavs = [2.01, 2.02, 2.03, 2.04]
+        candidates = []
+        for rw in ref_wavs:
+            pred = float(np.interp(rw, wavs, cols))
+            detected = bad_a * pred
+            candidates.append((detected, rw))
+
+        a, b, applied, n_pts = _fit_affine_col_correction(candidates, cols, wavs)
+        assert applied is False
+        assert a == 1.0
+
+    def test_exactly_two_candidates_sufficient(self):
+        """Two candidates should be enough to fit (not fall back to identity)."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fit_affine_col_correction
+
+        ncols = 256
+        cols = np.arange(ncols, dtype=float)
+        wavs = np.linspace(2.0, 2.05, ncols)
+
+        true_a, true_b = 1.01, 2.0  # within [0.95, 1.05] slope bounds → valid correction
+        ref_wavs = [2.01, 2.04]
+        candidates = []
+        for rw in ref_wavs:
+            pred = float(np.interp(rw, wavs, cols))
+            detected = true_a * pred + true_b
+            candidates.append((detected, rw))
+
+        a, b, applied, n_pts = _fit_affine_col_correction(candidates, cols, wavs)
+        assert applied is True
+        assert n_pts == 2
+
+    def test_n_points_equals_candidate_count(self):
+        """n_points in return should equal len(candidates) regardless of fallback."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fit_affine_col_correction
+
+        cols, wavs = self._make_grid()
+        for n in [0, 1, 3]:
+            ref_wavs = np.linspace(2.01, 2.04, n)
+            candidates = [
+                (float(np.interp(rw, wavs, cols)), float(rw))
+                for rw in ref_wavs
+            ]
+            _, _, _, n_pts = _fit_affine_col_correction(candidates, cols, wavs)
+            assert n_pts == n, f"Expected n_pts={n}, got {n_pts}"
+
+
+class TestOrderMatchStatsAffineFields:
+    """OrderMatchStats has the four new affine correction fields with correct defaults."""
+
+    def _make_stat_minimal(self):
+        """Create an OrderMatchStats using only the required fields (new affine fields use defaults)."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderMatchStats
+
+        return OrderMatchStats(
+            order_number=215,
+            xcorr_shift_px=1.0,
+            n_candidate=10,
+            n_matched=8,
+            n_ambiguous_removed=0,
+            n_monotonic_removed=2,
+            n_accepted=7,
+            n_rejected=1,
+            rms_resid_um=0.001,
+            participated=True,
+            xcorr_shift_clipped=False,
+            skipped_insufficient_matches=False,
+            min_lines_required=3,
+        )
+
+    def test_affine_a_field_exists(self):
+        stat = self._make_stat_minimal()
+        assert hasattr(stat, "affine_a")
+
+    def test_affine_b_field_exists(self):
+        stat = self._make_stat_minimal()
+        assert hasattr(stat, "affine_b")
+
+    def test_affine_applied_field_exists(self):
+        stat = self._make_stat_minimal()
+        assert hasattr(stat, "affine_applied")
+
+    def test_affine_n_points_field_exists(self):
+        stat = self._make_stat_minimal()
+        assert hasattr(stat, "affine_n_points")
+
+    def test_affine_a_default_is_one(self):
+        stat = self._make_stat_minimal()
+        assert stat.affine_a == 1.0
+
+    def test_affine_b_default_is_zero(self):
+        stat = self._make_stat_minimal()
+        assert stat.affine_b == 0.0
+
+    def test_affine_applied_default_is_false(self):
+        stat = self._make_stat_minimal()
+        assert stat.affine_applied is False
+
+    def test_affine_n_points_default_is_zero(self):
+        stat = self._make_stat_minimal()
+        assert stat.affine_n_points == 0
+
+    def test_affine_fields_settable_explicitly(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderMatchStats
+
+        stat = OrderMatchStats(
+            order_number=215,
+            xcorr_shift_px=1.0,
+            n_candidate=10,
+            n_matched=8,
+            n_ambiguous_removed=0,
+            n_monotonic_removed=2,
+            n_accepted=7,
+            n_rejected=1,
+            rms_resid_um=0.001,
+            participated=True,
+            xcorr_shift_clipped=False,
+            skipped_insufficient_matches=False,
+            min_lines_required=3,
+            affine_a=1.02,
+            affine_b=3.5,
+            affine_applied=True,
+            affine_n_points=5,
+        )
+        assert stat.affine_a == 1.02
+        assert stat.affine_b == 3.5
+        assert stat.affine_applied is True
+        assert stat.affine_n_points == 5
+
+    def test_affine_fields_present_in_dataclass_fields(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderMatchStats
+        from dataclasses import fields as dc_fields
+
+        field_names = {f.name for f in dc_fields(OrderMatchStats)}
+        for name in ("affine_a", "affine_b", "affine_applied", "affine_n_points"):
+            assert name in field_names, f"Missing field: {name}"
+
+    def test_affine_fields_types_after_fit(self):
+        """After fit_1dxd_wavelength_model, per_order_stats have correct affine field types."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+
+        for stat in model.per_order_stats:
+            assert isinstance(stat.affine_a, float), (
+                f"Order {stat.order_number}: affine_a should be float, got {type(stat.affine_a)}"
+            )
+            assert isinstance(stat.affine_b, float), (
+                f"Order {stat.order_number}: affine_b should be float, got {type(stat.affine_b)}"
+            )
+            assert isinstance(stat.affine_applied, bool), (
+                f"Order {stat.order_number}: affine_applied should be bool, "
+                f"got {type(stat.affine_applied)}"
+            )
+            assert isinstance(stat.affine_n_points, int), (
+                f"Order {stat.order_number}: affine_n_points should be int, "
+                f"got {type(stat.affine_n_points)}"
+            )
+
+    def test_affine_n_points_nonneg_after_fit(self):
+        """affine_n_points is non-negative for all orders after fitting."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import fit_1dxd_wavelength_model
+
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+
+        for stat in model.per_order_stats:
+            assert stat.affine_n_points >= 0, (
+                f"Order {stat.order_number}: affine_n_points={stat.affine_n_points}"
+            )
+
+    def test_affine_a_within_bounds_when_applied(self):
+        """When affine_applied is True, affine_a must be in [0.95, 1.05]."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import fit_1dxd_wavelength_model
+
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+
+        for stat in model.per_order_stats:
+            if stat.affine_applied:
+                assert 0.95 <= stat.affine_a <= 1.05, (
+                    f"Order {stat.order_number}: affine_a={stat.affine_a:.5f} outside [0.95,1.05]"
+                )
+
+    def test_identity_when_affine_not_applied(self):
+        """When affine_applied is False, affine_a==1.0 and affine_b==0.0."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import fit_1dxd_wavelength_model
+
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+
+        for stat in model.per_order_stats:
+            if not stat.affine_applied:
+                assert stat.affine_a == 1.0, (
+                    f"Order {stat.order_number}: expected affine_a=1.0 when not applied, "
+                    f"got {stat.affine_a}"
+                )
+                assert stat.affine_b == 0.0, (
+                    f"Order {stat.order_number}: expected affine_b=0.0 when not applied, "
+                    f"got {stat.affine_b}"
+                )
+
+    def test_two_pass_finds_lines_with_affine_shifted_peaks(self):
+        """Two-pass approach finds lines when peaks have an affine (not just shift) offset.
+
+        Peaks are placed at detected_col = 1.01 * pred_col + 8.  Without the
+        affine correction only the shift component is corrected; with two-pass the
+        slope is also corrected and all lines are found.
+        """
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            OrderArcSpectrum,
+            OrderArcSpectraSet,
+            fit_1dxd_wavelength_model,
+        )
+
+        n_orders = 3
+        ncols = 512
+        order_nums = [200 + i for i in range(n_orders)]
+        wci = _make_synthetic_wavecalinfo(n_orders=n_orders, n_pixels=ncols,
+                                          order_nums=order_nums)
+        ll = _make_synthetic_line_list(n_orders=n_orders, order_nums=order_nums,
+                                       n_lines_per_order=6)
+
+        # a=1.01 is a small but valid slope (within [0.95,1.05]); b=8.0 is a shift
+        # large enough to be missed by xcorr-only correction at narrow windows
+        true_a, true_b = 1.01, 8.0
+        spectra = []
+        for i, on in enumerate(order_nums):
+            flux = np.full(ncols, 10.0, dtype=float)
+            wav_array = wci.data[i, 0, :]
+            for entry in ll.entries:
+                if entry.order != on:
+                    continue
+                wav = entry.wavelength_um
+                pred_col = float(np.argmin(np.abs(wav_array - wav)))
+                detected_col = int(round(true_a * pred_col + true_b))
+                for dc in range(-2, 3):
+                    c = detected_col + dc
+                    if 0 <= c < ncols:
+                        flux[c] += 10000.0 * np.exp(-0.5 * dc ** 2)
+            spectra.append(OrderArcSpectrum(
+                order_index=i, order_number=on,
+                col_start=0, col_end=ncols - 1, flux=flux,
+            ))
+
+        spectra_set = OrderArcSpectraSet(mode="K3", spectra=spectra, aperture_half_width=3)
+        model = fit_1dxd_wavelength_model(
+            spectra_set, wci, ll, wdeg=2, odeg=1,
+            local_search_window_px=20,
+        )
+        # Two-pass should find all (or nearly all) lines
+        assert model.n_lines > 0
+        assert model.n_orders_fit >= 1

@@ -224,6 +224,21 @@ class OrderMatchStats:
     min_lines_required : int
         The per-order minimum-match threshold used when deciding whether
         this order should participate in the global fit.
+    affine_a : float
+        Slope of the per-order affine column correction fitted from the
+        first-pass local search results.  ``1.0`` when the identity
+        transform was used (fewer than 2 first-pass matches, or the fitted
+        slope was outside the allowed range ``[0.95, 1.05]``).
+    affine_b : float
+        Intercept (pixels) of the per-order affine column correction.
+        ``0.0`` when the identity transform was used.
+    affine_applied : bool
+        ``True`` if a valid non-identity affine correction was fitted and
+        applied before the second-pass local search.  ``False`` when the
+        identity transform was used.
+    affine_n_points : int
+        Number of first-pass candidate matches used to fit the affine
+        correction.  ``0`` when no first-pass candidates were available.
     """
 
     order_number: int
@@ -239,6 +254,10 @@ class OrderMatchStats:
     xcorr_shift_clipped: bool
     skipped_insufficient_matches: bool
     min_lines_required: int
+    affine_a: float = 1.0
+    affine_b: float = 0.0
+    affine_applied: bool = False
+    affine_n_points: int = 0
 
 
 @dataclass
@@ -605,12 +624,21 @@ def fit_1dxd_wavelength_model(
        reference comb (Gaussians placed at each reference-line column position
        predicted by the coarse wavelength grid) to determine a per-order
        column shift.
-    2. **Local expected-line search** — for each reference line expected in
-       this order, predict its detector column from the shifted coarse grid,
-       then search only within ``±local_search_window_px`` pixels of that
-       predicted column for the strongest local peak.  This replaces the
-       former global :func:`scipy.signal.find_peaks` + nearest-reference
-       matching strategy, yielding higher match yield and fewer ambiguities.
+    2. **Two-pass local expected-line search** — for each reference line
+       expected in this order:
+
+       * **Pass 1**: search within ``±adaptive_window`` pixels of the
+         xcorr-shifted predicted column.  Collect provisional matches.
+       * **Affine correction**: fit ``detected_col ≈ a × predicted_col + b``
+         from the provisional matches (falls back to identity when fewer
+         than 2 matches or if the slope is outside ``[0.95, 1.05]``).
+       * **Pass 2**: re-run the same local search using the affine-corrected
+         column predictions.  This second pass is the final match set used
+         for the global fit.
+
+       This two-pass approach corrects both the per-order translation (xcorr
+       shift) and a small residual slope/stretch, improving match yield for
+       orders where the coarse wavelength grid has a slight dispersion error.
 
     Then fit a single global 2-D polynomial across all matched points:
 
@@ -776,17 +804,43 @@ def fit_1dxd_wavelength_model(
         adaptive_window = max(local_search_window_px, int(abs(xcorr_shift)) + 5)
 
         # ------------------------------------------------------------------
-        # Step 2: Local expected-line search.
-        # For each reference line, search only within a small window of
-        # ±adaptive_window pixels near its predicted detector column.
-        # n_candidate = number of reference-line windows that yielded a peak.
-        # This IDL-style approach avoids the ambiguity that arises when
-        # hundreds of global peaks are matched against a sparse reference list.
+        # Step 2a: Pass 1 — local expected-line search with xcorr-shifted grid.
+        # For each reference line, search within ±adaptive_window pixels of
+        # its predicted column.  Results feed the per-order affine correction.
+        # ------------------------------------------------------------------
+        pass1_candidates, _ = _find_local_line_peaks(
+            flux,
+            spec.col_start,
+            shifted_coarse_cols,
+            coarse_wavs,
+            ref_entries,
+            local_window_px=adaptive_window,
+            min_prominence=min_prominence,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 2b: Fit a per-order affine column correction from pass-1 results.
+        # col_corrected = affine_a * shifted_coarse_col + affine_b
+        # Falls back to identity (a=1, b=0) when < 2 provisional matches or
+        # when the fitted slope is outside [0.95, 1.05].
+        # ------------------------------------------------------------------
+        affine_a, affine_b, affine_applied, affine_n_pts = _fit_affine_col_correction(
+            pass1_candidates, shifted_coarse_cols, coarse_wavs,
+        )
+        affine_coarse_cols = affine_a * shifted_coarse_cols + affine_b
+        logger.debug(
+            "Order %d: affine correction a=%.5f b=%.2f applied=%s (n_pts=%d)",
+            order_num, affine_a, affine_b, affine_applied, affine_n_pts,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 2c: Pass 2 — local expected-line search with affine-corrected grid.
+        # This is the final match set used for the global fit.
         # ------------------------------------------------------------------
         candidates, local_diag = _find_local_line_peaks(
             flux,
             spec.col_start,
-            shifted_coarse_cols,
+            affine_coarse_cols,
             coarse_wavs,
             ref_entries,
             local_window_px=adaptive_window,
@@ -804,6 +858,8 @@ def fit_1dxd_wavelength_model(
                 xcorr_shift_clipped=xcorr_shift_clipped,
                 skipped_insufficient_matches=False,
                 min_lines_required=min_lines_per_order,
+                affine_a=affine_a, affine_b=affine_b,
+                affine_applied=affine_applied, affine_n_points=affine_n_pts,
             ))
             continue
 
@@ -833,6 +889,8 @@ def fit_1dxd_wavelength_model(
                 xcorr_shift_clipped=xcorr_shift_clipped,
                 skipped_insufficient_matches=False,
                 min_lines_required=min_lines_per_order,
+                affine_a=affine_a, affine_b=affine_b,
+                affine_applied=affine_applied, affine_n_points=affine_n_pts,
             ))
             continue
 
@@ -855,6 +913,8 @@ def fit_1dxd_wavelength_model(
                 xcorr_shift_clipped=xcorr_shift_clipped,
                 skipped_insufficient_matches=True,
                 min_lines_required=min_lines_per_order,
+                affine_a=affine_a, affine_b=affine_b,
+                affine_applied=affine_applied, affine_n_points=affine_n_pts,
             ))
             continue
 
@@ -874,6 +934,8 @@ def fit_1dxd_wavelength_model(
             n_accepted=n_matched, n_rejected=0,
             rms_resid_um=float("nan"), participated=True,
             xcorr_shift_clipped=xcorr_shift_clipped,
+            affine_a=affine_a, affine_b=affine_b,
+            affine_applied=affine_applied, affine_n_points=affine_n_pts,
             skipped_insufficient_matches=False,
             min_lines_required=min_lines_per_order,
         ))
@@ -1348,6 +1410,68 @@ def _enforce_monotonic_matches(
 
     n_removed = len(sorted_matches) - len(filtered)
     return filtered, n_removed
+
+
+def _fit_affine_col_correction(
+    candidates: list[tuple[float, float]],
+    coarse_cols: npt.NDArray,
+    coarse_wavs: npt.NDArray,
+    *,
+    a_lo: float = 0.95,
+    a_hi: float = 1.05,
+) -> tuple[float, float, bool, int]:
+    """Fit an affine column correction from provisional first-pass candidates.
+
+    Given provisional ``(peak_col, ref_wav)`` pairs from the first-pass local
+    expected-line search, fits the affine mapping::
+
+        detected_col ≈ a * predicted_col + b
+
+    where ``predicted_col = interp(ref_wav, coarse_wavs, coarse_cols)``.
+
+    Parameters
+    ----------
+    candidates : list of (peak_col, ref_wav)
+        Provisional matches from the first-pass local search.
+    coarse_cols, coarse_wavs : ndarray
+        Coarse column→wavelength lookup (already xcorr-shifted).
+    a_lo, a_hi : float, default (0.95, 1.05)
+        Allowed range for the fitted slope.  If the slope falls outside this
+        range (pathological fit), the identity transform is returned.
+
+    Returns
+    -------
+    a : float
+        Fitted slope (``1.0`` for the identity transform).
+    b : float
+        Fitted intercept in pixels (``0.0`` for the identity transform).
+    applied : bool
+        ``True`` if a valid non-identity affine correction was fitted.
+    n_points : int
+        Number of provisional candidate matches used in the fit.
+    """
+    n_pts = len(candidates)
+    if n_pts < 2:
+        return 1.0, 0.0, False, n_pts
+
+    pred_cols = np.array(
+        [float(np.interp(ref_wav, coarse_wavs, coarse_cols)) for _, ref_wav in candidates],
+        dtype=float,
+    )
+    detected_cols = np.array([float(peak_col) for peak_col, _ in candidates], dtype=float)
+
+    # Fit detected_col = a * pred_col + b via least squares
+    X = np.column_stack([pred_cols, np.ones(n_pts)])
+    try:
+        coeffs_fit, _residuals, _rank, _singular = np.linalg.lstsq(X, detected_cols, rcond=None)
+        a, b = float(coeffs_fit[0]), float(coeffs_fit[1])
+    except (np.linalg.LinAlgError, ValueError):
+        return 1.0, 0.0, False, n_pts
+
+    if not (a_lo <= a <= a_hi):
+        return 1.0, 0.0, False, n_pts
+
+    return a, b, True, n_pts
 
 
 def _find_local_line_peaks(
