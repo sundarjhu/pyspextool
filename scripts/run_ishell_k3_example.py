@@ -430,6 +430,9 @@ class OrderDiagnostics1DXD:
     n_matched : int
         Number of peaks matched to a reference line after monotonicity
         filtering (before sigma clipping).
+    n_ambiguous_removed : int
+        Number of matches rejected because multiple peaks claimed the same
+        reference line.
     n_monotonic_removed : int
         Number of matches removed by monotonicity enforcement.
     n_accepted : int
@@ -441,17 +444,28 @@ class OrderDiagnostics1DXD:
         NaN if this order contributed no accepted points.
     participated : bool
         True if this order contributed at least one accepted point.
+    xcorr_shift_clipped : bool
+        True if the cross-correlation peak landed at the boundary of the
+        allowed search window, indicating the true shift may lie outside it.
+    skipped_insufficient_matches : bool
+        True if the order was excluded due to too few matched lines.
+    min_lines_required : int
+        Per-order minimum match threshold used for the global fit.
     """
 
     order_number: int
     xcorr_shift_px: float
     n_candidate: int
     n_matched: int
+    n_ambiguous_removed: int
     n_monotonic_removed: int
     n_accepted: int
     n_rejected: int
     rms_resid_nm: float
     participated: bool
+    xcorr_shift_clipped: bool
+    skipped_insufficient_matches: bool
+    min_lines_required: int
 
 
 def _build_1dxd_diagnostics(
@@ -479,11 +493,15 @@ def _build_1dxd_diagnostics(
             xcorr_shift_px=stat.xcorr_shift_px,
             n_candidate=stat.n_candidate,
             n_matched=stat.n_matched,
+            n_ambiguous_removed=stat.n_ambiguous_removed,
             n_monotonic_removed=stat.n_monotonic_removed,
             n_accepted=stat.n_accepted,
             n_rejected=stat.n_rejected,
             rms_resid_nm=rms_nm,
             participated=stat.participated,
+            xcorr_shift_clipped=stat.xcorr_shift_clipped,
+            skipped_insufficient_matches=stat.skipped_insufficient_matches,
+            min_lines_required=stat.min_lines_required,
         ))
     return diags
 
@@ -584,6 +602,64 @@ def _print_weak_order_warnings(diags: list[OrderCalibrationDiagnostics]) -> None
         print(f"  [!!]  Non-monotonic wavelength surface ({len(non_mono)}): {nums}")
 
 
+def _print_stage3b_order_table(k3_model: "IdlStyle1DXDModel") -> None:
+    """Print a compact per-order Stage 3b diagnostic table."""
+    stats = k3_model.per_order_stats
+    if not stats:
+        return
+    header = (
+        f"  {'order':>6}  {'xcorr_px':>9}  {'clip?':>5}  "
+        f"{'cand':>5}  {'ambig':>5}  {'mono':>5}  "
+        f"{'match':>5}  {'accept':>6}  {'part?':>5}"
+    )
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for s in sorted(stats, key=lambda x: x.order_number):
+        clipped = "Y" if s.xcorr_shift_clipped else "-"
+        part = "Y" if s.participated else "-"
+        print(
+            f"  {s.order_number:>6}  {s.xcorr_shift_px:>9.2f}  {clipped:>5}  "
+            f"{s.n_candidate:>5}  {s.n_ambiguous_removed:>5}  "
+            f"{s.n_monotonic_removed:>5}  "
+            f"{s.n_matched:>5}  {s.n_accepted:>6}  {part:>5}"
+        )
+
+
+def _print_stage3b_summary(k3_model: "IdlStyle1DXDModel") -> None:
+    """Print a grouped Stage 3b diagnostic summary."""
+    stats = sorted(k3_model.per_order_stats, key=lambda s: s.order_number)
+    skipped = [s for s in stats if s.skipped_insufficient_matches]
+    clipped = [s for s in stats if s.xcorr_shift_clipped]
+    ambig = [s for s in stats if s.n_ambiguous_removed > 0]
+    mono = [s for s in stats if s.n_monotonic_removed > 0]
+
+    print("  Stage 3b grouped diagnostics:")
+    print(
+        "    skipped_insufficient_matches: "
+        + (", ".join(str(s.order_number) for s in skipped) or "none")
+    )
+    print(
+        "    xcorr_shift_clipped: "
+        + (", ".join(str(s.order_number) for s in clipped) or "none")
+    )
+    print(
+        "    ambiguity_removed: "
+        + (
+            ", ".join(
+                f"{s.order_number}(n={s.n_ambiguous_removed})" for s in ambig
+            ) or "none"
+        )
+    )
+    print(
+        "    monotonic_removed: "
+        + (
+            ", ".join(
+                f"{s.order_number}(n={s.n_monotonic_removed})" for s in mono
+            ) or "none"
+        )
+    )
+
+
 def _export_diagnostics(
     diags: list[OrderCalibrationDiagnostics],
     out_dir: str,
@@ -624,6 +700,7 @@ def _export_diagnostics(
             row["1dxd_xcorr_shift_px"] = round(dxd.xcorr_shift_px, 3)
             row["1dxd_n_candidate"] = dxd.n_candidate
             row["1dxd_n_matched"] = dxd.n_matched
+            row["1dxd_n_ambiguous_removed"] = dxd.n_ambiguous_removed
             row["1dxd_n_monotonic_removed"] = dxd.n_monotonic_removed
             row["1dxd_n_accepted"] = dxd.n_accepted
             row["1dxd_n_rejected"] = dxd.n_rejected
@@ -632,6 +709,9 @@ def _export_diagnostics(
                 else round(dxd.rms_resid_nm, 6)
             )
             row["1dxd_participated"] = dxd.participated
+            row["1dxd_xcorr_shift_clipped"] = dxd.xcorr_shift_clipped
+            row["1dxd_skipped_insufficient_matches"] = dxd.skipped_insufficient_matches
+            row["1dxd_min_lines_required"] = dxd.min_lines_required
         rows.append(row)
 
     if fmt == "json":
@@ -1933,6 +2013,12 @@ def run_k3_example(
         print(f"    RMS = {k3_model.fit_rms_um * 1e3:.3f} nm  "
               f"median_res = {k3_model.median_residual_um * 1e3:.4f} nm")
         print(f"  Fitted orders: {k3_model.fitted_order_numbers}")
+
+        # Stage 3b per-order debug table (compact)
+        _print_stage3b_order_table(k3_model)
+        # Stage 3b grouped summary
+        _print_stage3b_summary(k3_model)
+
         _ok("Stage 3b — K3 1DXD wavelength calibration")
         completed["stage3b_k3_1dxd"] = True
     except Exception as exc:  # noqa: BLE001

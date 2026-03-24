@@ -196,6 +196,9 @@ class OrderMatchStats:
         Number of peaks that matched a reference line within the tolerance
         window and passed monotonicity filtering (before global sigma
         clipping).
+    n_ambiguous_removed : int
+        Number of reference-line matches rejected because multiple peaks
+        claimed the same reference line (ambiguity filtering).
     n_monotonic_removed : int
         Number of matches removed by monotonicity enforcement (wavelength
         must increase monotonically with detector column).
@@ -209,17 +212,31 @@ class OrderMatchStats:
     participated : bool
         ``True`` if this order contributed at least one accepted point to
         the global fit.
+    xcorr_shift_clipped : bool
+        ``True`` if the cross-correlation peak landed at the boundary of the
+        allowed search window, indicating the true shift may lie outside it.
+    skipped_insufficient_matches : bool
+        ``True`` if the order was excluded from the global fit because it
+        had fewer than the required minimum number of matched lines after
+        filtering.
+    min_lines_required : int
+        The per-order minimum-match threshold used when deciding whether
+        this order should participate in the global fit.
     """
 
     order_number: int
     xcorr_shift_px: float
     n_candidate: int
     n_matched: int
+    n_ambiguous_removed: int
     n_monotonic_removed: int
     n_accepted: int
     n_rejected: int
     rms_resid_um: float
     participated: bool
+    xcorr_shift_clipped: bool
+    skipped_insufficient_matches: bool
+    min_lines_required: int
 
 
 @dataclass
@@ -698,9 +715,13 @@ def fit_1dxd_wavelength_model(
             )
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=0.0,
-                n_candidate=0, n_matched=0, n_monotonic_removed=0,
+                n_candidate=0, n_matched=0, n_ambiguous_removed=0,
+                n_monotonic_removed=0,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=False,
+                skipped_insufficient_matches=False,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -713,9 +734,13 @@ def fit_1dxd_wavelength_model(
         if not valid_mask.any():
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=0.0,
-                n_candidate=0, n_matched=0, n_monotonic_removed=0,
+                n_candidate=0, n_matched=0, n_ambiguous_removed=0,
+                n_monotonic_removed=0,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=False,
+                skipped_insufficient_matches=False,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -723,7 +748,7 @@ def fit_1dxd_wavelength_model(
         # Step 1: Cross-correlate extracted spectrum against reference comb
         # to find the per-order column shift.
         # ------------------------------------------------------------------
-        xcorr_shift = _xcorr_order_shift(
+        xcorr_shift, xcorr_shift_clipped = _xcorr_order_shift(
             flux, coarse_cols, coarse_wavs, ref_entries,
             spec.col_start, max_shift_px=xcorr_max_shift_px,
         )
@@ -751,9 +776,13 @@ def fit_1dxd_wavelength_model(
             logger.debug("Order %d: no peaks found in 1D arc spectrum", order_num)
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=xcorr_shift,
-                n_candidate=0, n_matched=0, n_monotonic_removed=0,
+                n_candidate=0, n_matched=0, n_ambiguous_removed=0,
+                n_monotonic_removed=0,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=xcorr_shift_clipped,
+                skipped_insufficient_matches=False,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -784,9 +813,13 @@ def fit_1dxd_wavelength_model(
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=xcorr_shift,
                 n_candidate=n_candidate, n_matched=0,
+                n_ambiguous_removed=n_ambiguous_removed,
                 n_monotonic_removed=n_monotonic_removed,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=xcorr_shift_clipped,
+                skipped_insufficient_matches=False,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -802,9 +835,13 @@ def fit_1dxd_wavelength_model(
             per_order_stats.append(OrderMatchStats(
                 order_number=order_num, xcorr_shift_px=xcorr_shift,
                 n_candidate=n_candidate, n_matched=n_matched,
+                n_ambiguous_removed=n_ambiguous_removed,
                 n_monotonic_removed=n_monotonic_removed,
                 n_accepted=0, n_rejected=0,
                 rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=xcorr_shift_clipped,
+                skipped_insufficient_matches=True,
+                min_lines_required=min_lines_per_order,
             ))
             continue
 
@@ -819,9 +856,13 @@ def fit_1dxd_wavelength_model(
         per_order_stats.append(OrderMatchStats(
             order_number=order_num, xcorr_shift_px=xcorr_shift,
             n_candidate=n_candidate, n_matched=n_matched,
+            n_ambiguous_removed=n_ambiguous_removed,
             n_monotonic_removed=n_monotonic_removed,
             n_accepted=n_matched, n_rejected=0,
             rms_resid_um=float("nan"), participated=True,
+            xcorr_shift_clipped=xcorr_shift_clipped,
+            skipped_insufficient_matches=False,
+            min_lines_required=min_lines_per_order,
         ))
 
         logger.debug(
@@ -990,7 +1031,7 @@ def _xcorr_order_shift(
     *,
     max_shift_px: int = 50,
     fwhm_px: float = 3.0,
-) -> float:
+) -> tuple[float, bool]:
     """Compute the per-order column shift via cross-correlation.
 
     Builds a synthetic reference comb from the expected arc-line column
@@ -1001,6 +1042,11 @@ def _xcorr_order_shift(
     The shift is found from the peak of the cross-correlation within
     ``±max_shift_px`` pixels.  Sub-pixel accuracy is obtained by
     fitting a parabola through the three points around the peak.
+
+    The returned shift is always within ``[-max_shift_px, max_shift_px]``.
+    The boolean flag indicates whether the correlation peak landed at the
+    boundary of the search window — which suggests the true peak is outside
+    the allowed shift range and the result should be treated with caution.
 
     Parameters
     ----------
@@ -1019,18 +1065,25 @@ def _xcorr_order_shift(
 
     Returns
     -------
-    float
-        Cross-correlation shift in pixels.  A positive value means the
+    shift : float
+        Cross-correlation shift in pixels, clipped to
+        ``[-max_shift_px, max_shift_px]``.  A positive value means the
         extracted spectrum is shifted *right* relative to the reference.
         Returns ``0.0`` if no reference lines are available, the coarse
         grid is empty, or correlation fails.
+    was_clipped : bool
+        ``True`` if the correlation peak was found at the boundary of the
+        search window (index 0 or ``len(window)-1``), which indicates the
+        true peak is likely outside the allowed shift range and the returned
+        shift has been constrained.  ``False`` in the normal case, including
+        early-return paths that yield ``0.0``.
     """
     if len(ref_entries) == 0 or len(coarse_cols) == 0:
-        return 0.0
+        return 0.0, False
 
     n = len(flux)
     if n == 0:
-        return 0.0
+        return 0.0, False
 
     # Replace NaNs with zero for correlation
     flux_clean = np.where(np.isfinite(flux), flux, 0.0)
@@ -1060,7 +1113,7 @@ def _xcorr_order_shift(
         n_lines_in_comb += 1
 
     if n_lines_in_comb == 0:
-        return 0.0
+        return 0.0, False
 
     # Full cross-correlation (mode="full") gives a (2n-1,)-length result.
     # The zero-lag is at index n-1.
@@ -1072,6 +1125,9 @@ def _xcorr_order_shift(
 
     peak_idx_local = int(np.argmax(xcorr_window))
     peak_idx_global = lo + peak_idx_local
+    # True when the correlation argmax is at the boundary of the search window,
+    # indicating the true shift is likely outside the allowed range.
+    was_clipped = (peak_idx_local == 0 or peak_idx_local == len(xcorr_window) - 1)
 
     # Sub-pixel refinement via parabolic fit through three points
     if 0 < peak_idx_global < len(xcorr) - 1:
@@ -1086,11 +1142,12 @@ def _xcorr_order_shift(
     else:
         sub_shift = 0.0
 
-    # Shift relative to zero lag
-    shift = float(peak_idx_global - zero_lag) + sub_shift
-    # Clip to max_shift
-    shift = float(np.clip(shift, -max_shift_px, max_shift_px))
-    return shift
+    # Raw subpixel shift relative to zero lag
+    raw_shift = float(peak_idx_global - zero_lag) + sub_shift
+    # Clip to allowed window (raw_shift could slightly exceed ±max_shift_px
+    # due to the sub-pixel parabolic correction at the boundary)
+    clipped_shift = float(np.clip(raw_shift, -max_shift_px, max_shift_px))
+    return clipped_shift, was_clipped
 
 
 def _build_coarse_lookup_1d(
