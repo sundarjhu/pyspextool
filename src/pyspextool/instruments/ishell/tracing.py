@@ -440,6 +440,7 @@ class FlatOrderTrace:
     ``valid_orders_mask[i]`` is ``True``; the returned
     :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet` may
     therefore contain fewer orders than ``n_orders``.
+    Callers MUST NOT assume ``n_orders == n_valid_orders()``.
     """
 
     n_orders: int
@@ -525,6 +526,9 @@ class FlatOrderTrace:
             default_x_start, default_x_end = int(col_range[0]), int(col_range[1])
 
         geometries = []
+        # NOTE: FlatOrderTrace.n_orders counts all traced orders, including
+        # invalid ones.  OrderGeometrySet contains only valid orders (filtered
+        # by valid_orders_mask).
         # When valid_orders_mask is set (populated by trace_orders_from_flat),
         # iterate only over valid orders.  The resulting OrderGeometrySet
         # contains only valid orders; ordering is preserved but filtered.
