@@ -423,6 +423,23 @@ class FlatOrderTrace:
         ``order_samples`` when populated.
     order_stats : list of OrderTraceStats
         Per-order QA metrics.  Empty if constructed directly.
+    valid_orders_mask : ndarray of bool, shape (n_orders,), or None
+        Per-order validity flags.  ``True`` when the order has a valid fitted
+        geometry (finite bot/top polynomial coefficients **and** a non-sentinel
+        xrange ``[x_start, x_end]``).  ``False`` when the order was rejected
+        by the valid-edge-fraction guard (NaN coefficients, xrange ``(-1,-1)``).
+        Populated by :func:`trace_orders_from_flat`; ``None`` when the object
+        is constructed directly (backward-compatibility).
+
+    Notes
+    -----
+    ``n_orders`` reflects the **total** number of traced orders, including any
+    that were later invalidated by the fraction guard.
+    ``valid_orders_mask`` defines which of those orders are usable.
+    :meth:`to_order_geometry_set` only includes orders where
+    ``valid_orders_mask[i]`` is ``True``; the returned
+    :class:`~pyspextool.instruments.ishell.geometry.OrderGeometrySet` may
+    therefore contain fewer orders than ``n_orders``.
     """
 
     n_orders: int
@@ -438,6 +455,17 @@ class FlatOrderTrace:
     order_xranges: Optional[np.ndarray] = None
     order_samples: list[OrderTraceSamples] = field(default_factory=list)
     order_stats: list[OrderTraceStats] = field(default_factory=list)
+    valid_orders_mask: Optional[np.ndarray] = None
+
+    def n_valid_orders(self) -> int:
+        """Return the number of orders with valid fitted geometry.
+
+        Returns ``n_orders`` when ``valid_orders_mask`` is ``None``
+        (direct-construction path where all orders are assumed valid).
+        """
+        if self.valid_orders_mask is None:
+            return self.n_orders
+        return int(np.sum(self.valid_orders_mask))
 
     def to_order_geometry_set(
         self,
@@ -497,7 +525,18 @@ class FlatOrderTrace:
             default_x_start, default_x_end = int(col_range[0]), int(col_range[1])
 
         geometries = []
-        for i in range(self.n_orders):
+        # When valid_orders_mask is set (populated by trace_orders_from_flat),
+        # iterate only over valid orders.  The resulting OrderGeometrySet
+        # contains only valid orders; ordering is preserved but filtered.
+        # When valid_orders_mask is None (direct-construction path), process
+        # all indices — the sentinel-xrange and NaN-coeff guards below still
+        # apply as a safety net.
+        if self.valid_orders_mask is not None:
+            order_indices = [i for i in range(self.n_orders) if self.valid_orders_mask[i]]
+        else:
+            order_indices = list(range(self.n_orders))
+
+        for i in order_indices:
             # Per-order x-range: use order_xranges when available (IDL path).
             if self.order_xranges is not None:
                 x_start = int(self.order_xranges[i, 0])
@@ -1005,6 +1044,18 @@ def trace_orders_from_flat(
         float(np.nanmedian(fit_rms)),
     )
 
+    # Compute valid_orders_mask: True for orders with finite edge coefficients
+    # AND a non-sentinel xrange.  This explicitly encodes which orders have
+    # usable fitted geometry, so that to_order_geometry_set() and callers do
+    # not need to re-derive validity from NaN propagation.
+    valid_orders_mask = np.array([
+        np.all(np.isfinite(bot_poly_coeffs[i]))
+        and np.all(np.isfinite(top_poly_coeffs[i]))
+        and int(traced_xranges_out[i, 0]) != -1
+        and int(traced_xranges_out[i, 1]) != -1
+        for i in range(n_orders)
+    ], dtype=bool)
+
     return FlatOrderTrace(
         n_orders=n_orders,
         order_samples=order_samples,
@@ -1019,6 +1070,7 @@ def trace_orders_from_flat(
         top_poly_coeffs=top_poly_coeffs,
         order_xranges=traced_xranges_out,
         order_stats=order_stats,
+        valid_orders_mask=valid_orders_mask,
     )
 
 

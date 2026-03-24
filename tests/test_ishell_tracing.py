@@ -5364,6 +5364,101 @@ class TestValidEdgePairMaskFitIsolation:
         )
 
 
+# ---------------------------------------------------------------------------
+# TestValidOrdersMask
+# ---------------------------------------------------------------------------
+
+
+class TestValidOrdersMask:
+    """Tests for FlatOrderTrace.valid_orders_mask and n_valid_orders()."""
+
+    def _make_trace(self, *, invalid_order: bool) -> "FlatOrderTrace":
+        """Return a FlatOrderTrace with two orders.
+
+        When *invalid_order* is True, order 1 has NaN coefficients and
+        sentinel xrange.  When False, both orders are valid.
+        """
+        from pyspextool.instruments.ishell.tracing import FlatOrderTrace
+        import numpy as np
+
+        poly_degree = 3
+        n_coeff = poly_degree + 1
+        valid_bot = np.array([100.0, 0.0, 0.0, 0.0])
+        valid_top = np.array([120.0, 0.0, 0.0, 0.0])
+        valid_cen = (valid_bot + valid_top) / 2.0
+
+        if invalid_order:
+            nan_coeffs = np.full(n_coeff, np.nan)
+            bot_poly = np.stack([valid_bot, nan_coeffs])
+            top_poly = np.stack([valid_top, nan_coeffs])
+            cen_poly = np.stack([valid_cen, nan_coeffs])
+            xranges = np.array([[50, 450], [-1, -1]])
+            mask = np.array([True, False])
+        else:
+            valid_bot2 = np.array([200.0, 0.0, 0.0, 0.0])
+            valid_top2 = np.array([220.0, 0.0, 0.0, 0.0])
+            valid_cen2 = (valid_bot2 + valid_top2) / 2.0
+            bot_poly = np.stack([valid_bot, valid_bot2])
+            top_poly = np.stack([valid_top, valid_top2])
+            cen_poly = np.stack([valid_cen, valid_cen2])
+            xranges = np.array([[50, 450], [50, 450]])
+            mask = np.array([True, True])
+
+        return FlatOrderTrace(
+            n_orders=2,
+            sample_cols=np.arange(50, 451, 10, dtype=int),
+            center_rows=np.zeros((2, 41)),
+            center_poly_coeffs=cen_poly,
+            fit_rms=np.array([0.5, 0.5 if not invalid_order else np.nan]),
+            half_width_rows=np.array([10.0, 10.0]),
+            poly_degree=poly_degree,
+            seed_col=250,
+            bot_poly_coeffs=bot_poly,
+            top_poly_coeffs=top_poly,
+            order_xranges=xranges,
+            valid_orders_mask=mask,
+        )
+
+    def test_mixed_n_valid_orders_less_than_n_orders(self):
+        """With one invalid order: n_valid_orders() < n_orders."""
+        trace = self._make_trace(invalid_order=True)
+        assert trace.n_orders == 2
+        assert trace.n_valid_orders() == 1
+        assert trace.n_orders > trace.n_valid_orders()
+
+    def test_mixed_geom_n_orders_equals_n_valid_orders(self):
+        """With one invalid order: geom.n_orders == trace.n_valid_orders()."""
+        trace = self._make_trace(invalid_order=True)
+        geom = trace.to_order_geometry_set(mode="K3")
+        assert geom.n_orders == trace.n_valid_orders()
+        assert geom.n_orders == 1
+
+    def test_all_valid_n_valid_equals_n_orders(self):
+        """With all valid orders: n_orders == n_valid_orders() == geom.n_orders."""
+        trace = self._make_trace(invalid_order=False)
+        geom = trace.to_order_geometry_set(mode="K3")
+        assert trace.n_orders == trace.n_valid_orders()
+        assert trace.n_orders == geom.n_orders
+        assert trace.n_orders == 2
+
+    def test_n_valid_orders_none_mask_returns_n_orders(self):
+        """When valid_orders_mask is None, n_valid_orders() returns n_orders."""
+        from pyspextool.instruments.ishell.tracing import FlatOrderTrace
+        import numpy as np
+
+        trace = FlatOrderTrace(
+            n_orders=3,
+            sample_cols=np.arange(10),
+            center_rows=np.ones((3, 10)) * 100.0,
+            center_poly_coeffs=np.zeros((3, 4)),
+            fit_rms=np.ones(3),
+            half_width_rows=np.full(3, 15.0),
+            poly_degree=3,
+            seed_col=5,
+        )
+        # valid_orders_mask is None → backward compat: all orders count as valid
+        assert trace.valid_orders_mask is None
+        assert trace.n_valid_orders() == 3
 
 
 
