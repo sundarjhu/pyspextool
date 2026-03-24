@@ -59,6 +59,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import numpy.typing as npt
 from scipy.signal import correlate as _scipy_correlate
+from scipy.signal import find_peaks as _scipy_find_peaks
 
 if TYPE_CHECKING:
     from .calibrations import LineList, WaveCalInfo
@@ -239,6 +240,14 @@ class OrderMatchStats:
     affine_n_points : int
         Number of first-pass candidate matches used to fit the affine
         correction.  ``0`` when no first-pass candidates were available.
+    used_fallback : bool
+        ``True`` if the fallback global peak search was triggered for this
+        order (because the local search produced fewer than
+        ``min_lines_per_order`` matches) and the fallback produced enough
+        matches to rescue the order.  ``False`` in the normal case.
+    fallback_n_matches : int
+        Number of matches returned by the fallback global peak search.
+        ``0`` when fallback was not triggered or produced no matches.
     """
 
     order_number: int
@@ -258,6 +267,8 @@ class OrderMatchStats:
     affine_b: float = 0.0
     affine_applied: bool = False
     affine_n_points: int = 0
+    used_fallback: bool = False
+    fallback_n_matches: int = 0
 
 
 @dataclass
@@ -897,26 +908,55 @@ def fit_1dxd_wavelength_model(
         # ------------------------------------------------------------------
         # Per-order minimum-match threshold: exclude weakly constrained
         # orders from the global fit to avoid destabilising the polynomial.
+        # If local search produces too few matches, try the fallback global
+        # peak search before giving up.
         # ------------------------------------------------------------------
+        used_fallback = False
+        fallback_n_matches = 0
         if n_matched < min_lines_per_order:
             logger.debug(
-                "Order %d skipped: insufficient matches (%d < %d)",
+                "Order %d: local matches insufficient (%d < %d); "
+                "trying fallback global peak search",
                 order_num, n_matched, min_lines_per_order,
             )
-            per_order_stats.append(OrderMatchStats(
-                order_number=order_num, xcorr_shift_px=xcorr_shift,
-                n_candidate=n_candidate, n_matched=n_matched,
-                n_ambiguous_removed=n_ambiguous_removed,
-                n_monotonic_removed=n_monotonic_removed,
-                n_accepted=0, n_rejected=0,
-                rms_resid_um=float("nan"), participated=False,
-                xcorr_shift_clipped=xcorr_shift_clipped,
-                skipped_insufficient_matches=True,
-                min_lines_required=min_lines_per_order,
-                affine_a=affine_a, affine_b=affine_b,
-                affine_applied=affine_applied, affine_n_points=affine_n_pts,
-            ))
-            continue
+            fallback_matches = _fallback_global_line_match(
+                flux,
+                spec.col_start,
+                affine_coarse_cols,
+                coarse_wavs,
+                ref_entries,
+                min_prominence=min_prominence,
+            )
+            fallback_n_matches = len(fallback_matches)
+            logger.debug(
+                "Order %d: fallback used: %s, fallback matches = %d",
+                order_num, fallback_n_matches >= min_lines_per_order,
+                fallback_n_matches,
+            )
+            if fallback_n_matches >= min_lines_per_order:
+                used_fallback = True
+                matches = fallback_matches
+                n_matched = fallback_n_matches
+            else:
+                logger.debug(
+                    "Order %d skipped: fallback insufficient (%d < %d)",
+                    order_num, fallback_n_matches, min_lines_per_order,
+                )
+                per_order_stats.append(OrderMatchStats(
+                    order_number=order_num, xcorr_shift_px=xcorr_shift,
+                    n_candidate=n_candidate, n_matched=n_matched,
+                    n_ambiguous_removed=n_ambiguous_removed,
+                    n_monotonic_removed=n_monotonic_removed,
+                    n_accepted=0, n_rejected=0,
+                    rms_resid_um=float("nan"), participated=False,
+                    xcorr_shift_clipped=xcorr_shift_clipped,
+                    skipped_insufficient_matches=True,
+                    min_lines_required=min_lines_per_order,
+                    affine_a=affine_a, affine_b=affine_b,
+                    affine_applied=affine_applied, affine_n_points=affine_n_pts,
+                    used_fallback=False, fallback_n_matches=fallback_n_matches,
+                ))
+                continue
 
         for col_m, wav_m in matches:
             all_cols.append(col_m)
@@ -938,6 +978,7 @@ def fit_1dxd_wavelength_model(
             affine_applied=affine_applied, affine_n_points=affine_n_pts,
             skipped_insufficient_matches=False,
             min_lines_required=min_lines_per_order,
+            used_fallback=used_fallback, fallback_n_matches=fallback_n_matches,
         ))
 
         logger.debug(
@@ -1650,3 +1691,116 @@ def _find_local_line_peaks(
         "n_windows_with_peak": n_with_peak,
         "n_windows_empty": n_empty,
     }
+
+
+def _fallback_global_line_match(
+    flux: npt.NDArray,
+    col_start: int,
+    affine_coarse_cols: npt.NDArray,
+    coarse_wavs: npt.NDArray,
+    ref_entries: list[tuple[float, str]],
+    *,
+    min_prominence: float = 50.0,
+    min_distance: int = 5,
+    match_tol_um: float = 0.0005,
+) -> list[tuple[float, float]]:
+    """Fallback global peak search for orders where local search fails.
+
+    Detects peaks across the full 1-D arc spectrum and attempts to match
+    them to reference lines in wavelength space.  This is called ONLY when
+    the two-pass local expected-line search produces fewer than
+    ``min_lines_per_order`` matches.  It must NOT replace the IDL-style
+    local search for well-behaved orders.
+
+    Parameters
+    ----------
+    flux : ndarray, shape (n_cols,)
+        Extracted 1-D arc spectrum for this order.
+    col_start : int
+        Detector column corresponding to ``flux[0]``.
+    affine_coarse_cols : ndarray
+        Coarse column lookup already shifted by xcorr and affine correction.
+    coarse_wavs : ndarray
+        Coarse wavelength values (µm) corresponding to *affine_coarse_cols*.
+        Must be monotonically ordered for :func:`numpy.interp`.
+    ref_entries : list of (float, str)
+        Reference line ``(wavelength_um, species)`` pairs for this order.
+    min_prominence : float, default 50.0
+        Minimum prominence (in detector counts) for a global peak to be
+        considered as an arc-line candidate.
+    min_distance : int, default 5
+        Minimum separation (in pixels) between detected peaks.
+    match_tol_um : float, default 0.0005
+        Maximum allowed wavelength residual (µm) between a detected peak's
+        predicted wavelength and the nearest reference line.  The default
+        0.0005 µm equals 0.5 nm (1 µm = 1000 nm).
+
+    Returns
+    -------
+    matches : list of (col, ref_wavelength_um)
+        Matched and monotonicity-filtered (col, reference-wavelength) pairs.
+        Returns an empty list when fewer matches are found or when the
+        fallback cannot improve on the local result.
+
+    Notes
+    -----
+    Monotonicity (wavelength must increase with column) is enforced via
+    :func:`_enforce_monotonic_matches`.  Duplicate matches (two detected
+    peaks claiming the same reference line) are resolved by keeping the
+    one with the smallest wavelength residual.
+    """
+    if len(ref_entries) == 0 or len(affine_coarse_cols) == 0:
+        return []
+
+    n_flux = len(flux)
+    if n_flux == 0:
+        return []
+
+    # Replace NaNs with zero for peak finding
+    flux_clean = np.where(np.isfinite(flux), flux, 0.0)
+
+    # Step 1: Detect peaks across the full 1-D spectrum
+    peak_indices, _ = _scipy_find_peaks(
+        flux_clean,
+        prominence=min_prominence,
+        distance=min_distance,
+    )
+    if len(peak_indices) == 0:
+        return []
+
+    # Convert peak local indices to absolute detector columns
+    peak_cols = (peak_indices + col_start).astype(float)
+
+    # Step 2: Convert peak columns to wavelengths using the current model
+    col_min = float(affine_coarse_cols[0])
+    col_max = float(affine_coarse_cols[-1])
+    ref_wavs = np.array([e[0] for e in ref_entries], dtype=float)
+
+    # Step 3 & 4: Match each detected peak to nearest reference line within
+    # tolerance, keeping only the best match per reference line.
+    # best: ref_idx → (col, ref_wav, wav_residual)
+    best: dict[int, tuple[float, float, float]] = {}
+
+    for peak_col in peak_cols:
+        if peak_col < col_min or peak_col > col_max:
+            continue
+
+        pred_wav = float(np.interp(peak_col, affine_coarse_cols, coarse_wavs))
+        diffs = np.abs(ref_wavs - pred_wav)
+        best_ref_idx = int(np.argmin(diffs))
+        wav_residual = float(diffs[best_ref_idx])
+
+        if wav_residual > match_tol_um:
+            continue
+
+        ref_wav = float(ref_wavs[best_ref_idx])
+
+        # Keep only the closest peak for each reference line
+        if best_ref_idx not in best or wav_residual < best[best_ref_idx][2]:
+            best[best_ref_idx] = (peak_col, ref_wav, wav_residual)
+
+    raw_matches = [(col, wav) for col, wav, _ in best.values()]
+
+    # Step 5: Enforce monotonicity (wavelength must increase with column)
+    filtered, _ = _enforce_monotonic_matches(raw_matches)
+    return filtered

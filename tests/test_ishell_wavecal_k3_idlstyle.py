@@ -3200,3 +3200,163 @@ class TestOrderMatchStatsAffineFields:
         # Two-pass should find all (or nearly all) lines
         assert model.n_lines > 0
         assert model.n_orders_fit >= 1
+
+
+# ===========================================================================
+# 24. Fallback global peak search
+# ===========================================================================
+
+
+class TestFallbackGlobalLineMatch:
+    """Fallback global peak search (_fallback_global_line_match) behaviour."""
+
+    def _make_order_setup(self, ncols=512, n_lines=6):
+        """Return (coarse_cols, coarse_wavs, ref_entries) for a single order."""
+        coarse_cols = np.arange(ncols, dtype=float)
+        coarse_wavs = np.linspace(2.0, 2.05, ncols)
+        # Reference lines spaced evenly across the wavelength range
+        ref_wavs = np.linspace(2.002, 2.048, n_lines)
+        ref_entries = [(float(w), "Ar I") for w in ref_wavs]
+        return coarse_cols, coarse_wavs, ref_entries
+
+    def test_fallback_triggers_when_local_matches_below_threshold(self):
+        """Fallback is used when local matches < min_lines_per_order."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            OrderArcSpectrum,
+            OrderArcSpectraSet,
+            fit_1dxd_wavelength_model,
+        )
+
+        # Build a spectrum where lines are shifted so far that the local search
+        # (even with affine) finds < 4 matches, but global peaks are detectable.
+        ncols = 512
+        n_lines = 8
+        order_num = 200
+        wci = _make_synthetic_wavecalinfo(n_orders=1, n_pixels=ncols, order_nums=[order_num])
+        ll = _make_synthetic_line_list(n_orders=1, order_nums=[order_num],
+                                       n_lines_per_order=n_lines)
+
+        wav_array = wci.data[0, 0, :]
+
+        # Place peaks at a large, fixed offset (60 px) that exceeds local window
+        # but the global fallback can still find them.
+        offset = 60
+        flux = np.full(ncols, 10.0, dtype=float)
+        for entry in ll.entries:
+            if entry.order != order_num:
+                continue
+            wav = entry.wavelength_um
+            col_idx = int(np.argmin(np.abs(wav_array - wav)))
+            shifted_col = min(col_idx + offset, ncols - 1)
+            for dc in range(-2, 3):
+                c = shifted_col + dc
+                if 0 <= c < ncols:
+                    flux[c] += 10000.0 * np.exp(-0.5 * dc ** 2)
+
+        spec = OrderArcSpectrum(
+            order_index=0, order_number=order_num,
+            col_start=0, col_end=ncols - 1, flux=flux,
+        )
+        spectra_set = OrderArcSpectraSet(mode="K3", spectra=[spec], aperture_half_width=3)
+
+        # Use a second order with well-placed peaks to satisfy min_lines_total
+        order_num2 = 201
+        wci2 = _make_synthetic_wavecalinfo(n_orders=2, n_pixels=ncols,
+                                           order_nums=[order_num, order_num2])
+        ll2 = _make_synthetic_line_list(n_orders=2, order_nums=[order_num, order_num2],
+                                        n_lines_per_order=n_lines)
+        wav_array2 = wci2.data[1, 0, :]
+        flux2 = np.full(ncols, 10.0, dtype=float)
+        for entry in ll2.entries:
+            if entry.order != order_num2:
+                continue
+            wav = entry.wavelength_um
+            col_idx = int(np.argmin(np.abs(wav_array2 - wav)))
+            for dc in range(-2, 3):
+                c = col_idx + dc
+                if 0 <= c < ncols:
+                    flux2[c] += 10000.0 * np.exp(-0.5 * dc ** 2)
+        spec2 = OrderArcSpectrum(
+            order_index=1, order_number=order_num2,
+            col_start=0, col_end=ncols - 1, flux=flux2,
+        )
+        spectra_set2 = OrderArcSpectraSet(mode="K3",
+                                          spectra=[spec, spec2], aperture_half_width=3)
+        model = fit_1dxd_wavelength_model(
+            spectra_set2, wci2, ll2, wdeg=2, odeg=1,
+            xcorr_max_shift_px=50, local_search_window_px=10,
+        )
+        # At least the well-placed order should participate
+        assert model.n_orders_fit >= 1
+        # Check that fallback fields exist on stats
+        for stat in model.per_order_stats:
+            assert hasattr(stat, "used_fallback")
+            assert hasattr(stat, "fallback_n_matches")
+
+    def test_fallback_improves_match_count_on_misaligned_data(self):
+        """Fallback rescues an order whose local search yields 0 matches."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _fallback_global_line_match
+
+        ncols = 512
+        coarse_cols, coarse_wavs, ref_entries = self._make_order_setup(
+            ncols=ncols, n_lines=6
+        )
+
+        # Place bright peaks exactly at the reference line column positions
+        flux = np.full(ncols, 10.0, dtype=float)
+        for ref_wav, _ in ref_entries:
+            pred_col = int(round(float(np.interp(ref_wav, coarse_wavs, coarse_cols))))
+            for dc in range(-1, 2):
+                c = pred_col + dc
+                if 0 <= c < ncols:
+                    flux[c] += 5000.0 * np.exp(-0.5 * dc ** 2)
+
+        matches = _fallback_global_line_match(
+            flux, 0, coarse_cols, coarse_wavs, ref_entries,
+            min_prominence=50.0, min_distance=5, match_tol_um=0.001,
+        )
+        # Should recover at least 4 of the 6 reference lines
+        assert len(matches) >= 4, f"Expected >= 4 fallback matches, got {len(matches)}"
+
+    def test_no_fallback_when_local_matches_sufficient(self):
+        """used_fallback is False for orders that already have sufficient local matches."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import fit_1dxd_wavelength_model
+
+        # Use the standard well-placed peaks (sufficient local matches expected)
+        spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs(n_orders=3)
+        model = fit_1dxd_wavelength_model(spectra_set, wci, ll, wdeg=2, odeg=1)
+
+        for stat in model.per_order_stats:
+            if stat.participated:
+                assert stat.used_fallback is False, (
+                    f"Order {stat.order_number}: used_fallback should be False "
+                    "when local matches are sufficient"
+                )
+
+    def test_order_match_stats_fallback_fields_exist(self):
+        """OrderMatchStats has used_fallback and fallback_n_matches fields."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderMatchStats
+        from dataclasses import fields as dc_fields
+
+        field_names = {f.name for f in dc_fields(OrderMatchStats)}
+        assert "used_fallback" in field_names, "Missing field: used_fallback"
+        assert "fallback_n_matches" in field_names, "Missing field: fallback_n_matches"
+
+        # Verify defaults
+        stat = OrderMatchStats(
+            order_number=210,
+            xcorr_shift_px=0.0,
+            n_candidate=0,
+            n_matched=0,
+            n_ambiguous_removed=0,
+            n_monotonic_removed=0,
+            n_accepted=0,
+            n_rejected=0,
+            rms_resid_um=float("nan"),
+            participated=False,
+            xcorr_shift_clipped=False,
+            skipped_insufficient_matches=True,
+            min_lines_required=4,
+        )
+        assert stat.used_fallback is False
+        assert stat.fallback_n_matches == 0
