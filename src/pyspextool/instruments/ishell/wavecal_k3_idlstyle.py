@@ -595,7 +595,7 @@ def fit_1dxd_wavelength_model(
     sigma_thresh: float = 3.0,
     max_sigma_iter: int = 5,
     xcorr_max_shift_px: int = 50,
-    local_search_window_px: int = 6,
+    local_search_window_px: int = 20,
 ) -> IdlStyle1DXDModel:
     """Fit a global IDL-style 1DXD wavelength model across all echelle orders.
 
@@ -668,11 +668,12 @@ def fit_1dxd_wavelength_model(
     xcorr_max_shift_px : int, default 50
         Maximum absolute column shift (pixels) allowed by the
         cross-correlation.  Shifts larger than this are clipped to ±50.
-    local_search_window_px : int, default 6
-        Half-width of the local search window in pixels.  For each
-        reference line, the arc-line candidate is searched in the range
-        ``[predicted_col - local_search_window_px,
-        predicted_col + local_search_window_px]``.
+    local_search_window_px : int, default 20
+        Base half-width of the local search window in pixels.  The effective
+        window used per order is:
+        ``max(local_search_window_px, int(abs(xcorr_shift)) + 5)``,
+        so that the window expands automatically when the cross-correlation
+        shift is large (indicating a coarser-than-expected wavelength grid).
 
     Returns
     -------
@@ -769,10 +770,15 @@ def fit_1dxd_wavelength_model(
         # columns to compensate.
         shifted_coarse_cols = coarse_cols + xcorr_shift
 
+        # Expand the search window when xcorr reports a large shift — this
+        # compensates for coarse-grid prediction errors that exceed the base
+        # window size.
+        adaptive_window = max(local_search_window_px, int(abs(xcorr_shift)) + 5)
+
         # ------------------------------------------------------------------
         # Step 2: Local expected-line search.
         # For each reference line, search only within a small window of
-        # ±local_search_window_px pixels near its predicted detector column.
+        # ±adaptive_window pixels near its predicted detector column.
         # n_candidate = number of reference-line windows that yielded a peak.
         # This IDL-style approach avoids the ambiguity that arises when
         # hundreds of global peaks are matched against a sparse reference list.
@@ -783,7 +789,7 @@ def fit_1dxd_wavelength_model(
             shifted_coarse_cols,
             coarse_wavs,
             ref_entries,
-            local_window_px=local_search_window_px,
+            local_window_px=adaptive_window,
             min_prominence=min_prominence,
         )
         n_candidate = local_diag["n_windows_with_peak"]
@@ -1351,7 +1357,7 @@ def _find_local_line_peaks(
     coarse_wavs: npt.NDArray,
     ref_entries: list[tuple[float, str]],
     *,
-    local_window_px: int = 6,
+    local_window_px: int = 20,
     min_prominence: float = 50.0,
 ) -> tuple[list[tuple[float, float]], dict]:
     """Search locally near each expected reference-line column for a peak.
@@ -1364,6 +1370,12 @@ def _find_local_line_peaks(
     we search *only* near where each line is expected, avoiding the ambiguity
     that arises when hundreds of global peaks are matched against a sparse
     reference list.
+
+    Before selecting the peak the window flux is smoothed with a 3-pixel
+    box-car filter so that isolated single-pixel noise spikes do not
+    dominate the argmax.  Prominence is evaluated on the **raw** (unsmoothed)
+    window so that the threshold retains its physical meaning in detector
+    counts.
 
     Parameters
     ----------
@@ -1379,13 +1391,14 @@ def _find_local_line_peaks(
         correctly.
     ref_entries : list of (float, str)
         Reference line ``(wavelength_um, species)`` pairs for this order.
-    local_window_px : int, default 6
+    local_window_px : int, default 20
         Half-width of the local search window in pixels.  For each reference
         line the window spans
         ``[predicted_col - local_window_px, predicted_col + local_window_px]``.
     min_prominence : float, default 50.0
         Minimum local prominence (peak value minus window floor, in detector
         counts) required for a peak to be accepted as a candidate.
+        Prominence is measured on the raw (unsmoothed) window flux.
 
     Returns
     -------
@@ -1443,9 +1456,22 @@ def _find_local_line_peaks(
         if not finite_mask.any():
             continue
 
-        # Find the index of the highest finite value in the window
-        masked_flux = np.where(finite_mask, window_flux, -np.inf)
-        peak_local_idx = int(np.argmax(masked_flux))
+        # Smooth the window with a 3-pixel box-car to suppress single-pixel
+        # noise spikes.  Use the smoothed signal only to locate the peak
+        # index; raw flux is used for prominence measurement.
+        raw_flux = np.where(finite_mask, window_flux, 0.0)
+        if len(raw_flux) >= 3:
+            kernel = np.ones(3) / 3.0
+            smoothed = np.convolve(raw_flux, kernel, mode="same")
+            # Edges of the convolution are less reliable; reset to raw there
+            smoothed[0] = raw_flux[0]
+            smoothed[-1] = raw_flux[-1]
+        else:
+            smoothed = raw_flux
+
+        # Find peak on the smoothed signal; measure prominence on raw flux
+        smooth_masked = np.where(finite_mask, smoothed, -np.inf)
+        peak_local_idx = int(np.argmax(smooth_masked))
         peak_val = float(window_flux[peak_local_idx])
         window_floor = float(np.nanmin(window_flux))
         local_prominence = peak_val - window_floor

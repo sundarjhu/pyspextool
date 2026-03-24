@@ -1259,6 +1259,136 @@ class TestFindLocalLinePeaks:
         # Only the in-range line at 2.02 µm should be considered
         assert diag["n_reference_lines_considered"] <= 1
 
+    def test_larger_window_finds_peaks_shifted_far(self):
+        """A peak shifted well outside window=6 is found with window=20."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        ncols = 512
+        # Simple coarse grid
+        cols = np.arange(ncols, dtype=float)
+        wavs = np.linspace(2.0, 2.05, ncols)
+        ref_entries = [(2.025, "ArI")]  # predicted at col ~256
+
+        # Place a real peak at col 270 (14 px away from prediction)
+        flux = np.full(ncols, 10.0, dtype=float)
+        for dc in range(-2, 3):
+            c = 270 + dc
+            if 0 <= c < ncols:
+                flux[c] += 5000.0 * np.exp(-0.5 * dc ** 2)
+
+        # window=6 should miss it; window=20 should find it
+        cands_narrow, _ = _find_local_line_peaks(
+            flux, 0, cols, wavs, ref_entries,
+            local_window_px=6, min_prominence=100.0,
+        )
+        cands_wide, _ = _find_local_line_peaks(
+            flux, 0, cols, wavs, ref_entries,
+            local_window_px=20, min_prominence=100.0,
+        )
+        assert len(cands_narrow) == 0, "Narrow window should miss the shifted peak"
+        assert len(cands_wide) == 1, "Wide window should find the shifted peak"
+
+    def test_smoothing_suppresses_isolated_spike(self):
+        """Smoothing steers peak selection away from an isolated spike toward a broad line.
+
+        The raw spike is taller than the arc-line peak, but the broad arc
+        line wins in the smoothed signal because its neighbours are also
+        elevated.  This verifies that the 3-pixel box-car smoothing in
+        _find_local_line_peaks() is effective against isolated single-pixel
+        spikes.
+        """
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _find_local_line_peaks
+
+        ncols = 256
+        cols = np.arange(ncols, dtype=float)
+        wavs = np.linspace(2.0, 2.05, ncols)
+        ref_entries = [(2.025, "ArI")]  # predicted ~col 128
+
+        flux = np.full(ncols, 10.0, dtype=float)
+        # Broad real arc line centred at col 128 (sigma=2 px, amplitude 3000)
+        # Smoothed value at col 128 ≈ (flux[127]+flux[128]+flux[129])/3
+        #   ≈ (2656 + 3010 + 2656) / 3 ≈ 2774
+        for dc in range(-5, 6):
+            c = 128 + dc
+            if 0 <= c < ncols:
+                flux[c] += 3000.0 * np.exp(-0.5 * (dc / 2.0) ** 2)
+
+        # Isolated single-pixel spike at col 148 (no elevated neighbours)
+        # Raw amplitude 8000 > arc peak 3000, but smoothed value at 148
+        # ≈ (flux[147]+flux[148]+flux[149])/3 ≈ (10+8010+10)/3 ≈ 2677 < 2774
+        flux[148] += 8000.0
+
+        cands, diag = _find_local_line_peaks(
+            flux, 0, cols, wavs, ref_entries,
+            local_window_px=25, min_prominence=100.0,
+        )
+        assert len(cands) == 1
+        peak_col = cands[0][0]
+        # With smoothing the broad arc line wins; without it the spike would win.
+        assert abs(peak_col - 128) < abs(peak_col - 148), (
+            f"Smoothing should steer peak to the broad arc line (~col 128), "
+            f"not the isolated spike (col 148). Got peak_col={peak_col:.1f}"
+        )
+
+
+class TestAdaptiveWindowInFit:
+    """fit_1dxd_wavelength_model uses adaptive window based on xcorr shift."""
+
+    def test_default_local_search_window_is_20(self):
+        """Default local_search_window_px should be 20."""
+        import inspect
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        sig = inspect.signature(fit_1dxd_wavelength_model)
+        default = sig.parameters["local_search_window_px"].default
+        assert default == 20, f"Expected default=20, got {default}"
+
+    def test_large_xcorr_shift_does_not_prevent_matching(self):
+        """When xcorr shift is large, adaptive window should still find lines."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            OrderArcSpectrum,
+            OrderArcSpectraSet,
+            fit_1dxd_wavelength_model,
+        )
+
+        n_orders = 3
+        ncols = 512
+        order_nums = [200 + i for i in range(n_orders)]
+        wci = _make_synthetic_wavecalinfo(n_orders=n_orders, n_pixels=ncols,
+                                          order_nums=order_nums)
+        ll = _make_synthetic_line_list(n_orders=n_orders, order_nums=order_nums,
+                                       n_lines_per_order=6)
+
+        # Shift all peaks by 15 pixels to simulate a large xcorr residual
+        true_shift = 15
+        spectra = []
+        for i, on in enumerate(order_nums):
+            flux = np.full(ncols, 10.0, dtype=float)
+            for entry in ll.entries:
+                if entry.order != on:
+                    continue
+                wav = entry.wavelength_um
+                wav_array = wci.data[i, 0, :]
+                col_idx = int(np.argmin(np.abs(wav_array - wav))) + true_shift
+                for dc in range(-2, 3):
+                    c = col_idx + dc
+                    if 0 <= c < ncols:
+                        flux[c] += 10000.0 * np.exp(-0.5 * dc ** 2)
+            spectra.append(OrderArcSpectrum(
+                order_index=i, order_number=on,
+                col_start=0, col_end=ncols - 1, flux=flux,
+            ))
+
+        spectra_set = OrderArcSpectraSet(mode="K3", spectra=spectra, aperture_half_width=3)
+        # adaptive window should compensate; model should fit successfully
+        model = fit_1dxd_wavelength_model(
+            spectra_set, wci, ll, wdeg=2, odeg=1,
+            local_search_window_px=20,
+        )
+        assert model.n_lines > 0
+        assert model.n_orders_fit >= 1
+
 
 # ===========================================================================
 # 8b. Monotonicity enforcement and ambiguity rejection
