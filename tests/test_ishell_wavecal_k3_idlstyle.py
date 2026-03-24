@@ -942,7 +942,7 @@ class TestXCorrOrderShift:
         assert was_clipped is False
 
     def test_was_clipped_returns_false_when_peak_within_search_window(self):
-        """was_clipped is False when the raw correlation peak is inside the window."""
+        """was_clipped is False when the correlation peak is inside the search window."""
         from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _xcorr_order_shift
 
         flux, cols, wavs, refs = self._build_xcorr_inputs(true_shift_px=5)
@@ -950,22 +950,22 @@ class TestXCorrOrderShift:
             flux, cols, wavs, refs, col_start=0, max_shift_px=50
         )
         assert was_clipped is False, (
-            f"Expected no clipping for 5px shift with max=50, got was_clipped={was_clipped}"
+            f"Expected peak inside window for 5px shift with max=50, got was_clipped={was_clipped}"
         )
 
     def test_was_clipped_returns_true_when_peak_at_search_window_boundary(self):
         """was_clipped is True when correlation peak lands at the window boundary."""
         from pyspextool.instruments.ishell.wavecal_k3_idlstyle import _xcorr_order_shift
 
-        # true_shift_px=30; constrain max to 2 so the 30px true peak is far outside
-        # the search window.  The correlation's argmax will be at the boundary.
+        # true_shift_px=30; constrain max to 29 so the window's upper edge is
+        # just below the true peak — the correlation argmax sits at index len-1.
         flux, cols, wavs, refs = self._build_xcorr_inputs(true_shift_px=30)
         shift, was_clipped = _xcorr_order_shift(
-            flux, cols, wavs, refs, col_start=0, max_shift_px=2
+            flux, cols, wavs, refs, col_start=0, max_shift_px=29
         )
-        assert abs(shift) <= 2
+        assert abs(shift) <= 29
         assert was_clipped is True, (
-            "Expected clipping flag when true shift (30px) >> max_shift_px (2px)"
+            "Expected peak-at-boundary flag when true shift (30px) > max_shift_px (29px)"
         )
 
     def test_shift_changes_peak_search_window(self):
@@ -1210,15 +1210,15 @@ class TestOrderMatchStatsNewFields:
             assert isinstance(stat.skipped_insufficient_matches, bool)
             assert isinstance(stat.min_lines_required, int)
 
-    def test_xcorr_shift_clipped_set_when_shift_at_limit(self):
-        """xcorr_shift_clipped reflects actual clipping (raw > max), not boundary equality."""
+    def test_xcorr_shift_clipped_propagated_from_xcorr_function(self):
+        """xcorr_shift_clipped reflects peak-at-boundary detection from _xcorr_order_shift."""
         from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
             fit_1dxd_wavelength_model,
         )
         spectra_set, wci, ll = TestFit1DXDWavelengthModel()._build_inputs()
-        # max_shift_px=1 is small enough that the real correlation peak almost
-        # certainly lies outside ±1 px for a non-trivial aligned spectrum.
-        # max_shift_px=200 is large enough that no raw shift can exceed it.
+        # max_shift_px=1 means the search window is ±1 px; for any order whose
+        # true shift is larger the argmax lands at the window boundary.
+        # max_shift_px=200 is wide enough that no peak hits the boundary.
         model_tiny = fit_1dxd_wavelength_model(
             spectra_set, wci, ll, wdeg=2, odeg=1, xcorr_max_shift_px=1
         )
@@ -1226,18 +1226,11 @@ class TestOrderMatchStatsNewFields:
             spectra_set, wci, ll, wdeg=2, odeg=1, xcorr_max_shift_px=200
         )
         clipped_normal = sum(1 for s in model_normal.per_order_stats if s.xcorr_shift_clipped)
-        # With a max_shift_px of 200 no raw shift can exceed the window
+        # With a wide window no peak should land at the boundary
         assert clipped_normal == 0, (
-            "No orders should be clipped when max_shift_px=200"
+            "No orders should have boundary peaks when max_shift_px=200"
         )
-        # With max_shift_px=1 at least some orders should have been clipped
-        # (raw shift is found within the restricted window, but the boundary
-        # is genuinely tight relative to a well-aligned spectrum; the xcorr
-        # search restricts the window so the returned shift stays at ±1, but
-        # was_clipped from fit-level logic comes from the _xcorr_order_shift
-        # return value which tracks the raw vs window comparison)
-        clipped_tiny = sum(1 for s in model_tiny.per_order_stats if s.xcorr_shift_clipped)
-        # We just verify the field is a bool on every stat (value depends on data)
+        # We verify the field is a bool on every stat (exact count depends on data)
         for s in model_tiny.per_order_stats:
             assert isinstance(s.xcorr_shift_clipped, bool)
 

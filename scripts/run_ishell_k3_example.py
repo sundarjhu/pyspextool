@@ -445,7 +445,8 @@ class OrderDiagnostics1DXD:
     participated : bool
         True if this order contributed at least one accepted point.
     xcorr_shift_clipped : bool
-        True if the xcorr shift reached the ±max_shift_px limit.
+        True if the cross-correlation peak landed at the boundary of the
+        allowed search window, indicating the true shift may lie outside it.
     skipped_insufficient_matches : bool
         True if the order was excluded due to too few matched lines.
     min_lines_required : int

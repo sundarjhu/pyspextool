@@ -213,8 +213,8 @@ class OrderMatchStats:
         ``True`` if this order contributed at least one accepted point to
         the global fit.
     xcorr_shift_clipped : bool
-        ``True`` if the cross-correlation shift reached the allowed limit
-        (``±xcorr_max_shift_px``) and was clipped to it.
+        ``True`` if the cross-correlation peak landed at the boundary of the
+        allowed search window, indicating the true shift may lie outside it.
     skipped_insufficient_matches : bool
         ``True`` if the order was excluded from the global fit because it
         had fewer than the required minimum number of matched lines after
@@ -1125,9 +1125,8 @@ def _xcorr_order_shift(
 
     peak_idx_local = int(np.argmax(xcorr_window))
     peak_idx_global = lo + peak_idx_local
-    # Record whether the peak landed at the boundary of the search window,
-    # which indicates the true correlation peak is likely outside the allowed
-    # shift range.  This is the honest "was clipped" diagnostic.
+    # True when the correlation argmax is at the boundary of the search window,
+    # indicating the true shift is likely outside the allowed range.
     was_clipped = (peak_idx_local == 0 or peak_idx_local == len(xcorr_window) - 1)
 
     # Sub-pixel refinement via parabolic fit through three points
