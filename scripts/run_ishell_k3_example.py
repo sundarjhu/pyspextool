@@ -634,8 +634,10 @@ def _print_stage3b_summary(k3_model: "IdlStyle1DXDModel") -> None:
     mono = [s for s in stats if s.n_monotonic_removed > 0]
 
     print("  Stage 3b grouped diagnostics:")
+    # Determine the participation threshold from per_order_stats (all share the same value).
+    min_req = stats[0].min_lines_required if stats else 4
     print(
-        "    skipped_insufficient_matches: "
+        f"    skipped_insufficient_matches (<{min_req} lines): "
         + (", ".join(str(s.order_number) for s in skipped) or "none")
     )
     print(
@@ -2004,7 +2006,8 @@ def run_k3_example(
         print(f"  1D arc spectra extracted : {arc_spectra.n_orders} orders")
 
         k3_model = fit_1dxd_wavelength_model(
-            arc_spectra, wavecalinfo, line_list, wdeg=2, odeg=1
+            arc_spectra, wavecalinfo, line_list, wdeg=2, odeg=1,
+            min_lines_per_order=4,
         )
         print(f"  1DXD fit: {k3_model.n_orders_fit} orders")
         print(f"    total={k3_model.n_lines_total}, "

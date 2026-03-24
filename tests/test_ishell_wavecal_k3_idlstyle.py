@@ -2250,3 +2250,168 @@ class TestPerOrderExportRegression:
                 rows = list(_csv.DictReader(fh))
         assert len(rows) == 1
         assert int(rows[0]["order_number"]) == 215
+
+
+# ===========================================================================
+# 17. min_lines_per_order=4 participation threshold
+# ===========================================================================
+
+
+class TestMinLinesPerOrder4Threshold:
+    """Orders with <4 matched lines are excluded; orders with >=4 participate."""
+
+    def _build_inputs_with_line_counts(self, line_counts_per_order):
+        """Build inputs where each order has a controlled number of lines."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            OrderArcSpectrum,
+            OrderArcSpectraSet,
+        )
+
+        ncols = 512
+        n_orders = len(line_counts_per_order)
+        order_nums = [200 + i for i in range(n_orders)]
+        wci = _make_synthetic_wavecalinfo(
+            n_orders=n_orders, n_pixels=ncols, order_nums=order_nums
+        )
+
+        # Build a custom line list with the specified number of lines per order
+        entries = []
+        for i, (on, n_lines) in enumerate(zip(order_nums, line_counts_per_order)):
+            wav_lo = 2.0 - 0.1 * (max(order_nums) - on)
+            wav_hi = wav_lo + 0.05
+            for k in range(n_lines):
+                frac = (k + 0.5) / max(n_lines, 1)
+                wav = wav_lo + frac * (wav_hi - wav_lo)
+                entry = MagicMock()
+                entry.order = on
+                entry.wavelength_um = wav
+                entry.species = "Ar I"
+                entries.append(entry)
+        ll = MagicMock()
+        ll.entries = entries
+
+        spectra = []
+        for i, on in enumerate(order_nums):
+            flux = np.full(ncols, 10.0, dtype=float)
+            n_lines = line_counts_per_order[i]
+            wav_lo = 2.0 - 0.1 * (max(order_nums) - on)
+            wav_hi = wav_lo + 0.05
+            wav_array = wci.data[i, 0, :]
+            for k in range(n_lines):
+                frac = (k + 0.5) / max(n_lines, 1)
+                wav = wav_lo + frac * (wav_hi - wav_lo)
+                col_idx = int(np.argmin(np.abs(wav_array - wav)))
+                for dc in range(-2, 3):
+                    c = col_idx + dc
+                    if 0 <= c < ncols:
+                        flux[c] += 10000.0 * np.exp(-0.5 * dc ** 2)
+            spectra.append(OrderArcSpectrum(
+                order_index=i, order_number=on,
+                col_start=0, col_end=ncols - 1, flux=flux,
+            ))
+
+        spectra_set = OrderArcSpectraSet(
+            mode="K3", spectra=spectra, aperture_half_width=3
+        )
+        return spectra_set, wci, ll
+
+    def test_order_with_3_lines_skipped_when_threshold_4(self):
+        """An order with exactly 3 matched lines is skipped when min_lines_per_order=4."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        # One order with 3 lines (below threshold), others with 6 (above threshold)
+        spectra_set, wci, ll = self._build_inputs_with_line_counts([3, 6, 6])
+        model = fit_1dxd_wavelength_model(
+            spectra_set, wci, ll, wdeg=2, odeg=1,
+            min_lines_per_order=4,
+        )
+        # The first order (order_number=200) has 3 lines and must be skipped
+        skipped_orders = [
+            s.order_number for s in model.per_order_stats
+            if s.skipped_insufficient_matches
+        ]
+        assert 200 in skipped_orders, (
+            f"Order 200 (3 lines) should be skipped with min_lines_per_order=4; "
+            f"skipped={skipped_orders}"
+        )
+        stat_200 = next(s for s in model.per_order_stats if s.order_number == 200)
+        assert stat_200.participated is False
+        assert stat_200.min_lines_required == 4
+
+    def test_order_with_4_lines_participates(self):
+        """An order with exactly 4 matched lines participates when min_lines_per_order=4."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        # All orders with 4 lines (at the threshold)
+        spectra_set, wci, ll = self._build_inputs_with_line_counts([4, 4, 4])
+        model = fit_1dxd_wavelength_model(
+            spectra_set, wci, ll, wdeg=2, odeg=1,
+            min_lines_per_order=4,
+        )
+        participating = [
+            s.order_number for s in model.per_order_stats
+            if s.participated
+        ]
+        assert len(participating) >= 1, (
+            "At least one order with 4 lines should participate with "
+            f"min_lines_per_order=4; participated={participating}"
+        )
+        for s in model.per_order_stats:
+            if s.n_matched >= 4:
+                assert s.skipped_insufficient_matches is False
+                assert s.min_lines_required == 4
+
+    def test_default_threshold_is_4(self):
+        """fit_1dxd_wavelength_model default min_lines_per_order is 4."""
+        import inspect
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+        )
+        sig = inspect.signature(fit_1dxd_wavelength_model)
+        default_val = sig.parameters["min_lines_per_order"].default
+        assert default_val == 4, (
+            f"Expected default min_lines_per_order=4, got {default_val}"
+        )
+
+    def test_summary_text_shows_threshold(self, capsys):
+        """_print_stage3b_summary shows the numeric threshold in the skipped line."""
+        import importlib.util
+        import sys
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderMatchStats
+
+        scripts_dir = os.path.join(_REPO_ROOT, "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "run_ishell_k3_example_thresh_test",
+            os.path.join(scripts_dir, "run_ishell_k3_example.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        def _make_stat(order_number, **kwargs):
+            defaults = dict(
+                xcorr_shift_px=0.0, n_candidate=5, n_matched=3,
+                n_ambiguous_removed=0, n_monotonic_removed=0,
+                n_accepted=0, n_rejected=0,
+                rms_resid_um=float("nan"), participated=False,
+                xcorr_shift_clipped=False,
+                skipped_insufficient_matches=True,
+                min_lines_required=4,
+            )
+            defaults.update(kwargs)
+            return OrderMatchStats(order_number=order_number, **defaults)
+
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.per_order_stats = [_make_stat(203), _make_stat(204)]
+        mod._print_stage3b_summary(m)
+        out = capsys.readouterr().out
+        # The threshold number 4 must appear in the skipped line
+        skipped_line = next(
+            l for l in out.splitlines() if "skipped_insufficient_matches" in l
+        )
+        assert "4" in skipped_line, (
+            f"Expected threshold '4' in skipped line, got: {skipped_line!r}"
+        )

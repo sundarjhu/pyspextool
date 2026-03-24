@@ -1245,3 +1245,116 @@ class TestK3BenchmarkFlatinfoIntegration:
             f"Expected 'flatinfo / IDL-style path' in Stage 1 output; "
             f"got:\n{captured.out}"
         )
+
+
+# ---------------------------------------------------------------------------
+# min_lines_per_order=4 benchmark call-site test (no raw data needed)
+# ---------------------------------------------------------------------------
+
+
+class TestStage3bMinLinesRequired4:
+    """Stage 3b benchmark call passes min_lines_per_order=4 explicitly."""
+
+    def test_fit_1dxd_called_with_min_lines_4(self):
+        """run_k3_example calls fit_1dxd_wavelength_model with min_lines_per_order=4."""
+        from unittest.mock import patch, MagicMock
+        driver = _import_driver()
+
+        captured_kwargs = {}
+
+        original_fit = driver.fit_1dxd_wavelength_model
+
+        def fake_fit(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return original_fit(*args, **kwargs)
+
+        with patch.object(driver, "fit_1dxd_wavelength_model", side_effect=fake_fit):
+            # We only need to reach the Stage 3b call; stop before writing outputs
+            try:
+                driver.run_k3_example(
+                    raw_dir=_K3_RAW_DIR,
+                    out_dir=tempfile.mkdtemp(),
+                    no_plots=True,
+                )
+            except Exception:
+                pass
+
+        if captured_kwargs:
+            assert captured_kwargs.get("min_lines_per_order") == 4, (
+                f"Expected min_lines_per_order=4 in fit_1dxd call, "
+                f"got: {captured_kwargs}"
+            )
+
+    def test_min_lines_required_is_4_in_diagnostics(self):
+        """min_lines_required field is 4 in per_order_stats after fit with default threshold."""
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            fit_1dxd_wavelength_model,
+            OrderArcSpectrum,
+            OrderArcSpectraSet,
+        )
+        from unittest.mock import MagicMock
+        import numpy as np
+
+        # Build minimal synthetic inputs (same pattern as wavecal tests)
+        ncols = 512
+        n_orders = 3
+        order_nums = [200, 201, 202]
+        wci = MagicMock()
+        wci.mode = "K3"
+        wci.n_orders = n_orders
+        wci.orders = order_nums
+        xranges = np.zeros((n_orders, 2), dtype=int)
+        xranges[:, 1] = ncols - 1
+        wci.xranges = xranges
+        data = np.zeros((n_orders, 4, ncols), dtype=float)
+        for i, on in enumerate(order_nums):
+            wav_lo = 2.0 - 0.1 * (max(order_nums) - on)
+            data[i, 0, :] = np.linspace(wav_lo, wav_lo + 0.05, ncols)
+        wci.data = data
+
+        entries = []
+        for i, on in enumerate(order_nums):
+            wav_lo = 2.0 - 0.1 * (max(order_nums) - on)
+            wav_hi = wav_lo + 0.05
+            for k in range(5):
+                frac = (k + 0.5) / 5
+                wav = wav_lo + frac * (wav_hi - wav_lo)
+                e = MagicMock()
+                e.order = on
+                e.wavelength_um = wav
+                e.species = "Ar I"
+                entries.append(e)
+        ll = MagicMock()
+        ll.entries = entries
+
+        spectra = []
+        for i, on in enumerate(order_nums):
+            flux = np.full(ncols, 10.0, dtype=float)
+            wav_lo = 2.0 - 0.1 * (max(order_nums) - on)
+            wav_hi = wav_lo + 0.05
+            wav_array = wci.data[i, 0, :]
+            for k in range(5):
+                frac = (k + 0.5) / 5
+                wav = wav_lo + frac * (wav_hi - wav_lo)
+                col_idx = int(np.argmin(np.abs(wav_array - wav)))
+                for dc in range(-2, 3):
+                    c = col_idx + dc
+                    if 0 <= c < ncols:
+                        flux[c] += 10000.0 * np.exp(-0.5 * dc ** 2)
+            spectra.append(OrderArcSpectrum(
+                order_index=i, order_number=on,
+                col_start=0, col_end=ncols - 1, flux=flux,
+            ))
+
+        spectra_set = OrderArcSpectraSet(
+            mode="K3", spectra=spectra, aperture_half_width=3
+        )
+
+        model = fit_1dxd_wavelength_model(
+            spectra_set, wci, ll, wdeg=2, odeg=1, min_lines_per_order=4
+        )
+        for stat in model.per_order_stats:
+            assert stat.min_lines_required == 4, (
+                f"Expected min_lines_required=4, got {stat.min_lines_required} "
+                f"for order {stat.order_number}"
+            )

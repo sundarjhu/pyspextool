@@ -588,7 +588,7 @@ def fit_1dxd_wavelength_model(
     min_distance: int = 5,
     match_tol_um: float = 0.002,
     max_col_residual_px: float = 5.0,
-    min_lines_per_order: int = 3,
+    min_lines_per_order: int = 4,
     min_lines_total: int = 10,
     sigma_thresh: float = 3.0,
     max_sigma_iter: int = 5,
@@ -647,7 +647,7 @@ def fit_1dxd_wavelength_model(
         column and the predicted detector column for the matched reference
         line.  Used together with *match_tol_um* as a dual-constraint
         acceptance criterion to prevent incorrect peak↔line associations.
-    min_lines_per_order : int, default 3
+    min_lines_per_order : int, default 4
         Minimum number of matched (post-monotonicity-filter) arc lines
         required for an order to contribute to the global fit.  Orders
         with fewer accepted matches are recorded in ``per_order_stats``
