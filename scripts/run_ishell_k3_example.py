@@ -127,6 +127,7 @@ from pyspextool.instruments.ishell.wavecal_2d_refine import (  # noqa: E402
 from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (  # noqa: E402
     extract_order_arc_spectra,
     fit_1dxd_wavelength_model,
+    diagnose_weak_order_prediction_offsets,
 )
 from pyspextool.instruments.ishell.rectification_indices import (  # noqa: E402
     build_rectification_indices,
@@ -1999,6 +2000,7 @@ def run_k3_example(
 
     _banner("Stage 3b: K3 1DXD wavelength calibration (IDL-style — primary path)")
     k3_model = None
+    arc_spectra = None
     try:
         arc_spectra = extract_order_arc_spectra(
             arc_img, trace, wavecalinfo, aperture_half_width=3
@@ -2039,6 +2041,30 @@ def run_k3_example(
             k3_model, out_dir, save=save_plots, prefix=prefix,
             out_stem="wavecal_residuals",
         )
+
+    # ------------------------------------------------------------------
+    # Stage 3b QA: weak-order prediction-offset diagnostics
+    # ------------------------------------------------------------------
+
+    _banner("Stage 3b QA: weak-order arc-line prediction offsets")
+    if k3_model is not None and arc_spectra is not None:
+        try:
+            qa_dx_dir = os.path.join(out_dir, "qa_dx")
+            dx_stats = diagnose_weak_order_prediction_offsets(
+                order_spectra=arc_spectra,
+                reference_lines=line_list,
+                wave_model=k3_model,
+                output_dir=qa_dx_dir,
+            )
+            completed["stage3b_dx_diagnostics"] = True
+            completed["_stage3b_dx_stats"] = dx_stats  # type: ignore[assignment]
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Stage 3b dx diagnostics raised: {exc}")
+            _skip("Stage 3b dx diagnostics", "exception (see above)")
+            completed["stage3b_dx_diagnostics"] = False
+    else:
+        _skip("Stage 3b dx diagnostics", "Stage 3b did not complete")
+        completed["stage3b_dx_diagnostics"] = False
 
     # ------------------------------------------------------------------
     # Stage 4: Global wavelength surface (scaffold — kept for reference)

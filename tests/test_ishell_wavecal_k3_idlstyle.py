@@ -3360,3 +3360,235 @@ class TestFallbackGlobalLineMatch:
         )
         assert stat.used_fallback is False
         assert stat.fallback_n_matches == 0
+
+
+# ===========================================================================
+# diagnose_weak_order_prediction_offsets
+# ===========================================================================
+
+
+class TestDiagnoseWeakOrderPredictionOffsets:
+    """Tests for diagnose_weak_order_prediction_offsets in wavecal_k3_idlstyle."""
+
+    def _make_model(self, wdeg=2, odeg=1, order_ref=204.0):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import IdlStyle1DXDModel
+
+        coeffs = np.zeros((wdeg + 1, odeg + 1), dtype=float)
+        coeffs[0, 0] = 2.0    # constant: 2 µm at col=0
+        coeffs[1, 0] = 5e-4   # linear: 0.5 nm / pixel
+        return IdlStyle1DXDModel(
+            mode="K3",
+            wdeg=wdeg,
+            odeg=odeg,
+            order_ref=order_ref,
+            coeffs=coeffs,
+            fitted_order_numbers=[int(order_ref)],
+            fit_rms_um=0.001,
+            n_lines=10,
+            n_lines_total=12,
+            n_lines_rejected=2,
+            accepted_mask=np.ones(12, dtype=bool),
+            median_residual_um=0.0,
+            n_orders_fit=1,
+        )
+
+    def _make_arc_spectrum(self, order_number, col_start=100, n_cols=400):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderArcSpectrum
+
+        rng = np.random.default_rng(seed=order_number)
+        flux = rng.normal(10.0, 1.0, size=n_cols).astype(float)
+        for offset in [50, 150, 250]:
+            if offset < n_cols:
+                flux[offset] += 200.0
+        return OrderArcSpectrum(
+            order_index=0,
+            order_number=order_number,
+            col_start=col_start,
+            col_end=col_start + n_cols - 1,
+            flux=flux,
+        )
+
+    def _make_arc_spectra_set(self, order_numbers):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import OrderArcSpectraSet
+
+        spectra = [self._make_arc_spectrum(o) for o in order_numbers]
+        return OrderArcSpectraSet(mode="K3", spectra=spectra, aperture_half_width=3)
+
+    def _make_line_list(self, order_numbers, n_lines_per_order=5):
+        from pyspextool.instruments.ishell.calibrations import LineList, LineListEntry
+
+        entries = []
+        for order in order_numbers:
+            wavs = np.linspace(2.05, 2.25, n_lines_per_order)
+            for wav in wavs:
+                entries.append(
+                    LineListEntry(
+                        order=order,
+                        wavelength_um=float(wav),
+                        species="Th I",
+                        fit_window_angstrom=2.0,
+                        fit_type="G",
+                        fit_n_terms=3,
+                    )
+                )
+        return LineList(mode="K3", entries=entries)
+
+    def test_is_exported_in_all(self):
+        import pyspextool.instruments.ishell.wavecal_k3_idlstyle as mod
+        assert "diagnose_weak_order_prediction_offsets" in mod.__all__
+
+    def test_returns_list_of_stats(self):
+        import tempfile
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            diagnose_weak_order_prediction_offsets,
+        )
+        from pyspextool.instruments.ishell.k3_arc_dx_diagnostics import OrderDxStats
+
+        orders = [204, 205]
+        model = self._make_model()
+        arc_spectra = self._make_arc_spectra_set(orders)
+        line_list = self._make_line_list(orders)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            import os
+            out_dir = os.path.join(tmp, "qa_dx")
+            results = diagnose_weak_order_prediction_offsets(
+                order_spectra=arc_spectra,
+                reference_lines=line_list,
+                wave_model=model,
+                weak_orders=orders,
+                output_dir=out_dir,
+            )
+
+        assert isinstance(results, list)
+        assert all(isinstance(s, OrderDxStats) for s in results)
+        assert len(results) == 2
+
+    def test_csv_written(self):
+        import os
+        import tempfile
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            diagnose_weak_order_prediction_offsets,
+        )
+
+        orders = [204]
+        model = self._make_model()
+        arc_spectra = self._make_arc_spectra_set(orders)
+        line_list = self._make_line_list(orders)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "qa_dx")
+            diagnose_weak_order_prediction_offsets(
+                order_spectra=arc_spectra,
+                reference_lines=line_list,
+                wave_model=model,
+                weak_orders=orders,
+                output_dir=out_dir,
+            )
+            csv_path = os.path.join(out_dir, "dx_summary.csv")
+            assert os.path.isfile(csv_path), f"CSV not found: {csv_path}"
+
+            import csv
+            with open(csv_path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            assert len(rows) == 1
+            assert rows[0]["order"] == "204"
+            assert "median_dx" in rows[0]
+            assert "min_dx" in rows[0]
+            assert "max_dx" in rows[0]
+
+    def test_plots_written(self):
+        import os
+        import tempfile
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            diagnose_weak_order_prediction_offsets,
+        )
+
+        orders = [204, 205]
+        model = self._make_model()
+        arc_spectra = self._make_arc_spectra_set(orders)
+        line_list = self._make_line_list(orders)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "qa_dx")
+            diagnose_weak_order_prediction_offsets(
+                order_spectra=arc_spectra,
+                reference_lines=line_list,
+                wave_model=model,
+                weak_orders=orders,
+                output_dir=out_dir,
+            )
+            for o in orders:
+                png = os.path.join(out_dir, f"order_{o}.png")
+                assert os.path.isfile(png), f"Missing plot: {png}"
+
+    def test_no_output_when_output_dir_none(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            diagnose_weak_order_prediction_offsets,
+        )
+
+        orders = [204]
+        model = self._make_model()
+        arc_spectra = self._make_arc_spectra_set(orders)
+        line_list = self._make_line_list(orders)
+
+        # Should not raise
+        results = diagnose_weak_order_prediction_offsets(
+            order_spectra=arc_spectra,
+            reference_lines=line_list,
+            wave_model=model,
+            weak_orders=orders,
+            output_dir=None,
+        )
+        assert len(results) == 1
+
+    def test_skips_missing_orders(self):
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            diagnose_weak_order_prediction_offsets,
+        )
+
+        model = self._make_model()
+        arc_spectra = self._make_arc_spectra_set([204])
+        line_list = self._make_line_list([204])
+
+        results = diagnose_weak_order_prediction_offsets(
+            order_spectra=arc_spectra,
+            reference_lines=line_list,
+            wave_model=model,
+            weak_orders=[204, 999],
+            output_dir=None,
+        )
+        order_nums = [r.order_number for r in results]
+        assert 204 in order_nums
+        assert 999 not in order_nums
+
+    def test_csv_columns(self):
+        """CSV must contain the expected column headers."""
+        import csv
+        import os
+        import tempfile
+        from pyspextool.instruments.ishell.wavecal_k3_idlstyle import (
+            diagnose_weak_order_prediction_offsets,
+        )
+
+        orders = [204, 205]
+        model = self._make_model()
+        arc_spectra = self._make_arc_spectra_set(orders)
+        line_list = self._make_line_list(orders)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "qa_dx")
+            diagnose_weak_order_prediction_offsets(
+                order_spectra=arc_spectra,
+                reference_lines=line_list,
+                wave_model=model,
+                weak_orders=orders,
+                output_dir=out_dir,
+            )
+            with open(os.path.join(out_dir, "dx_summary.csv"), newline="") as fh:
+                reader = csv.DictReader(fh)
+                headers = reader.fieldnames
+
+        expected = {"order", "n_predicted", "n_detected", "n_dx",
+                    "median_dx", "min_dx", "max_dx"}
+        assert expected <= set(headers), f"Missing CSV columns: {expected - set(headers)}"
