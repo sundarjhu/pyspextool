@@ -52,6 +52,7 @@ Constraints
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
@@ -72,6 +73,7 @@ __all__ = [
     "IdlStyle1DXDModel",
     "extract_order_arc_spectra",
     "fit_1dxd_wavelength_model",
+    "diagnose_weak_order_prediction_offsets",
 ]
 
 logger = logging.getLogger(__name__)
@@ -1804,3 +1806,124 @@ def _fallback_global_line_match(
     # Step 5: Enforce monotonicity (wavelength must increase with column)
     filtered, _ = _enforce_monotonic_matches(raw_matches)
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic: weak-order prediction offsets (Stage 3b QA)
+# ---------------------------------------------------------------------------
+
+_WEAK_ORDERS_K3: list[int] = [204, 205, 212, 213, 214, 217, 221, 228]
+
+
+def diagnose_weak_order_prediction_offsets(
+    order_spectra: "OrderArcSpectraSet",
+    reference_lines: "LineList",
+    wave_model: "IdlStyle1DXDModel",
+    weak_orders: Optional[list[int]] = None,
+    output_dir: Optional[str] = "output/qa_dx",
+    debug: bool = False,
+) -> list:
+    """Diagnose pixel offsets between predicted and detected arc lines for weak K3 orders.
+
+    For each weak order this function:
+
+    1. Loads the extracted 1-D arc spectrum from *order_spectra*.
+    2. Smooths it with a Gaussian (sigma = 1.5 pixels).
+    3. Detects peaks above ``median + 3 × MAD``.
+    4. Inverts the 1DXD *wave_model* to predict detector column positions for
+       every reference wavelength in *reference_lines* for that order.
+    5. Measures the nearest-peak distance (dx) for each prediction.
+    6. Computes per-order statistics and saves diagnostic plots under
+       ``<output_dir>/order_<N>.png``.
+    7. Writes a CSV summary to ``<output_dir>/dx_summary.csv``.
+    8. Prints per-order median/min/max dx to the console.
+
+    This function does **not** modify any pipeline state.
+
+    Parameters
+    ----------
+    order_spectra : OrderArcSpectraSet
+        Extracted 1-D arc spectra (one per order) from Stage 3b.
+    reference_lines : LineList
+        Packaged K3 ThAr arc-line reference list.
+    wave_model : IdlStyle1DXDModel
+        Fitted global 1DXD wavelength model from Stage 3b.
+    weak_orders : list of int or None, optional
+        Override the default list of weak K3 orders.  If *None* (default),
+        uses the hardcoded list ``[204, 205, 212, 213, 214, 217, 221, 228]``.
+    output_dir : str or None, optional
+        Directory to write per-order PNG plots and the CSV summary.  Created
+        if it does not exist.  Pass ``None`` to skip all file output.
+        Default: ``"output/qa_dx"``.
+    debug : bool, optional
+        If ``True``, emit additional debug logging.  Default: ``False``.
+
+    Returns
+    -------
+    list of :class:`~pyspextool.instruments.ishell.k3_arc_dx_diagnostics.OrderDxStats`
+        Per-order statistics, one entry per order that was found in
+        *order_spectra* and had at least one reference wavelength in
+        *reference_lines*.  Orders absent from *order_spectra* are silently
+        skipped.
+    """
+    import csv as _csv
+
+    from .k3_arc_dx_diagnostics import run_k3_arc_dx_diagnostics
+
+    orders_to_check = weak_orders if weak_orders is not None else _WEAK_ORDERS_K3
+
+    if debug:
+        logger.setLevel(logging.DEBUG)
+
+    save_plots = output_dir is not None
+    results = run_k3_arc_dx_diagnostics(
+        model=wave_model,
+        arc_spectra=order_spectra,
+        line_list=reference_lines,
+        out_dir=output_dir,
+        save_plots=save_plots,
+        weak_orders=orders_to_check,
+    )
+
+    # ------------------------------------------------------------------
+    # Console report
+    # ------------------------------------------------------------------
+    def _n_dx(s) -> int:
+        return int(np.sum(np.isfinite(s.dx_values))) if len(s.dx_values) > 0 else 0
+
+    print("\n  [DX] Weak-order prediction offsets (Stage 3b diagnostic)")
+    print(f"  {'order':>6}  {'n_pred':>6}  {'n_det':>6}  {'n_dx':>5}  "
+          f"{'median_dx':>9}  {'min_dx':>7}  {'max_dx':>7}")
+    print("  " + "-" * 60)
+    for s in results:
+        print(f"  {s.order_number:>6}  {s.n_predicted:>6}  {s.n_peaks:>6}  {_n_dx(s):>5}  "
+              f"{s.median_dx:>9.2f}  {s.min_dx:>7.2f}  {s.max_dx:>7.2f}  px")
+    print()
+
+    # ------------------------------------------------------------------
+    # CSV summary
+    # ------------------------------------------------------------------
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        csv_path = os.path.join(output_dir, "dx_summary.csv")
+        _fieldnames = [
+            "order", "n_predicted", "n_detected", "n_dx",
+            "median_dx", "min_dx", "max_dx",
+        ]
+        with open(csv_path, "w", newline="") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=_fieldnames)
+            writer.writeheader()
+            for s in results:
+                writer.writerow({
+                    "order":       s.order_number,
+                    "n_predicted": s.n_predicted,
+                    "n_detected":  s.n_peaks,
+                    "n_dx":        _n_dx(s),
+                    "median_dx":   f"{s.median_dx:.4f}",
+                    "min_dx":      f"{s.min_dx:.4f}",
+                    "max_dx":      f"{s.max_dx:.4f}",
+                })
+        logger.info("Weak-order dx summary written to: %s", csv_path)
+        print(f"  [DX] CSV summary written to: {csv_path}")
+
+    return results
