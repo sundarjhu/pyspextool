@@ -13,6 +13,8 @@ Coverage:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -35,6 +37,7 @@ from pyspextool.instruments.ishell.wavecal import (
     build_geometry_from_arc_lines,
     build_geometry_from_wavecalinfo,
     build_rectification_maps,
+    diagnose_weak_orders,
     fit_arc_line_centroids,
 )
 
@@ -1154,3 +1157,323 @@ class TestBuildGeometryFromArcLines:
                     f"Order {order}: centroid {centroid:.2f} != expected "
                     f"{expected_pix:.2f} for line at {wav:.6f} µm"
                 )
+
+
+# ===========================================================================
+# TestDiagnoseWeakOrders – diagnostic layer for Stage 3b weak orders
+# ===========================================================================
+
+
+def _make_synthetic_wavecalinfo_with_arc(
+    mode: str = "K1",
+    orders: list | None = None,
+    n_pixels: int = 300,
+    line_pixel_offsets: list | None = None,
+) -> "WaveCalInfo":
+    """WaveCalInfo with plane-0 wavelengths and plane-1 Gaussian arc lines."""
+    if orders is None:
+        orders = [233, 234]
+    if line_pixel_offsets is None:
+        line_pixel_offsets = [60, 150, 240]
+    n_orders = len(orders)
+    x0 = 20
+    disp = 5e-4  # µm/pixel
+
+    data = np.full((n_orders, 4, n_pixels), np.nan)
+    xranges = np.zeros((n_orders, 2), dtype=int)
+
+    for i, _order in enumerate(orders):
+        cols = np.arange(n_pixels, dtype=float) + x0
+        wavs = 2.20 + i * 0.05 + cols * disp
+        data[i, 0, :] = wavs
+
+        arc = np.ones(n_pixels, dtype=float) * 5.0  # flat background
+        for pix_offset in line_pixel_offsets:
+            arc += 300.0 * np.exp(
+                -0.5 * ((np.arange(n_pixels) - pix_offset) / 1.5) ** 2
+            )
+        data[i, 1, :] = arc
+        xranges[i] = [x0, x0 + n_pixels - 1]
+
+    return WaveCalInfo(
+        mode=mode,
+        n_orders=n_orders,
+        orders=orders,
+        resolving_power=70000.0,
+        data=data,
+        linelist_name="K1_lines.dat",
+        wcal_type="2DXD",
+        home_order=250,
+        disp_degree=3,
+        order_degree=2,
+        xranges=xranges,
+    )
+
+
+def _make_line_list_for_arc(
+    mode: str = "K1",
+    orders: list | None = None,
+    n_pixels: int = 300,
+    line_pixel_offsets: list | None = None,
+) -> "LineList":
+    """LineList whose wavelengths correspond to the Gaussian lines in the arc."""
+    if orders is None:
+        orders = [233, 234]
+    if line_pixel_offsets is None:
+        line_pixel_offsets = [60, 150, 240]
+    x0 = 20
+    disp = 5e-4
+
+    entries = []
+    for i, order in enumerate(orders):
+        cols = np.arange(n_pixels, dtype=float) + x0
+        wavs = 2.20 + i * 0.05 + cols * disp
+        for pix_offset in line_pixel_offsets:
+            wav = float(wavs[pix_offset])
+            entries.append(
+                LineListEntry(
+                    order=order,
+                    wavelength_um=wav,
+                    species="Ar I",
+                    fit_window_angstrom=1.0,
+                    fit_type="G",
+                    fit_n_terms=5,
+                )
+            )
+    return LineList(mode=mode, entries=entries)
+
+
+class TestDiagnoseWeakOrders:
+    """Tests for diagnose_weak_orders diagnostic function."""
+
+    def _make_inputs(self, orders=None, line_pixel_offsets=None):
+        if orders is None:
+            orders = [233, 234]
+        wci = _make_synthetic_wavecalinfo_with_arc(
+            orders=orders, line_pixel_offsets=line_pixel_offsets
+        )
+        ll = _make_line_list_for_arc(
+            orders=orders, line_pixel_offsets=line_pixel_offsets
+        )
+        return wci, ll
+
+    def test_returns_dict_keyed_by_weak_orders(self, tmp_path):
+        """Result dict must have exactly the requested orders as keys."""
+        wci, ll = self._make_inputs(orders=[233, 234])
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233, 234],
+            output_dir=str(tmp_path),
+        )
+        assert set(result.keys()) == {233, 234}
+
+    def test_only_requested_orders_returned(self, tmp_path):
+        """Orders not in weak_orders must not appear in the result."""
+        wci, ll = self._make_inputs(orders=[233, 234])
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        assert 234 not in result
+        assert 233 in result
+
+    def test_result_has_required_keys(self, tmp_path):
+        """Each per-order result must contain all required keys."""
+        required = {
+            "pixel", "flux", "predicted_pixels", "predicted_wavelengths",
+            "detected_peaks", "match_table", "qa_path",
+        }
+        wci, ll = self._make_inputs()
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        assert required <= set(result[233].keys())
+
+    def test_match_table_has_required_columns(self, tmp_path):
+        """match_table must have the four required column arrays."""
+        wci, ll = self._make_inputs()
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        mt = result[233]["match_table"]
+        for col in ("wavelength", "predicted_pixel", "matched_pixel", "residual", "matched"):
+            assert col in mt, f"match_table missing column '{col}'"
+
+    def test_pixel_and_flux_arrays_consistent_length(self, tmp_path):
+        """pixel and flux arrays must have the same length."""
+        wci, ll = self._make_inputs()
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        r = result[233]
+        assert len(r["pixel"]) == len(r["flux"])
+
+    def test_predicted_pixels_and_wavelengths_consistent(self, tmp_path):
+        """predicted_pixels and predicted_wavelengths must be the same length."""
+        wci, ll = self._make_inputs()
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        r = result[233]
+        assert len(r["predicted_pixels"]) == len(r["predicted_wavelengths"])
+
+    def test_match_table_lengths_equal_n_predicted(self, tmp_path):
+        """All match_table column arrays must have length == N_predicted."""
+        wci, ll = self._make_inputs()
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        r = result[233]
+        n_pred = len(r["predicted_pixels"])
+        mt = r["match_table"]
+        for col in ("wavelength", "predicted_pixel", "matched_pixel", "residual", "matched"):
+            assert len(mt[col]) == n_pred, (
+                f"match_table['{col}'] length {len(mt[col])} != n_predicted {n_pred}"
+            )
+
+    def test_detected_peaks_within_column_range(self, tmp_path):
+        """Detected peaks must lie within the valid column range for the order."""
+        wci, ll = self._make_inputs(orders=[233])
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        r = result[233]
+        x0, x1 = float(r["pixel"][0]), float(r["pixel"][-1])
+        for pk in r["detected_peaks"]:
+            assert x0 <= pk <= x1, f"Peak {pk} outside [{x0}, {x1}]"
+
+    def test_matched_residuals_within_tolerance(self, tmp_path):
+        """Matched residuals must not exceed the tolerance."""
+        tolerance = 15.0
+        wci, ll = self._make_inputs()
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+            tolerance_pix=tolerance,
+        )
+        mt = result[233]["match_table"]
+        for flag, res in zip(mt["matched"], mt["residual"]):
+            if flag:
+                assert abs(res) <= tolerance, (
+                    f"Matched residual {res:.2f} exceeds tolerance {tolerance}"
+                )
+
+    def test_unmatched_residuals_are_nan(self, tmp_path):
+        """Unmatched predicted lines must have NaN residuals and matched_pixel."""
+        wci, ll = self._make_inputs()
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        mt = result[233]["match_table"]
+        for flag, res, mp in zip(
+            mt["matched"], mt["residual"], mt["matched_pixel"]
+        ):
+            if not flag:
+                assert np.isnan(res), f"Unmatched residual is {res}, expected NaN"
+                assert np.isnan(mp), f"Unmatched matched_pixel is {mp}, expected NaN"
+
+    def test_qa_plot_file_created(self, tmp_path):
+        """A QA PNG file must be created for each requested order."""
+        wci, ll = self._make_inputs(orders=[233, 234])
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233, 234],
+            output_dir=str(tmp_path),
+        )
+        for order in [233, 234]:
+            qa_path = result[order]["qa_path"]
+            assert qa_path is not None
+            assert qa_path.endswith(f"order_{order}.png")
+            assert os.path.isfile(qa_path), f"QA plot file not found: {qa_path}"
+
+    def test_qa_plot_filename_contains_order(self, tmp_path):
+        """QA plot filename must contain the order number."""
+        wci, ll = self._make_inputs(orders=[233])
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        assert "233" in result[233]["qa_path"]
+
+    def test_output_dir_created_automatically(self, tmp_path):
+        """diagnose_weak_orders must create the output directory if absent."""
+        new_dir = str(tmp_path / "subdir" / "qa")
+        wci, ll = self._make_inputs(orders=[233])
+        diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=new_dir,
+        )
+        assert os.path.isdir(new_dir)
+
+    def test_empty_weak_orders_returns_empty_dict(self, tmp_path):
+        """Empty weak_orders list must return an empty dict."""
+        wci, ll = self._make_inputs()
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[],
+            output_dir=str(tmp_path),
+        )
+        assert result == {}
+
+    def test_order_not_in_wavecalinfo_skipped(self, tmp_path):
+        """Orders not present in wavecalinfo must be silently skipped."""
+        wci, ll = self._make_inputs(orders=[233])
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[999],  # 999 not in wci.orders
+            output_dir=str(tmp_path),
+        )
+        assert 999 not in result
+
+    def test_known_lines_are_detected_and_matched(self, tmp_path):
+        """With bright synthetic Gaussian lines, all predicted lines are matched."""
+        line_pixel_offsets = [60, 150, 240]
+        wci, ll = self._make_inputs(orders=[233], line_pixel_offsets=line_pixel_offsets)
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+            tolerance_pix=15.0,
+        )
+        mt = result[233]["match_table"]
+        n_matched = int(np.sum(mt["matched"]))
+        n_pred = len(mt["predicted_pixel"])
+        assert n_matched > 0, "Expected at least one matched line for bright synthetic arc"
+        assert n_pred == len(line_pixel_offsets)
+
+    def test_predicted_pixels_in_column_range(self, tmp_path):
+        """Predicted pixel positions must fall within the stored column range."""
+        wci, ll = self._make_inputs(orders=[233])
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+        )
+        r = result[233]
+        x0, x1 = float(r["pixel"][0]), float(r["pixel"][-1])
+        for pp in r["predicted_pixels"]:
+            assert x0 <= pp <= x1, f"Predicted pixel {pp} outside [{x0}, {x1}]"
+
+    def test_negative_tolerance_produces_no_matches(self, tmp_path):
+        """Negative tolerance must result in no matched lines."""
+        wci, ll = self._make_inputs()
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=[233],
+            output_dir=str(tmp_path),
+            tolerance_pix=-1.0,  # Negative is always < 0; diffs >= 0, so never match
+        )
+        mt = result[233]["match_table"]
+        assert not np.any(mt["matched"]), "Expected no matches with negative tolerance"
+
+    def test_real_mode_k1_succeeds(self, tmp_path):
+        """diagnose_weak_orders must run without error for a real K1 mode."""
+        wci = read_wavecalinfo("K1")
+        ll = read_line_list("K1")
+        # Use the first order from the real mode as a "weak" order
+        weak = [wci.orders[0]]
+        result = diagnose_weak_orders(
+            wci, ll, weak_orders=weak,
+            output_dir=str(tmp_path),
+        )
+        assert weak[0] in result
