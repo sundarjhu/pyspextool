@@ -121,12 +121,15 @@ What remains incomplete relative to legacy IDL Spextool
 
 from __future__ import annotations
 
+import os
 import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
+from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
+from scipy.signal import find_peaks
 
 from .geometry import OrderGeometry, OrderGeometrySet, RectificationMap
 
@@ -138,6 +141,7 @@ __all__ = [
     "build_geometry_from_arc_lines",
     "build_geometry_from_wavecalinfo",
     "build_rectification_maps",
+    "diagnose_weak_orders",
 ]
 
 # iSHELL default plate scale (arcsec/pixel) – used as fallback when
@@ -527,6 +531,181 @@ def build_geometry_from_arc_lines(
     return OrderGeometrySet(mode=mode, geometries=geometries)
 
 
+def diagnose_weak_orders(
+    wavecalinfo: "WaveCalInfo",
+    line_list: "LineList",
+    weak_orders: list[int],
+    output_dir: str = "qa_weak_orders",
+    tolerance_pix: float = 15.0,
+    smooth_sigma: float = 1.5,
+    peak_mad_multiplier: float = 3.0,
+) -> dict[int, dict]:
+    """Diagnose Stage 3b failures for a set of weak echelle orders.
+
+    This is a **diagnostic-only** layer that does **not** alter the fitting
+    logic.  For each order listed in *weak_orders* it:
+
+    1. Extracts the 1-D arc spectrum and pixel array from the stored
+       ``wavecalinfo`` data cube (plane 1, interpreted as the ThAr arc
+       spectrum; plane 0 provides the wavelength grid).
+    2. Converts every reference wavelength in *line_list* for that order to
+       a predicted pixel position using the coarse (plane-0) wavelength grid.
+    3. Detects actual arc-emission peaks by lightly smoothing the spectrum
+       (Gaussian, *smooth_sigma* pixels) and finding local maxima above a
+       robust threshold (``median + peak_mad_multiplier * MAD``).
+    4. Matches each predicted line to the nearest detected peak within
+       *tolerance_pix* pixels and records a residual table.
+    5. Saves one QA plot per order under *output_dir*/``order_<N>.png``.
+
+    The output directory is created automatically if it does not exist.
+
+    Parameters
+    ----------
+    wavecalinfo : :class:`~.calibrations.WaveCalInfo`
+        Stored calibration for the mode.  Requires ``xranges`` and valid
+        plane 0 (wavelengths in µm) and plane 1 (arc spectrum in DN/s).
+    line_list : :class:`~.calibrations.LineList`
+        ThAr arc-line list for the same mode.
+    weak_orders : list of int
+        Order numbers to diagnose (e.g. ``[203, 204, 205, 210]``).
+    output_dir : str, optional
+        Directory where QA plots are saved.  Created if absent.
+        Default: ``"qa_weak_orders"``.
+    tolerance_pix : float, optional
+        Maximum pixel separation for a predicted–detected match.
+        Default: ``15.0``.
+    smooth_sigma : float, optional
+        Standard deviation of the Gaussian smoothing kernel applied before
+        peak detection, in pixels.  Default: ``1.5``.
+    peak_mad_multiplier : float, optional
+        Threshold for peak detection expressed as a multiple of the
+        median absolute deviation above the median.  Default: ``3.0``.
+
+    Returns
+    -------
+    dict mapping ``order_number -> result_dict``
+        Each ``result_dict`` contains:
+
+        ``"pixel"`` : ndarray
+            Detector column array for this order.
+        ``"flux"`` : ndarray
+            Arc spectrum values for this order.
+        ``"predicted_pixels"`` : ndarray
+            Predicted pixel positions for every reference line.
+        ``"predicted_wavelengths"`` : ndarray
+            Reference wavelengths (µm) corresponding to
+            ``predicted_pixels``.
+        ``"detected_peaks"`` : ndarray
+            Pixel positions of detected peaks.
+        ``"match_table"`` : dict with keys
+            ``"wavelength"``, ``"predicted_pixel"``,
+            ``"matched_pixel"``, ``"residual"``, ``"matched"``
+            (each an ndarray with one element per predicted line).
+        ``"qa_path"`` : str or None
+            Full path of the saved QA plot, or ``None`` if the order
+            was not found in ``wavecalinfo``.
+
+    Notes
+    -----
+    Orders listed in *weak_orders* that do not appear in
+    ``wavecalinfo.orders`` are silently skipped and their keys are not
+    present in the returned dict.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    results: dict[int, dict] = {}
+
+    for i, order_num in enumerate(wavecalinfo.orders):
+        if order_num not in weak_orders:
+            continue
+
+        # ------------------------------------------------------------------
+        # Step 1 — Extract per-order 1-D arc spectrum
+        # ------------------------------------------------------------------
+        wav_arr = wavecalinfo.data[i, 0, :]   # plane 0 = wavelengths (µm)
+        arc_arr = wavecalinfo.data[i, 1, :]   # plane 1 = arc spectrum (DN/s)
+        valid = ~np.isnan(wav_arr)
+
+        if not valid.any():
+            warnings.warn(
+                f"diagnose_weak_orders: order {order_num} has no valid "
+                "wavelength data; skipping.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+
+        x_start = int(wavecalinfo.xranges[i, 0])
+        n_valid = int(valid.sum())
+        pixel = np.arange(n_valid, dtype=float) + x_start
+        flux = arc_arr[valid].astype(float)
+        wav_valid = wav_arr[valid]
+
+        # ------------------------------------------------------------------
+        # Step 2 — Predicted pixel positions from the coarse wavelength grid
+        # ------------------------------------------------------------------
+        order_entries = [e for e in line_list.entries if e.order == order_num]
+
+        pred_pixels: list[float] = []
+        pred_wavs: list[float] = []
+
+        for entry in order_entries:
+            diff = np.abs(wav_valid - entry.wavelength_um)
+            best_idx = int(np.argmin(diff))
+            # Accept if the nearest stored wavelength is within 10 nm
+            if diff[best_idx] <= 0.010:
+                pred_pixels.append(float(pixel[best_idx]))
+                pred_wavs.append(float(entry.wavelength_um))
+
+        predicted_pixels = np.array(pred_pixels, dtype=float)
+        predicted_wavs = np.array(pred_wavs, dtype=float)
+
+        # ------------------------------------------------------------------
+        # Step 3 — Detect peaks in the (smoothed) arc spectrum
+        # ------------------------------------------------------------------
+        detected_peaks = _detect_spectrum_peaks(
+            pixel,
+            flux,
+            smooth_sigma=smooth_sigma,
+            mad_multiplier=peak_mad_multiplier,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 4 — Match predicted positions to detected peaks (loose)
+        # ------------------------------------------------------------------
+        match_table = _match_predicted_to_detected(
+            predicted_pixels=predicted_pixels,
+            predicted_wavs=predicted_wavs,
+            detected_peaks=detected_peaks,
+            tolerance_pix=tolerance_pix,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 5 — QA plot
+        # ------------------------------------------------------------------
+        qa_path = _plot_weak_order_diagnostic(
+            order_num=order_num,
+            pixel=pixel,
+            flux=flux,
+            detected_peaks=detected_peaks,
+            predicted_pixels=predicted_pixels,
+            match_table=match_table,
+            output_dir=output_dir,
+        )
+
+        results[order_num] = {
+            "pixel": pixel,
+            "flux": flux,
+            "predicted_pixels": predicted_pixels,
+            "predicted_wavelengths": predicted_wavs,
+            "detected_peaks": detected_peaks,
+            "match_table": match_table,
+            "qa_path": qa_path,
+        }
+
+    return results
+
+
 def build_rectification_maps(
     geom_set: OrderGeometrySet,
     plate_scale_arcsec: float,
@@ -586,6 +765,208 @@ def build_rectification_maps(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _detect_spectrum_peaks(
+    pixel: np.ndarray,
+    flux: np.ndarray,
+    smooth_sigma: float = 1.5,
+    mad_multiplier: float = 3.0,
+) -> np.ndarray:
+    """Detect emission-line peaks in a 1-D arc spectrum.
+
+    Parameters
+    ----------
+    pixel : ndarray, shape (n,)
+        Detector column positions.
+    flux : ndarray, shape (n,)
+        Arc-spectrum values.
+    smooth_sigma : float
+        Gaussian smoothing width in pixels.
+    mad_multiplier : float
+        Peak threshold = ``median + mad_multiplier * MAD``.
+
+    Returns
+    -------
+    ndarray
+        Pixel positions of detected peaks, in column order.
+    """
+    if len(flux) == 0:
+        return np.array([], dtype=float)
+
+    smoothed = gaussian_filter1d(flux.astype(float), sigma=smooth_sigma)
+
+    median_val = float(np.median(smoothed))
+    mad = float(np.median(np.abs(smoothed - median_val)))
+    threshold = median_val + mad_multiplier * mad
+
+    peak_indices, _ = find_peaks(smoothed, height=threshold)
+
+    if len(peak_indices) == 0:
+        return np.array([], dtype=float)
+
+    return pixel[peak_indices]
+
+
+def _match_predicted_to_detected(
+    predicted_pixels: np.ndarray,
+    predicted_wavs: np.ndarray,
+    detected_peaks: np.ndarray,
+    tolerance_pix: float = 15.0,
+) -> dict:
+    """Match predicted arc-line positions to detected peaks.
+
+    For each predicted line the nearest detected peak within
+    *tolerance_pix* is recorded.  Unmatched predictions are flagged with
+    ``NaN`` residuals.
+
+    Parameters
+    ----------
+    predicted_pixels : ndarray, shape (n_pred,)
+        Predicted pixel positions from the coarse wavelength model.
+    predicted_wavs : ndarray, shape (n_pred,)
+        Reference wavelengths (µm) for each predicted position.
+    detected_peaks : ndarray, shape (n_det,)
+        Detected peak pixel positions.
+    tolerance_pix : float
+        Maximum pixel separation for a match.
+
+    Returns
+    -------
+    dict with keys
+        ``"wavelength"``, ``"predicted_pixel"``, ``"matched_pixel"``,
+        ``"residual"``, ``"matched"``
+        – each an ndarray with one element per predicted line.
+    """
+    n_pred = len(predicted_pixels)
+    matched_pixel = np.full(n_pred, np.nan)
+    residual = np.full(n_pred, np.nan)
+    matched = np.zeros(n_pred, dtype=bool)
+
+    if len(detected_peaks) > 0:
+        for k, pp in enumerate(predicted_pixels):
+            diffs = np.abs(detected_peaks - pp)
+            nearest_idx = int(np.argmin(diffs))
+            if diffs[nearest_idx] <= tolerance_pix:
+                matched_pixel[k] = detected_peaks[nearest_idx]
+                residual[k] = detected_peaks[nearest_idx] - pp
+                matched[k] = True
+
+    return {
+        "wavelength": predicted_wavs.copy(),
+        "predicted_pixel": predicted_pixels.copy(),
+        "matched_pixel": matched_pixel,
+        "residual": residual,
+        "matched": matched,
+    }
+
+
+def _plot_weak_order_diagnostic(
+    order_num: int,
+    pixel: np.ndarray,
+    flux: np.ndarray,
+    detected_peaks: np.ndarray,
+    predicted_pixels: np.ndarray,
+    match_table: dict,
+    output_dir: str,
+) -> str | None:
+    """Save a diagnostic QA plot for one weak echelle order.
+
+    Parameters
+    ----------
+    order_num : int
+        Echelle order number (used in title and filename).
+    pixel, flux : ndarray
+        Spectrum arrays (x-axis = pixel, y-axis = flux).
+    detected_peaks : ndarray
+        Pixel positions of detected peaks.
+    predicted_pixels : ndarray
+        Predicted pixel positions from the coarse model.
+    match_table : dict
+        Output of :func:`_match_predicted_to_detected`.
+    output_dir : str
+        Directory for the PNG file.
+
+    Returns
+    -------
+    str
+        Full path of the saved PNG file.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        warnings.warn(
+            "matplotlib is not available; QA plots cannot be generated.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return None
+
+    n_pred = len(predicted_pixels)
+    n_det = len(detected_peaks)
+    n_matched = int(np.sum(match_table["matched"]))
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+
+    # Spectrum
+    ax.plot(pixel, flux, color="gray", lw=0.8, label="spectrum")
+
+    # Detected peaks (blue dots)
+    if n_det > 0:
+        peak_flux = np.interp(detected_peaks, pixel, flux)
+        ax.plot(
+            detected_peaks,
+            peak_flux,
+            "o",
+            color="steelblue",
+            ms=5,
+            label=f"detected peaks ({n_det})",
+            zorder=4,
+        )
+
+    # Predicted positions (red vertical lines)
+    y_min, y_max = ax.get_ylim()
+    for pp in predicted_pixels:
+        ax.axvline(pp, color="red", lw=0.7, alpha=0.7)
+    # Single legend entry for predicted
+    if n_pred > 0:
+        ax.axvline(
+            np.nan, color="red", lw=0.7, alpha=0.7,
+            label=f"predicted lines ({n_pred})",
+        )
+
+    # Matched peaks (green circles)
+    matched_mask = match_table["matched"]
+    matched_px = match_table["matched_pixel"][matched_mask]
+    if len(matched_px) > 0:
+        matched_flux = np.interp(matched_px, pixel, flux)
+        ax.plot(
+            matched_px,
+            matched_flux,
+            "o",
+            color="limegreen",
+            ms=9,
+            mfc="none",
+            mew=1.5,
+            label=f"matched ({n_matched})",
+            zorder=5,
+        )
+
+    ax.set_xlabel("Pixel (detector column)")
+    ax.set_ylabel("Flux (DN/s)")
+    ax.set_title(
+        f"Order {order_num} — "
+        f"N_predicted={n_pred}  N_detected={n_det}  N_matched={n_matched}"
+    )
+    ax.legend(fontsize=8, loc="upper right")
+    fig.tight_layout()
+
+    filename = os.path.join(output_dir, f"order_{order_num}.png")
+    fig.savefig(filename, dpi=100)
+    plt.close(fig)
+    return filename
 
 
 def _validate_inputs(wavecalinfo: "WaveCalInfo", flatinfo: "FlatInfo") -> None:
